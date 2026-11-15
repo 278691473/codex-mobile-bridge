@@ -1,0 +1,2 @@
+# Optional for source runs reading .jsonl.zst; plain history remains stdlib-only.
+zstandard==0.25.0

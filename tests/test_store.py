@@ -91,7 +91,7 @@ class RecentHistoryTests(unittest.TestCase):
         self.home = Path(self.temp.name)
         (self.home/'sessions').mkdir()
         self.path = self.home/'sessions/rollout.jsonl'
-        self.records = []
+        self.records = [{'type': 'session_meta', 'payload': {'id': 'fixture'}}]
         for index in range(120):
             self.records.extend([
                 {'type': 'event_msg', 'payload': {'type': 'task_started', 'turn_id': str(index)}},
@@ -115,7 +115,7 @@ class RecentHistoryTests(unittest.TestCase):
 
     def test_turn_context_labels_do_not_follow_later_thread_settings_or_cache(self):
         import json
-        records=[]
+        records=[{'type': 'session_meta', 'payload': {'id': 'fixture'}}]
         for index,model,effort in [('one','gpt-6-astra','max'),('two','gemini-pro','high')]:
             records.extend([
                 {'type':'event_msg','payload':{'type':'task_started','turn_id':index}},
@@ -136,6 +136,7 @@ class RecentHistoryTests(unittest.TestCase):
     def test_saved_imageview_event_is_preserved_for_history_rendering(self):
         import json
         self.path.write_text('\n'.join(json.dumps(record, ensure_ascii=False) for record in [
+            {'type':'session_meta','payload':{'id':'fixture'}},
             {'type':'event_msg','payload':{'type':'task_started','turn_id':'image-turn'}},
             {'type':'event_msg','payload':{'type':'item_completed','item':{'type':'imageView','id':'view','path':'file:///C:/fixture-preview.png'}}},
             {'type':'response_item','payload':{'type':'message','role':'assistant','content':[{'type':'output_text','text':'![preview](file:///C:/fixture-preview.png)'}]}},

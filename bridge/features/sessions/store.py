@@ -1,7 +1,9 @@
 """Read-only discovery and history for existing desktop chats."""
 import copy
+import io
 import threading
 from collections import OrderedDict
+from glob import escape
 import json
 import logging
 import shutil
@@ -13,6 +15,49 @@ from pathlib import Path
 
 class StoreUnavailable(RuntimeError):
     pass
+
+
+def _within_history_roots(path, roots):
+    if any(root in path.parents for root in roots):
+        return True
+    # Windows extended paths (\\?\C:\...) can name the same directory as C:\...
+    # without comparing equal as Paths. Check directory identity, not a prefix.
+    for parent in path.parents:
+        for root in roots:
+            try:
+                if root.samefile(parent):
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+@contextmanager
+def _open_rollout(path):
+    """Keep plain and multi-frame compressed history read-only and seekable."""
+    with path.open('rb') as source:
+        if not path.name.endswith('.jsonl.zst'):
+            yield source
+            return
+        try:
+            import zstandard
+        except ImportError as exc:
+            raise StoreUnavailable('读取压缩 Codex 历史需要安装 zstandard。') from exc
+        with io.BytesIO() as decoded:
+            decoder = zstandard.ZstdDecompressor().decompressobj()
+            try:
+                while chunk := source.read(65536):
+                    while chunk:
+                        if decoder.eof:
+                            decoder = zstandard.ZstdDecompressor().decompressobj()
+                        decoded.write(decoder.decompress(chunk))
+                        chunk = decoder.unused_data
+                if not decoder.eof:
+                    raise StoreUnavailable('压缩 Codex 历史不完整，请稍后重试。')
+            except zstandard.ZstdError as exc:
+                raise StoreUnavailable('无法解码压缩 Codex 历史，请检查记录文件。') from exc
+            decoded.seek(0)
+            yield decoded
 
 
 class SessionStore:
@@ -142,9 +187,9 @@ class SessionStore:
     @staticmethod
     def _recent_lines(path, turn_limit):
         """Read complete turns backwards without parsing the older rollout prefix."""
-        if turn_limit is None:
-            return path.read_bytes(), True
-        with path.open('rb') as stream:
+        with _open_rollout(path) as stream:
+            if turn_limit is None:
+                return stream.read(), True
             stream.seek(0, 2)
             position = stream.tell()
             parts, pending, starts = [], b'', 0
@@ -217,12 +262,47 @@ class SessionStore:
         if target is None: raise KeyError('请选择子智能体')
         return self._history(agent_id, target, 10)
 
-    def _history(self, thread_id, meta, turn_limit=None):
+    def _history_path(self, thread_id, meta):
         path = Path(meta["rollout_path"])
         # The file path must be an actual rollout in this user's Codex home.
         resolved = path.resolve()
-        if not any(root.resolve() in resolved.parents for root in (self.home / "sessions", self.home / "archived_sessions")):
+        roots = [(self.home / name).resolve() for name in ("sessions", "archived_sessions")]
+        if not _within_history_roots(resolved, roots):
             raise ValueError("会话记录路径不在 Codex 数据目录中")
+        # A DB path can name a short fork mirror even when its session_meta.id
+        # matches. The standard exact suffix identifies the original history.
+        for suffix in ('.jsonl', '.jsonl.zst'):
+            matches = []
+            for root in roots:
+                for candidate in root.rglob('*-' + escape(thread_id) + suffix):
+                    candidate = candidate.resolve()
+                    if not _within_history_roots(candidate, roots):
+                        raise ValueError("会话记录路径不在 Codex 数据目录中")
+                    if candidate.is_file():
+                        matches.append(candidate)
+            if len(matches) > 1:
+                raise StoreUnavailable('同一会话存在多个精确历史文件，无法安全选择。')
+            if matches:
+                return matches[0]
+        if not resolved.exists() and path.name.endswith('.jsonl'):
+            compressed = Path(str(path) + '.zst').resolve()
+            if not _within_history_roots(compressed, roots):
+                raise ValueError("会话记录路径不在 Codex 数据目录中")
+            if compressed.is_file():
+                resolved = compressed
+        with _open_rollout(resolved) as stream:
+            try:
+                header = json.loads(stream.readline())
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise StoreUnavailable('无法确认数据库指定历史文件的会话归属。') from exc
+        if (not isinstance(header, dict) or header.get('type') != 'session_meta'
+                or not isinstance(header.get('payload'), dict)
+                or header['payload'].get('id') != thread_id):
+            raise StoreUnavailable('数据库指定历史文件的会话归属不匹配。')
+        return resolved
+
+    def _history(self, thread_id, meta, turn_limit=None):
+        resolved = self._history_path(thread_id, meta)
         stat = resolved.stat()
         cache_key = (str(resolved), stat.st_ino, stat.st_size, stat.st_mtime_ns, turn_limit)
         with self.history_lock:
