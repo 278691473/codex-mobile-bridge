@@ -16,7 +16,7 @@ python -B -m bridge.features.network.zcode_relay --config <仓库外私有 deskt
 
 正常日志包括 `ZCR_READY`、`ZCR_STATE waiting_terminal`、`ZCR_PAIR_URL`。该 URL 只有公开设备身份，供原版 App 的智谱入口读取；云端 ZCode 页面不是本方案的聊天入口。
 
-隔离测试可使用 `--mid <独立临时值> --delete-on-exit`；正式设备不要使用删除参数。现有 AK-NEW 常驻方式、日志与回滚位置记录在部署工作区的验收文档。
+隔离测试可使用 `--mid <独立临时值> --delete-on-exit`；正式设备不要使用删除参数。本机常驻方式、日志与回滚位置记录在仓库外的私有部署验收文档。
 
 ## 安卓
 
