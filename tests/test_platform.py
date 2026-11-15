@@ -115,7 +115,9 @@ class PlatformDataTests(unittest.TestCase):
             history = root / 'sessions/history.jsonl'
             history.parent.mkdir()
             text = '\u4e2d\u6587\U0001f680'
-            history.write_text(json.dumps({'type': 'response_item', 'payload': {
+            history.write_text(
+                json.dumps({'type': 'session_meta', 'payload': {'id': THREAD}}) + '\n' +
+                json.dumps({'type': 'response_item', 'payload': {
                 'type': 'message', 'role': 'assistant', 'content': [{'text': text}]}},
                 ensure_ascii=False) + '\n', encoding='utf-8')
             with sqlite3.connect(str(root / 'state_5.sqlite')) as db:

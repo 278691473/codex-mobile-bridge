@@ -134,6 +134,7 @@ class RolloutReceiptTests(unittest.TestCase):
     def test_fallback_preserves_native_identity_without_duplicate_display_message(self):
         identifier = str(uuid.uuid4())
         records = [
+            {'type': 'session_meta', 'payload': {'id': 'thread'}},
             {'type': 'event_msg', 'payload': {'type': 'task_started', 'turn_id': 'turn'}},
             {'type': 'response_item', 'payload': {'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': 'same'}]}},
             {'type': 'event_msg', 'payload': {'type': 'item_completed', 'thread_id': 'thread', 'turn_id': 'turn',

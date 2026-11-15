@@ -131,6 +131,7 @@ class RolloutMessageTimeTests(unittest.TestCase):
 
     def records(self, native_id='native-reply', thread_id='thread', turn_id='turn', completed=STAMP):
         return [
+            {'type': 'session_meta', 'payload': {'id': 'thread'}},
             {'type': 'event_msg', 'payload': {'type': 'task_started', 'turn_id': 'turn'}},
             {'type': 'response_item', 'timestamp': ISO, 'payload': {'type': 'message', 'id': native_id,
                 'role': 'assistant', 'content': [{'type': 'output_text', 'text': 'same reply'}]}},

@@ -35,7 +35,7 @@ from typing import Callable, Mapping
 
 import websocket
 
-from bridge.api.assets import FONT_ROUTE, STATIC
+from bridge.web_assets import is_public_file_path
 
 
 LOG = logging.getLogger("zcode_relay")
@@ -249,9 +249,7 @@ def validate_bridge_path(method: str, value: object) -> str:
     ):
         raise ValueError("dot or empty segments are forbidden")
     if method in ("GET", "HEAD"):
-        static = raw_path in STATIC or raw_path == "/index.html" or bool(
-            FONT_ROUTE.fullmatch(raw_path)
-        )
+        static = is_public_file_path(raw_path)
         if not static and not raw_path.startswith("/api/"):
             raise ValueError("static path is not allowlisted")
     elif not raw_path.startswith("/api/"):

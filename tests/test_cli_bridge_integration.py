@@ -33,7 +33,8 @@ class CliBridgeFixture(unittest.TestCase):
         self.private_text = 'Private CLI conversation text'
         rollout = self.home / 'sessions' / 'rollout.jsonl'
         rollout.parent.mkdir()
-        rollout.write_text(json.dumps({'type': 'response_item', 'payload': {'type': 'message',
+        rollout.write_text(json.dumps({'type': 'session_meta', 'payload': {'id': self.thread_id}}) + '\n' +
+            json.dumps({'type': 'response_item', 'payload': {'type': 'message',
             'role': 'assistant', 'content': [{'type': 'text', 'text': self.private_text}]}}) + '\n')
         with closing(sqlite3.connect(self.home / 'state_5.sqlite')) as db, db:
             db.execute('CREATE TABLE threads(id TEXT, title TEXT, cwd TEXT, updated_at INT, archived INT, '
@@ -1205,7 +1206,7 @@ class CliModelAttributionTests(unittest.TestCase):
             thread_id = str(uuid.uuid4())
             rollout = home / 'sessions' / 'rollout.jsonl'
             rollout.parent.mkdir()
-            records = []
+            records = [{'type': 'session_meta', 'payload': {'id': thread_id}}]
             for turn_id, model in [('old', 'model-old'), ('new', 'model-new')]:
                 records.extend([
                     {'type': 'event_msg', 'payload': {'type': 'task_started', 'turn_id': turn_id}},

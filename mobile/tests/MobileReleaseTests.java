@@ -17,6 +17,7 @@ public class MobileReleaseTests {
   check(MobileRelease.channel("2.0.0-preview.1").equals("preview"));
   check(MobileRelease.channel("2.0.0").equals("stable"));
   check(MobileRelease.isDownload(url));
+  check(!MobileRelease.isDownload("https://github.com/try2love/codex-mobile-bridge/releases/download/v"+v+"/"+name));
   check(!MobileRelease.isDownload("https://evil.example/releases/download/v"+v+"/"+name));
   check(MobileRelease.redirectAllowed("https://objects.githubusercontent.com/github-production-release-asset-1/example"));
   check(!MobileRelease.redirectAllowed("https://evil.example/update.apk"));

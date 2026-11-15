@@ -1,5 +1,7 @@
 # 原版 Android App 经智谱中继
 
+本实现已在独立 fork 的 `zcode-relay` 分支合并上游 v2.2.1。Android 安装身份、固定签名、更新源和后续同步步骤见 [FORK.md](../FORK.md)。此前 2.0.3 包已被本轮智谱 fork 包替代，保留旧 App 和数据。
+
 保留本项目原版 HTML、聊天、项目分组、模型、历史、问询和审批页面，只新增传输连接层。链路为 Android App 本地 loopback 网关 → `zcode.z.ai` WSS → 本机 `bridge.features.network.zcode_relay` → `127.0.0.1:8787` → 已有 Codex Desktop owner。Android 无需公网 IP，不使用 Cloudflare。
 
 ## 电脑

@@ -62,8 +62,9 @@ final class DeviceBinding {
    if(!GatewayURL.origin(origin).equals(origin))return false;
    connection=(HttpURLConnection)new URL(origin+"/api/auth").openConnection();
    connection.setInstanceFollowRedirects(false);connection.setConnectTimeout(4000);connection.setReadTimeout(4000);
-   String capability=ZCodeConnection.cookie(origin);
-   connection.setRequestProperty("Cookie",credential.cookie()+(capability.isEmpty()?"":"; "+capability));connection.setRequestProperty("Origin",GatewayURL.httpOrigin(origin));connection.setRequestProperty("User-Agent",EventClient.USER_AGENT);
+   connection.setRequestProperty("Cookie",credential.cookie());
+   String capability=ZCodeConnection.capabilityToken(origin);if(!capability.isEmpty())connection.setRequestProperty(ZCodeLocalGateway.CAP_HEADER,capability);
+   connection.setRequestProperty("Origin",GatewayURL.httpOrigin(origin));connection.setRequestProperty("User-Agent",EventClient.USER_AGENT);
    if(connection.getResponseCode()!=200||!GatewayURL.sameOrigin(connection.getURL().toString(),origin))return null;
    ByteArrayOutputStream out=new ByteArrayOutputStream();try(InputStream in=connection.getInputStream()){
     byte[] bytes=new byte[4096];int n;while((n=in.read(bytes))!=-1){if(out.size()+n>65536)return null;out.write(bytes,0,n);}

@@ -56,6 +56,10 @@ class MobileUpdateTests(unittest.TestCase):
         self.service.close()
         self.temp.cleanup()
 
+    def test_fork_update_catalog_identifies_its_repository(self):
+        result = self.service.check('2.0.2')
+        self.assertEqual(result['repository'], 'https://github.com/278691473/codex-mobile-bridge')
+
     def test_channel_selection_and_metadata_cache(self):
         self.service._open = Mock(return_value=Response(json.dumps([row('2.0.4-beta.1'), row(), row('2.0.5', draft=True)]).encode()))
         self.assertEqual(self.service.check('2.0.2')['release']['version'], '2.0.3')

@@ -12,13 +12,14 @@ final class ZCodeConnection {
  private static volatile Connection current;
  private static final java.util.concurrent.ExecutorService closer=java.util.concurrent.Executors.newSingleThreadExecutor(r->{Thread thread=new Thread(r,"zcode-close");thread.setDaemon(true);return thread;});
  private static final class Connection {
-  final ZCodeTransport transport;final ZCodeLocalGateway gateway;final String origin,cookie;
-  Connection(ZCodeTransport transport,ZCodeLocalGateway gateway,String origin){this.transport=transport;this.gateway=gateway;this.origin=origin;this.cookie=gateway.capabilityCookie();}
+  final ZCodeTransport transport;final ZCodeLocalGateway gateway;final String origin,cookie,capability;
+  Connection(ZCodeTransport transport,ZCodeLocalGateway gateway,String origin){this.transport=transport;this.gateway=gateway;this.origin=origin;this.cookie=gateway.capabilityCookie();this.capability=gateway.capabilityToken();}
  }
  private static SharedPreferences prefs(Context c){return c.getSharedPreferences("bridge-zcode",0);}
  static String origin(Context c){int port=prefs(c).getInt("port",0);return port>0?"http://127.0.0.1:"+port:"";}
  static boolean manages(Context c,String address){return !address.isEmpty()&&address.equals(origin(c));}
  static String cookie(String address){Connection snapshot=current;return snapshot!=null&&snapshot.origin.equals(address)?snapshot.cookie:"";}
+ static String capabilityToken(String address){Connection snapshot=current;return snapshot!=null&&snapshot.origin.equals(address)?snapshot.capability:"";}
  static void save(Context c,ZCodePairing target)throws Exception {
   synchronized(LOCK){
   SharedPreferences p=prefs(c);String sid=p.getString("sid",""),mid=p.getString("mid","");

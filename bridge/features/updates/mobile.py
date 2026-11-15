@@ -14,8 +14,8 @@ from urllib.request import Request, build_opener, HTTPRedirectHandler, HTTPSHand
 from bridge.features.auth.tls import client_context
 from bridge.features.workspace.workspace import download_range
 
-REPO = 'https://github.com/try2love/codex-mobile-bridge'
-API = 'https://api.github.com/repos/try2love/codex-mobile-bridge/releases?per_page=100'
+REPO = 'https://github.com/278691473/codex-mobile-bridge'
+API = 'https://api.github.com/repos/278691473/codex-mobile-bridge/releases?per_page=100'
 MAX_SIZE = 512 * 1024 * 1024
 MAX_METADATA = 4 * 1024 * 1024
 CACHE_SECONDS = 24 * 60 * 60
@@ -121,7 +121,7 @@ class MobileUpdates:
         selected = max(candidates, key=lambda r: version_key(r['version'])) if candidates else None
         if selected and (selected['size'] <= 0 or selected['sha256'] is None):
             raise ValueError('发布信息已变化或缺少校验信息，请重新检查更新')
-        return {'supported': True, 'release': selected}
+        return {'supported': True, 'repository': REPO, 'release': selected}
 
     def _cleanup(self):
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)

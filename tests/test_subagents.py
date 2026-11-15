@@ -19,7 +19,8 @@ class SubagentTests(unittest.TestCase):
     def child(self,parent,title='Child',source=None,path=None):
         identifier=str(uuid.uuid4());log=path or self.root/'sessions'/(identifier+'.jsonl')
         if not path:
-            records=[{'type':'event_msg','payload':{'type':'task_started','turn_id':'fixture-turn'}},
+            records=[{'type':'session_meta','payload':{'id':identifier}},
+                     {'type':'event_msg','payload':{'type':'task_started','turn_id':'fixture-turn'}},
                      {'type':'response_item','payload':{'type':'message','role':'assistant','content':[{'text':'Result '+title}]}},
                      {'type':'event_msg','payload':{'type':'task_complete'}}]
             log.write_text('\n'.join(json.dumps(row) for row in records))

@@ -39,6 +39,7 @@ final class GatewayUpdate {
  }
  MobileRelease check(String current)throws IOException {
   JSONObject value=request("/api/mobile/update?current="+URLEncoder.encode(current,"UTF-8"),null);
+  if(!MobileRelease.REPO.equals(value.optString("repository")))throw new IOException("电脑更新源与智谱版不同，请更新电脑端或从智谱版发布页下载。");
   if(!value.optBoolean("supported")||!value.has("release"))throw new IOException("此网关暂不支持协助更新，请先更新电脑网关");
   if(value.isNull("release"))return null;
   try{

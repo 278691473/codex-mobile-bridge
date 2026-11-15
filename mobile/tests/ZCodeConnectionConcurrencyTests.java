@@ -37,6 +37,7 @@ public final class ZCodeConnectionConcurrencyTests {
   startWatchdog(ZCodeTransport.connectRelease);
 
   timed("cookie",()->check(ZCodeConnection.cookie(BASE).isEmpty(),"inactive cookie was visible"));
+  timed("capability",()->check(ZCodeConnection.capabilityToken(BASE).isEmpty(),"inactive capability token was visible"));
   timed("close",ZCodeConnection::close);
   timed("forget",()->ZCodeConnection.forget(context));
 
@@ -51,6 +52,7 @@ public final class ZCodeConnectionConcurrencyTests {
   check(ZCodeLocalGateway.closed.get()==1,"stale candidate gateway was not closed");
   check(ZCodeTransport.closeCalls.get()==1,"stale candidate transport was not closed");
   check(ZCodeConnection.cookie(BASE).isEmpty(),"stale candidate was committed");
+  check(ZCodeConnection.capabilityToken(BASE).isEmpty(),"stale candidate capability was committed");
  }
 
  private static void testGatewayDetachesBeforeAsyncTransportClose()throws Exception {
@@ -63,9 +65,12 @@ public final class ZCodeConnectionConcurrencyTests {
   ZCodeTransport.blockNextClose.set(true);
   String initial=ZCodeConnection.cookie(BASE);
   check(!initial.isEmpty(),"initial capability was unavailable");
+  check("cap-1".equals(ZCodeConnection.capabilityToken(BASE)),"exact origin raw capability was unavailable");
+  check(ZCodeConnection.capabilityToken(BASE+"/").isEmpty(),"lookalike origin received raw capability");
 
   timed("committed close",ZCodeConnection::close);
   check(ZCodeConnection.cookie(BASE).isEmpty(),"current snapshot survived close");
+  check(ZCodeConnection.capabilityToken(BASE).isEmpty(),"raw capability survived close");
   check(ZCodeLocalGateway.closed.get()==1,"gateway close was not released synchronously");
   check(ZCodeTransport.closeEntered.await(2,TimeUnit.SECONDS),"transport did not enter async close");
 
@@ -73,6 +78,7 @@ public final class ZCodeConnectionConcurrencyTests {
   // connection must be able to attach after the local gateway is released.
   check(BASE.equals(ZCodeConnection.ensure(context)),"replacement ensure failed");
   check(!ZCodeConnection.cookie(BASE).isEmpty(),"replacement capability was unavailable");
+  check("cap-2".equals(ZCodeConnection.capabilityToken(BASE)),"replacement raw capability was unavailable");
   check(ZCodeLocalGateway.created.get()==2,"replacement gateway was not created");
 
   ZCodeTransport.closeRelease.countDown();

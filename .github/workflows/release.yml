@@ -15,6 +15,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   validate:
+    if: github.repository == 'try2love/codex-mobile-bridge'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

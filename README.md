@@ -1,3 +1,5 @@
+> **智谱中继适配 fork**：源码在 `zcode-relay` 分支，已合并上游 v2.2.1。智谱版使用独立 Android 包名与签名，保留原 App。安装、跟进上游与发布规则见 [FORK.md](FORK.md)；[本 fork 发布页](https://github.com/278691473/codex-mobile-bridge/releases)。以下保留上游项目说明。
+
 <p align="center">
 
   <img src="site/assets/icon.png" alt="Codex Mobile Bridge" width="112" height="112">

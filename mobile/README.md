@@ -1,5 +1,7 @@
 # Android 与 iOS App
 
+> 本分支的智谱版为独立 Android 应用，安装与上游合并规则见 [FORK.md](../FORK.md)。请从 [本 fork 发布页](https://github.com/278691473/codex-mobile-bridge/releases) 取得智谱包；下方保留上游各版本说明。
+
 手机扫描网关二维码后连接 Codex、Claude Desktop 和 DeepSeek Harness，电脑继续执行任务。手机 App 保存多台电脑，提供原生扫码、剪贴板、文件下载和通知；浏览器入口同时保留。
 
 **[v2.2.1 发布页](https://github.com/try2love/codex-mobile-bridge/releases/tag/v2.2.1)** · [完整更新说明](../RELEASE_NOTES.md) · [桌面客户端接入](../docs/deepseek-harness.md)

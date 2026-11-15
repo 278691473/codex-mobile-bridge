@@ -98,6 +98,7 @@ final class ZCodeLocalGateway {
  ZCodeLocalGateway(ZCodeTransport transport,int port){this.transport=transport;this.port=port;this.id=created.incrementAndGet();}
  String start()throws Exception{return "http://127.0.0.1:"+port;}
  String capabilityCookie(){return "zcode_cap=cap-"+id;}
+ String capabilityToken(){return "cap-"+id;}
  void close(){if(done.compareAndSet(false,true))closed.incrementAndGet();}
 }
 """,

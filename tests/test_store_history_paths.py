@@ -22,7 +22,8 @@ class StoreHistoryPathTests(unittest.TestCase):
         self.sessions = self.home / 'sessions'
         self.sessions.mkdir(parents=True)
         self.rollout = self.sessions / 'rollout.jsonl'
-        self.rollout.write_text(json.dumps({'type': 'response_item', 'payload': {
+        self.rollout.write_text(json.dumps({'type': 'session_meta', 'payload': {'id': 'thread'}}) + '\n' +
+            json.dumps({'type': 'response_item', 'payload': {
             'type': 'message', 'role': 'assistant', 'content': [{'text': 'SAVED_REPLY'}]}}) + '\n')
         self.database = self.home / 'state_5.sqlite'
         with closing(sqlite3.connect(self.database)) as db:
@@ -51,6 +52,7 @@ class StoreHistoryPathTests(unittest.TestCase):
 
     def test_native_file_change_event_is_preserved_in_saved_history(self):
         records = [
+            {'type': 'session_meta', 'payload': {'id': 'thread'}},
             {'type': 'event_msg', 'payload': {'type': 'task_started', 'turn_id': 'native-turn'}},
             {'type': 'event_msg', 'payload': {'type': 'item_completed', 'item': {
                 'type': 'FileChange', 'id': 'patch', 'changes': {

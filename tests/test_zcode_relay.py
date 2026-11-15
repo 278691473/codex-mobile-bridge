@@ -138,6 +138,8 @@ class SecurityTests(unittest.TestCase):
             ("GET", "/index.html"),
             ("GET", "/app.js"),
             ("GET", "/vendor/katex/fonts/KaTeX_Main-Regular.woff2"),
+            ("GET", "/vendor/pdfjs/cmaps/H.bcmap"),
+            ("GET", "/vendor/pdfjs/standard_fonts/LiberationSans-Regular.ttf"),
             ("GET", "/api/auth?next=%2Fsessions"),
             ("HEAD", "/app.js"),
             ("POST", "/api/sessions/" + THREAD + "/send"),

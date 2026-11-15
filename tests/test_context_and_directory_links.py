@@ -36,6 +36,7 @@ class ContextUsageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=ROOT / '.tmp') as directory:
             home = Path(directory); (home / 'sessions').mkdir(); path = home / 'sessions/fixture.jsonl'
             records = [
+                {'type': 'session_meta', 'payload': {'id': 'test'}},
                 {'type': 'event_msg', 'payload': {'type': 'token_count', 'info': {'last_token_usage': {'total_tokens': 400}, 'model_context_window': 2000}}},
                 {'type': 'event_msg', 'payload': {'type': 'token_count', 'info': None}},
             ]

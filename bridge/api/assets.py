@@ -7,85 +7,13 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from bridge.resources import project_root
+from bridge.web_assets import (
+    FONT_ROUTE, PDF_CMAP_ROUTE, PDF_FONT_ROUTE, PUBLIC_FILE_ROUTES,
+    STATIC as FIXED_STATIC,
+)
 
-STATIC = {"/file-actions.js": ("file-actions.js", "text/javascript; charset=utf-8"),
-"/host.js": ("hosts/environment.js", "text/javascript; charset=utf-8"),
-          "/layout.js": ("layouts/viewport.js", "text/javascript; charset=utf-8"),
-          "/permissions.js": ("permissions.js", "text/javascript; charset=utf-8"),
-          "/downloads.js": ("downloads.js", "text/javascript; charset=utf-8"),
-          "/downloads.css": ("downloads.css", "text/css; charset=utf-8"),
-          "/client-icons/codex.png": ("client-icons/codex.png", "image/png"),
-          "/client-icons/claude.png": ("client-icons/claude.png", "image/png"),
-          "/client-icons/deepseek.png": ("client-icons/deepseek.png", "image/png"),
-          "/client-icons/zcode.png": ("client-icons/zcode.png", "image/png"),
-          "/client-icons/antigravity.png": ("client-icons/antigravity.png", "image/png"),
-          "/client-lifecycle.css": ("client-lifecycle.css", "text/css; charset=utf-8"),
-          "/client-lifecycle.js": ("client-lifecycle.js", "text/javascript; charset=utf-8"),
-          "/client-navigation.js": ("client-navigation.js", "text/javascript; charset=utf-8"),
-          "/client-navigation.css": ("client-navigation.css", "text/css; charset=utf-8"),
-          "/project-picker.js": ("shared/project-picker.js", "text/javascript; charset=utf-8"),
-          "/desktop-sessions.js": ("desktop-sessions.js", "text/javascript; charset=utf-8"),
-          "/client-accounts.js": ("client-accounts.js", "text/javascript; charset=utf-8"),
-          "/cli-access.js": ("cli-access.js", "text/javascript; charset=utf-8"),
-          "/wsl-accounts.js": ("wsl-accounts.js", "text/javascript; charset=utf-8"),
-          "/desktop-sessions.css": ("desktop-sessions.css", "text/css; charset=utf-8"),
-          "/vendor/xterm/xterm.js": ("vendor/xterm/xterm.js", "text/javascript; charset=utf-8"),
-          "/vendor/xterm/addon-fit.js": ("vendor/xterm/addon-fit.js", "text/javascript; charset=utf-8"),
-          "/vendor/xterm/xterm.css": ("vendor/xterm/xterm.css", "text/css; charset=utf-8"),
-          "/command-terminal-panel.js": ("command-terminal-panel.js", "text/javascript; charset=utf-8"),
-          "/list-sync.js": ("list-sync.js", "text/javascript; charset=utf-8"),
-          "/agents-panel.js": ("agents-panel.js", "text/javascript; charset=utf-8"),
-          "/side-chat.js": ("side-chat.js", "text/javascript; charset=utf-8"),
-          "/terminal-panel.js": ("terminal-panel.js", "text/javascript; charset=utf-8"),
-          "/floating-panel.js": ("floating-panel.js", "text/javascript; charset=utf-8"),
-          "/git-panel.js": ("git-panel.js", "text/javascript; charset=utf-8"),
-          "/workbench.js": ("workbench.js", "text/javascript; charset=utf-8"),
-          "/source-view.js": ("source-view.js", "text/javascript; charset=utf-8"),
-          "/code-syntax.js": ("code-syntax.js", "text/javascript; charset=utf-8"),
-          "/pdf-preview.js": ("pdf-preview.js", "text/javascript; charset=utf-8"),
-          "/html-preview.js": ("html-preview.js", "text/javascript; charset=utf-8"),
-          "/vendor/pdfjs/pdf.min.mjs": ("vendor/pdfjs/pdf.min.mjs", "text/javascript; charset=utf-8"),
-          "/vendor/pdfjs/pdf.worker.min.mjs": ("vendor/pdfjs/pdf.worker.min.mjs", "text/javascript; charset=utf-8"),
-          "/vendor/prism/source-view.min.js": ("vendor/prism/source-view.min.js", "text/javascript; charset=utf-8"),
-          "/image-viewer.js": ("image-viewer.js", "text/javascript; charset=utf-8"),
-          "/mermaid-renderer.js": ("mermaid-renderer.js", "text/javascript; charset=utf-8"),
-          "/mermaid-render-frame.js": ("mermaid-render-frame.js", "text/javascript; charset=utf-8"),
-          "/vendor/mermaid/mermaid.min.js": ("vendor/mermaid/mermaid.min.js", "text/javascript; charset=utf-8"),
-          "/mermaid-viewer.js": ("mermaid-viewer.js", "text/javascript; charset=utf-8"),
-          "/mermaid-viewer.css": ("mermaid-viewer.css", "text/css; charset=utf-8"),
-          "/mermaid-cards.js": ("mermaid-cards.js", "text/javascript; charset=utf-8"),
-          "/mermaid-cards.css": ("mermaid-cards.css", "text/css; charset=utf-8"),
-          "/workbench.css": ("workbench.css", "text/css; charset=utf-8"),
-          "/": ("index.html", "text/html; charset=utf-8"),
-          "/icon-ui.png": ("icon-ui.png", "image/png"),
-          "/icon-favicon.png": ("icon-favicon.png", "image/png"),
-          "/icon-touch.png": ("icon-touch.png", "image/png"),
-          "/icon-192.png": ("icon-192.png", "image/png"),
-          "/i18n.js": ("i18n.js", "text/javascript; charset=utf-8"),
-          "/app.js": ("app.js", "text/javascript; charset=utf-8"),
-          "/bootstrap.js": ("bootstrap.js", "text/javascript; charset=utf-8"),
-          "/modes.js": ("modes.js", "text/javascript; charset=utf-8"),
-          "/attachments.js": ("attachments.js", "text/javascript; charset=utf-8"),
-          "/activity.js": ("activity.js", "text/javascript; charset=utf-8"),
-          "/fast-mode.js": ("fast-mode.js", "text/javascript; charset=utf-8"),
-          "/accounts.js": ("accounts.js", "text/javascript; charset=utf-8"),
-          "/account.js": ("account.js", "text/javascript; charset=utf-8"),
-          "/account.css": ("account.css", "text/css; charset=utf-8"),
-          "/presentation.js": ("presentation.js", "text/javascript; charset=utf-8"),
-          "/presentation.css": ("presentation.css", "text/css; charset=utf-8"),
-          "/markdown.js": ("markdown.js", "text/javascript; charset=utf-8"),
-          "/message-actions.js": ("message-actions.js", "text/javascript; charset=utf-8"),
-          "/timeline.js": ("timeline.js", "text/javascript; charset=utf-8"),
-          "/vendor/markdown-it.min.js": ("vendor/markdown-it.min.js", "text/javascript; charset=utf-8"),
-          "/vendor/texmath.js": ("vendor/texmath.js", "text/javascript; charset=utf-8"),
-          "/vendor/katex/katex.min.js": ("vendor/katex/katex.min.js", "text/javascript; charset=utf-8"),
-          "/vendor/katex/katex.min.css": ("vendor/katex/katex.min.css", "text/css; charset=utf-8"),
-          "/style.css": ("style.css", "text/css; charset=utf-8"),
-          "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json"),
-          "/icon.png": ("icon.png", "image/png")}
-FONT_ROUTE = re.compile(r"^/vendor/katex/fonts/(KaTeX_[A-Za-z0-9_-]+\.(woff2|woff|ttf))$")
-PDF_CMAP_ROUTE = re.compile(r"^/vendor/pdfjs/cmaps/([A-Za-z0-9_-]+\.bcmap)$")
-PDF_FONT_ROUTE = re.compile(r"^/vendor/pdfjs/standard_fonts/([A-Za-z0-9_-]+\.(?:pfb|ttf))$")
+# Keep manifest path rewrites local to this API module.
+STATIC = dict(FIXED_STATIC)
 
 # The manifest moves files, never expands the public URL allowlist.
 _layout = json.loads((project_root() / 'web/assets.json').read_text(encoding='utf-8'))
@@ -127,9 +55,7 @@ _CSS_URL = re.compile(rb'url\((?P<quote>["\']?)(?P<url>[^)"\']+)(?P=quote)\)')
 def _public_file(web_dir, public_path):
     if public_path in STATIC and public_path != '/':
         return asset_bytes(web_dir, public_path)
-    for route, directory in ((FONT_ROUTE, 'vendor/katex/fonts'),
-                             (PDF_CMAP_ROUTE, 'vendor/pdfjs/cmaps'),
-                             (PDF_FONT_ROUTE, 'vendor/pdfjs/standard_fonts')):
+    for route, directory in PUBLIC_FILE_ROUTES:
         match = route.fullmatch(public_path)
         if match:
             file = Path(web_dir) / directory / match[1]
