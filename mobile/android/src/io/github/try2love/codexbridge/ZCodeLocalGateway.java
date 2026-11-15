@@ -33,6 +33,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import org.json.JSONObject;
+
 /**
  * A loopback-only HTTP/1.1 proxy used by the WebView and native App clients.
  * No request bytes or response bytes are modified except protocol framing.
@@ -210,11 +212,12 @@ public final class ZCodeLocalGateway implements Closeable {
     }
 
     private void handle(Socket socket) {
+        Request request = null;
         try {
             if (!socket.getInetAddress().isLoopbackAddress()) {
                 return;
             }
-            Request request = readRequestHead(socket);
+            request = readRequestHead(socket);
             validateCommon(request);
             if (isBootstrap(request)) {
                 bootstrap(socket, request);
@@ -233,13 +236,14 @@ public final class ZCodeLocalGateway implements Closeable {
                     response = transport.request(request.method, request.target, forwarded, request.body);
                     writeUpstream(socket, request.method, response);
                 } catch (ZCodeTransport.RequestTimeoutException timeout) {
-                    writeUnknown(socket, 504, request.method);
+                    writeUnknown(socket, 504, "request_timeout", request.method);
                     return;
                 } catch (ZCodeTransport.RequestUnknownException unknown) {
-                    writeUnknown(socket, 502, request.method);
+                    writeUnknown(socket, 502, "write_result_unknown", request.method);
                     return;
                 } catch (IOException unavailable) {
-                    writeError(socket, 502, "ZCode transport is unavailable", request.method);
+                    writeError(socket, 502, "与电脑的连接已断开，请确认电脑端 Bridge 正在运行后重试",
+                            "transport_unavailable", request.method);
                     return;
                 } finally {
                     if (response != null) {
@@ -251,13 +255,15 @@ public final class ZCodeLocalGateway implements Closeable {
             }
         } catch (HttpError error) {
             try {
-                writeError(socket, error.status, error.getMessage(), "GET");
+                writeError(socket, error.status, error.getMessage(),
+                        request == null ? "GET" : request.method);
             } catch (IOException ignored) {
                 // The peer may already have gone away.
             }
         } catch (Exception ignored) {
             try {
-                writeError(socket, 502, "gateway request failed", "GET");
+                writeError(socket, 502, "gateway request failed", "gateway_request_failed",
+                        request == null ? "GET" : request.method);
             } catch (IOException alsoIgnored) {
                 // The connection is already unusable.
             }
@@ -689,28 +695,48 @@ public final class ZCodeLocalGateway implements Closeable {
         return false;
     }
 
-    private void writeUnknown(Socket socket, int status, String method) throws IOException {
-        byte[] body = "ZCode request result is unknown\n".getBytes(StandardCharsets.UTF_8);
+    private void writeUnknown(Socket socket, int status, String code, String method) throws IOException {
+        byte[] body = jsonError(errorMessage(code), code);
         Map<String, List<String>> headers = new LinkedHashMap<>();
-        headers.put("Content-Type", Collections.singletonList("text/plain; charset=utf-8"));
+        headers.put("Content-Type", Collections.singletonList("application/json; charset=utf-8"));
         headers.put("Cache-Control", Collections.singletonList("no-store"));
         headers.put("X-ZCode-Result-Unknown", Collections.singletonList("1"));
+        headers.put("Content-Length", Collections.singletonList(Integer.toString(body.length)));
         headers.put("Connection", Collections.singletonList("close"));
         writeResponse(socket, status, headers, "HEAD".equals(method) ? new byte[0] : body,
                 "HEAD".equals(method));
     }
 
     private void writeError(Socket socket, int status, String message, String method) throws IOException {
-        byte[] body = (message + "\n").getBytes(StandardCharsets.UTF_8);
+        writeError(socket, status, message, "gateway_http_" + status, method);
+    }
+
+    private void writeError(Socket socket, int status, String message, String code, String method)
+            throws IOException {
+        byte[] body = jsonError(message, code);
         Map<String, List<String>> headers = new LinkedHashMap<>();
-        headers.put("Content-Type", Collections.singletonList("text/plain; charset=utf-8"));
+        headers.put("Content-Type", Collections.singletonList("application/json; charset=utf-8"));
         headers.put("Cache-Control", Collections.singletonList("no-store"));
+        headers.put("Content-Length", Collections.singletonList(Integer.toString(body.length)));
         if (status == 405) {
             headers.put("Allow", Collections.singletonList("GET, HEAD, POST"));
         }
         headers.put("Connection", Collections.singletonList("close"));
         writeResponse(socket, status, headers, "HEAD".equals(method) ? new byte[0] : body,
                 "HEAD".equals(method));
+    }
+
+    private static String errorMessage(String code) {
+        if ("request_timeout".equals(code)) {
+            return "请求超时，操作结果未知，请先检查当前状态，确认后再重试";
+        }
+        return "请求已发送，但未收到确认，操作结果未知，请先检查当前状态，确认后再重试";
+    }
+
+    static byte[] jsonError(String message, String code) {
+        String body = "{\"error\":" + JSONObject.quote(message)
+                + ",\"code\":" + JSONObject.quote(code) + "}";
+        return body.getBytes(StandardCharsets.UTF_8);
     }
 
     private static void writeResponse(Socket socket, int status, Map<String, List<String>> headers,

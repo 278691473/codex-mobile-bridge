@@ -40,6 +40,7 @@ public final class ZCodeTransportTests {
             Response denied = send(origin, "GET", "/api/projects", Collections.emptyMap(),
                     Collections.emptyList(), false, null);
             check(denied.status == 403, "capability is required");
+            checkJsonError(denied, 403, "gateway_http_403", "local capability required");
             check(backend.calls.get() == 0, "unauthorized request never reaches transport");
 
             String bootstrapUrl = gateway.bootstrapUrl();
@@ -132,11 +133,79 @@ public final class ZCodeTransportTests {
         }
 
         check(!gateway.isRunning(), "gateway close");
+        localErrorResponseTests();
         occupiedPortFailsToStart();
         smugglingTests();
         memoryAndConcurrencyTests();
         responseBudgetTests();
         System.out.println("ZCODE_GATEWAY_PASS " + checks);
+    }
+
+    private static void localErrorResponseTests() throws Exception {
+        int port = freePort();
+        FakeTransport backend = new FakeTransport();
+        ZCodeLocalGateway gateway = new ZCodeLocalGateway(backend, port);
+        String origin = gateway.start();
+        String capability = gateway.capabilityCookie();
+        try {
+            int before = backend.calls.get();
+            Response unavailable = send(origin, "GET", "/transport-unavailable",
+                    map("Cookie", capability), Collections.emptyList(), false, null);
+            check(backend.calls.get() == before + 1, "transport failure is not retried");
+            checkJsonError(unavailable, 502, "transport_unavailable",
+                    "与电脑的连接已断开，请确认电脑端 Bridge 正在运行后重试");
+            check(!unavailable.text().contains("fixture-secret"),
+                    "transport exception text is not exposed");
+            check(unavailable.header("X-ZCode-Result-Unknown") == null,
+                    "definitive transport failure is not marked unknown");
+
+            before = backend.calls.get();
+            Response timeout = send(origin, "POST", "/transport-timeout",
+                    map("Cookie", capability, "Content-Type", "application/json",
+                            ZCodeLocalGateway.NATIVE_ORIGIN_HEADER, ZCodeLocalGateway.NATIVE_ORIGIN),
+                    Collections.singletonList("{}".getBytes(StandardCharsets.UTF_8)), false, null);
+            check(backend.calls.get() == before + 1, "timeout is not retried or replayed");
+            checkJsonError(timeout, 504, "request_timeout",
+                    "请求超时，操作结果未知，请先检查当前状态，确认后再重试");
+            check("1".equals(timeout.header("X-ZCode-Result-Unknown")),
+                    "timeout preserves unknown result header");
+            check(!timeout.text().contains("fixture-secret"),
+                    "timeout exception text is not exposed");
+
+            before = backend.calls.get();
+            Response unknown = send(origin, "POST", "/transport-unknown",
+                    map("Cookie", capability, "Content-Type", "application/json",
+                            ZCodeLocalGateway.NATIVE_ORIGIN_HEADER, ZCodeLocalGateway.NATIVE_ORIGIN),
+                    Collections.singletonList("{}".getBytes(StandardCharsets.UTF_8)), false, null);
+            check(backend.calls.get() == before + 1, "unknown write is not retried or replayed");
+            checkJsonError(unknown, 502, "write_result_unknown",
+                    "请求已发送，但未收到确认，操作结果未知，请先检查当前状态，确认后再重试");
+            check("1".equals(unknown.header("X-ZCode-Result-Unknown")),
+                    "unknown write preserves unknown result header");
+            check(!unknown.text().contains("fixture-secret"),
+                    "unknown exception text is not exposed");
+
+            before = backend.calls.get();
+            Response unavailableHead = send(origin, "HEAD", "/transport-unavailable",
+                    map("Cookie", capability), Collections.emptyList(), false, null);
+            check(backend.calls.get() == before + 1, "HEAD transport failure is not retried");
+            check(unavailableHead.status == 502, "HEAD transport failure keeps status");
+            check(unavailableHead.body.length == 0, "HEAD error response has no body");
+            check(Integer.toString(unavailable.body.length).equals(unavailableHead.header("Content-Length")),
+                    "HEAD error declares the equivalent JSON body length");
+            checkErrorHeaders(unavailableHead);
+
+            String specialMessage = "第一行 \"quote\"\n第二行\\结束";
+            JSONObject escaped = new JSONObject(new String(
+                    ZCodeLocalGateway.jsonError(specialMessage, "quoted_code"),
+                    StandardCharsets.UTF_8));
+            check(specialMessage.equals(escaped.getString("error")),
+                    "JSON error round-trips quotes, newlines, and backslashes");
+            check(escaped.length() == 2, "escaped JSON error keeps the public shape");
+        } finally {
+            gateway.close();
+            backend.close();
+        }
     }
 
     private static void responseBudgetTests() throws Exception {
@@ -544,6 +613,25 @@ public final class ZCodeTransportTests {
         }
     }
 
+    private static void checkJsonError(Response response, int status, String code, String error)
+            throws Exception {
+        check(response.status == status, "JSON error keeps status: " + response.status);
+        checkErrorHeaders(response);
+        check(Integer.toString(response.body.length).equals(response.header("Content-Length")),
+                "JSON error Content-Length matches body");
+        JSONObject payload = new JSONObject(response.text());
+        check(payload.length() == 2, "JSON error contains only error and code");
+        check(error.equals(payload.getString("error")), "JSON error keeps stable message");
+        check(code.equals(payload.getString("code")), "JSON error keeps stable code");
+    }
+
+    private static void checkErrorHeaders(Response response) {
+        check(("application/json; charset=utf-8").equals(response.header("Content-Type")),
+                "local error is JSON");
+        check("no-store".equals(response.header("Cache-Control")), "local error is not cached");
+        check("close".equals(response.header("Connection")), "local error closes the connection");
+    }
+
     private static void check(boolean condition, String message) {
         checks++;
         if (!condition) {
@@ -587,6 +675,15 @@ public final class ZCodeTransportTests {
             calls.incrementAndGet();
             captures.add(new Capture(method, path, headers,
                     "/hold".equals(path) ? new byte[0] : body));
+            if ("/transport-unavailable".equals(path)) {
+                throw new IOException("fixture-secret transport unavailable");
+            }
+            if ("/transport-timeout".equals(path)) {
+                throw new RequestTimeoutException("fixture-secret timeout");
+            }
+            if ("/transport-unknown".equals(path)) {
+                throw new RequestUnknownException("fixture-secret unknown");
+            }
             entered.countDown();
             try {
                 if (!release.await(10, TimeUnit.SECONDS)) {

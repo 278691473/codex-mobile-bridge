@@ -38,6 +38,7 @@ python -B scripts/test-zcode-connection.py
 python -B scripts/test-zcode-release-channel.py
 python -B scripts/test-zcode-capability-headers.py
 python -B scripts/test-zcode-account.py
+python -B scripts/test-zcode-transport.py
 python -B scripts/build-mobile-android.py --zcode-fork --keystore <私有固定签名文件>
 ```
 

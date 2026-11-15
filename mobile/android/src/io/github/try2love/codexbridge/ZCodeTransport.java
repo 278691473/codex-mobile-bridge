@@ -39,7 +39,8 @@ import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * In-memory HTTP-over-WebSocket transport for the ZCode remote terminal.
- * The class deliberately owns no Android objects and performs no retries.
+ * The class owns no Android objects. A disconnected socket can be reopened before
+ * a new request is sent; requests already sent are never replayed.
  */
 public class ZCodeTransport {
     public static final String REMOTE_ORIGIN = "https://zcode.z.ai";
@@ -281,7 +282,7 @@ public class ZCodeTransport {
         }
         Map<String, List<String>> safeHeaders = safeRequestHeaders(headers);
         if (!isConnected()) {
-            throw new IOException("ZCode transport is not connected");
+            connect();
         }
 
         long deadline = System.nanoTime() + REQUEST_TIMEOUT_NANOS;
