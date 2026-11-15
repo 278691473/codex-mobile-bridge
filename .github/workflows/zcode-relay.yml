@@ -26,6 +26,7 @@ jobs:
         run: python -m pip install -r requirements-zcode.txt -r requirements-history.txt
       - name: Verify relay, history, updates and module boundaries
         run: |
+          mkdir -p .tmp
           python -B scripts/test-backend.py --source-only -p test_zcode_relay.py
           python -B scripts/test-backend.py --source-only -p test_store.py
           python -B scripts/test-backend.py --source-only -p test_store_zstd_history.py
