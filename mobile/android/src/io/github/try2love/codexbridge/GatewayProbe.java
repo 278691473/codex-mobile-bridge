@@ -18,6 +18,7 @@ final class GatewayProbe {
    c=(HttpURLConnection)new URL(GatewayURL.origin(origin)+"/api/auth").openConnection();connection=c;
    c.setConnectTimeout(4000);c.setReadTimeout(4000);c.setInstanceFollowRedirects(false);c.setUseCaches(false);
    c.setRequestProperty("Accept","application/json");
+   String capability=ZCodeConnection.cookie(origin);if(!capability.isEmpty())c.setRequestProperty("Cookie",capability);
    if(cancelled||c.getResponseCode()!=200||c.getContentLengthLong()>16384)return false;
    try(InputStream in=c.getInputStream();ByteArrayOutputStream out=new ByteArrayOutputStream()){
     byte[] buffer=new byte[2048];int n;long deadline=android.os.SystemClock.elapsedRealtime()+4000;

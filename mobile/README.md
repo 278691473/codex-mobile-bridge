@@ -138,11 +138,17 @@ macOS/Linux 使用登录 shell 与 PTY；Windows 10 1809 及以上使用 ConPTY 
 
 ## 开发与构建
 
+### 智谱中继
+
+Android 首页新增“智谱中继连接”，使用本项目原版页面和所有既有业务控件。电脑运行固定本机目标的智谱连接器，手机通过官方账号 OAuth 登录，再按原网关流程登录。连接和验收边界见 [智谱接入说明](../docs/zcode-relay.md)。当前 Android 真机蜂窝验收仍待完成。
+
 [源码对照表](source-map.json) · [Android 规则](android/AGENTS.md) · [iOS 规则](ios/AGENTS.md) · [共享脚本](shared/AGENTS.md)
 
 两端共用的页面适配、剪贴板等在 `shared/web/` 保留单一源码，原生平台分开维护。源码资源回归使用 `node --test mobile/tests/*.test.cjs`，不会运行原生编译器。
 
 Android 入口是 `scripts/build-mobile-android.py`，使用项目 `.tmp/mobile-tools` 中已准备的 JDK、SDK 和 ZXing；发布必须保留既有签名，不能以新建密钥替代升级验证。地址边界验证见 `scripts/test-mobile-urls.py`，会话验证见 `scripts/test-mobile-session.py`，通知事件见 `tests/test_mobile_events.py`。
+
+**签名限制：** 本地脚本使用 `.tmp/mobile-tools/preview-debug.p12` 生成预览签名。该签名与官方发布 APK 不一致，不能覆盖安装官方 APK，也不能通过应用内更新替换官方版本；直接安装时必须先卸载官方版，并会清除应用数据。需要覆盖升级并保留数据时，必须使用原官方签名密钥完成发布签名。
 
 iOS 构建入口 `scripts/build-mobile-ios.py` 生成未签名 IPA 和包含受版本管理源码的 Xcode ZIP；`--source-only` 只导出源码，无需 Xcode。脚本不会自动安装模拟器运行时；模拟器 SDK 编译与实际启动测试应分别记录。
 
