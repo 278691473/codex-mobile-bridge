@@ -9,14 +9,16 @@ import urllib.request
 from pathlib import Path
 from bridge.features.accounts.models import NoRedirect
 from bridge.app.lifecycle import private_json
-from bridge.clients.errors import BridgeUnavailable
-from bridge.clients.deepseek.setup import MARKER, insertion, verified_directory, legacy_account_configured
+from bridge.clients.errors import BridgeUnavailable, ResumePreflightBlocked
+from bridge.clients.file_mentions import file_mentions, display_file_mentions
+from bridge.features.sessions.create import ArchiveNotSent
+from bridge.clients.deepseek.setup import MARKER, insertion, verified_directory, legacy_account_configured, without_empty_array
 
 PLUGIN_ID = re.compile(r'''["']?id["']?\s*:\s*["']?codex-mobile-desktop(?:["'\s,}]|$)''')
-BRIDGE_REVISION = 4
-# Revisions 3 and 4 share the complete native-agent lifecycle schema. Revision
-# 4 only adds presentation fields; a verified revision 3 can prove safe restart.
-LIFECYCLE_REVISIONS = (3, BRIDGE_REVISION)
+BRIDGE_REVISION = 11
+# Revisions 3–10 share the complete native-agent lifecycle schema; presentation
+# and fork capability additions do not invalidate an older idle snapshot.
+LIFECYCLE_REVISIONS = (3, 4, 5, 6, 7, 8, 9, 10, BRIDGE_REVISION)
 UPDATE_REASON = 'Harness 接入需要更新，请结束任务后点击“重启并接入”'
 
 
@@ -38,6 +40,15 @@ class DeepSeek:
 
     def install(self):
         return self.ensure_installed()
+
+    def connection_error(self):
+        if not (self.home/'profiles/desktop/cordis.patch.yml').is_file():
+            return '未找到 Harness 桌面档案。使用 Web 或第三方客户端时，请在“第三方客户端：手动安装与绑定”中扫描并绑定其接入插件；官方桌面版请先启动一次并确认数据目录。'
+        return 'DeepSeek 桌面未连接，请安装接入插件并重新打开 Harness'
+
+    def repair_missing_connector(self, expected, check_stopped):
+        from bridge.clients.deepseek.orphan import repair
+        return repair(self, expected, check_stopped, private_json)
 
     def _line(self):
         entry = {'insert': [{'id': 'codex-mobile-desktop', 'name': (self.directory/'mobile-host.mjs').as_uri(),
@@ -145,7 +156,7 @@ class DeepSeek:
             if not backup.exists():
                 shutil.copyfile(patch, backup)
                 backup.chmod(0o600)
-            text += '\n'+MARKER+'\n'+line+'\n'
+            text = without_empty_array(text) + '\n'+MARKER+'\n'+line+'\n'
             _write_patch(patch, text)
         record = self.directory/'installation.json'
         if not record.exists() or not owned:
@@ -165,14 +176,37 @@ class DeepSeek:
         block = insertion(text)
         if not block or block[0] != json.loads(saved['line'][2:]) or len(PLUGIN_ID.findall(text)) != 1:
             raise ValueError('插件配置已被修改，请在 Harness 中检查后移除')
-        _write_patch(patch, text[:block[1]]+text[block[2]:])
+        remaining = text[:block[1]]+text[block[2]:]
+        backup = self.directory/'cordis.patch.before-mobile.yml'
+        if backup.is_file():
+            original = backup.read_text('utf-8')
+            normalized = without_empty_array(original)
+            if normalized != original and remaining.strip() == normalized.strip():
+                remaining = original
+        _write_patch(patch, remaining)
         # Invalidate the current generation immediately; reload removes the plugin.
         config = self.directory/'connection.json'
         private_json(config, {'token': secrets.token_urlsafe(32), 'endpoint': str(self.directory/'endpoint.json')})
         record.unlink()
         return {'installed': False, 'restartRequired': True}
 
+    def record_path(self, sid):
+        if self.call('status').get('recordLocation') is not True:
+            return None
+        value = self.call('record-location', sid)
+        path = value.get('path')
+        return path if isinstance(path, str) and Path(path).is_absolute() else None
+
     def call(self, action, sid=None, body=None):
+        if action == 'create' and body and 'model' in body and self.call('status').get('createModels') is not True:
+            raise ResumePreflightBlocked('Harness 接入需要更新后才能预设新会话模型；尚未创建会话')
+        if action == 'send' and body and body.get('resolvedReferences'):
+            body = {**body, 'text': file_mentions(body.get('text', ''), body['resolvedReferences'])}
+            body.pop('resolvedReferences')
+        if action == 'create' and body and body.get('directoryProject'):
+            project = body['directoryProject']
+            body = {**body, 'projectDirectory': project['directoryIdentity']}
+            body.pop('directoryProject')
         try:
             config = json.loads((self.directory/'connection.json').read_text())
             endpoint = json.loads((self.directory/'endpoint.json').read_text())
@@ -192,7 +226,9 @@ class DeepSeek:
                 message = 'Harness 拒绝了操作'
             raise BridgeUnavailable(message) from exc
         except (OSError, KeyError) as exc:
-            raise BridgeUnavailable('DeepSeek 桌面未连接，请安装接入插件并重新打开 Harness') from exc
+            raise BridgeUnavailable(self.connection_error()) from exc
+        if action == 'archive' and value.get('archiveNotSent') is True:
+            raise ArchiveNotSent(value.get('message') or '原生客户端拒绝归档，操作未发送')
         if action == 'detail':
             records = value.pop('records', [])
             value['messages'] = messages(records)
@@ -221,6 +257,14 @@ class DeepSeek:
                 self.use_existing(self.directory)
             value['updateRequired'] = self.legacy_protocol or value.get('bridgeRevision') != BRIDGE_REVISION
         return value
+
+    def project_environments(self):
+        state = self.call('status')
+        if not state.get('connected') or not state.get('projectDirectories'):
+            return []
+        return [{'surface': 'desktop', 'host': 'local', 'hostLabel': '此电脑',
+                 'name': 'DSH Desktop · 此电脑', 'scope': str(self.home),
+                 'createRequiresMessage': False}]
 
 
 def turns(records):
@@ -251,18 +295,59 @@ def turns(records):
 
 def messages(records):
     result = []
+    final_assistant = None
     for item in records:
         event = item.get('event', {})
         data = event.get('data') or {}
         kind = event.get('type')
+        if kind == 'turn/start':
+            final_assistant = None
+        if kind == 'turn/end':
+            if (final_assistant is not None and isinstance(data.get('reason'), dict)
+                    and data['reason'].get('kind') == 'completed'
+                    and type(event.get('seq')) is int and event['seq'] >= 0):
+                final_assistant['forkMessageId'] = str(event['seq'])
+            final_assistant = None
         if kind in ('user/message', 'assistant/message'):
-            content = data.get('message', data).get('content', [])
+            message = data.get('message', data)
+            metadata = {}
+            if event.get('time') is not None:
+                metadata['timestamp'] = event['time']
+            source_kind = (message.get('source') or {}).get('kind')
+            if kind == 'user/message' and isinstance(source_kind, str) and source_kind and source_kind != 'user':
+                metadata.update(role='activity', kind='context', title='上下文')
+            if kind == 'assistant/message':
+                selection = data.get('modelSelection') or {}
+                source = message.get('source') or {}
+                provider, model = source.get('provider'), source.get('model')
+                if isinstance(provider, str) and isinstance(model, str) and model:
+                    metadata['model'] = provider+'/'+model if provider else model
+                    if (selection.get('provider') == provider and selection.get('model') == model
+                            and isinstance(selection.get('reasoningEffort'), str)):
+                        metadata['effort'] = selection['reasoningEffort']
+            content = message.get('content', [])
             if isinstance(content, str):
                 content = [{'type': 'text', 'text': content}]
+            first_part = len(result)
             for i, block in enumerate(content):
-                text = block.get('text') or block.get('thinking') or ('[图片]' if block.get('type') == 'image' else '')
+                if block.get('type') == 'image':
+                    result.append({'id': str(event.get('seq'))+':'+str(i), 'role': kind.split('/')[0], 'text':'',
+                        'attachments':[{'type':'image','name':(block.get('attachment') or {}).get('name') or '图片',
+                                        '_nativeImage':{'seq':event.get('seq'),'part':i}}], **metadata})
+                    continue
+                text = block.get('text') or block.get('thinking') or ''
                 if text:
-                    result.append({'id': str(event.get('seq'))+':'+str(i), 'role': 'reasoning' if block.get('type') in ('thinking', 'reasoning') else kind.split('/')[0], 'text': text})
+                    result.append({'id': str(event.get('seq'))+':'+str(i), 'role': 'reasoning' if block.get('type') in ('thinking', 'reasoning') else kind.split('/')[0], 'text': text, **metadata})
+                    if kind == 'assistant/message' and result[-1]['role'] == 'assistant':
+                        final_assistant = result[-1]
+            visible = False
+            for row in result[first_part:]:
+                if row['role'] not in ('user', 'assistant') or visible:
+                    row.pop('timestamp', None)
+                else:
+                    visible = True
         elif kind in ('tool/call', 'tool/result', 'todo/write'):
             result.append({'id': str(event.get('seq')), 'role': 'activity', 'title': data.get('name') or data.get('toolName') or kind, 'text': json.dumps(data, ensure_ascii=False, indent=2)})
+    for message in result:
+        display_file_mentions(message)
     return result

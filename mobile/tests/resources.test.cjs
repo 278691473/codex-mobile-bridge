@@ -5,13 +5,27 @@ const fs = require('node:fs');
 const path = require('node:path');
 const root = path.resolve(__dirname, '../..');
 const read = value => fs.readFileSync(path.join(root, value), 'utf8');
-const shared = ['mobile-ui.js', 'mobile-clipboard.js', 'mobile-system-bars.js'];
+const shared = ['channel-link.js', 'mobile-ui.js', 'mobile-clipboard.js', 'mobile-system-bars.js'];
 const android = [...shared, 'mobile-session.js'];
 
 test('both Android variants register the downloaded-file viewer provider', () => {
   for (const manifest of ['mobile/android/AndroidManifest.xml', 'mobile/android-push/AndroidManifest.xml']) {
     const source = read(manifest);
     assert.match(source, /<provider[^>]*android:name="io\.github\.try2love\.codexbridge\.DownloadProvider"[^>]*android:exported="false"[^>]*android:grantUriPermissions="true"/);
+  }
+});
+
+test('both Android hosts declare the same private background monitoring service', () => {
+  for (const manifest of ['mobile/android/AndroidManifest.xml', 'mobile/android-push/AndroidManifest.xml']) {
+    const source = read(manifest);
+    for (const permission of ['FOREGROUND_SERVICE', 'FOREGROUND_SERVICE_SPECIAL_USE', 'ACCESS_NETWORK_STATE']) {
+      assert.ok(source.includes(`android.permission.${permission}`), `${manifest}: ${permission}`);
+    }
+    const service = source.match(/<service[^>]*android:name="io\.github\.try2love\.codexbridge\.MonitorService"[\s\S]*?<\/service>/)?.[0];
+    assert.ok(service, manifest);
+    assert.match(service, /android:exported="false"/);
+    assert.match(service, /android:foregroundServiceType="specialUse"/);
+    assert.match(service, /android\.app\.PROPERTY_SPECIAL_USE_FGS_SUBTYPE/);
   }
 });
 
@@ -63,7 +77,7 @@ test('ordinary APK and push Gradle package the same scripts without overlapping 
     assert.equal(new Set(names).size, names.length);
   }
   const loader = read('mobile/android/src/io/github/try2love/codexbridge/MobileWebScripts.java');
-  assert.deepEqual([...loader.matchAll(/"(mobile-[^"]+\.js)"/g)].map(([, name]) => name), android);
+  assert.deepEqual([...loader.match(/for\(String asset:new String\[\]\{([^}]+)\}/)[1].matchAll(/"([^"]+\.js)"/g)].map(([, name]) => name), android);
   assert.match(loader, /throw new IllegalStateException\("Missing mobile layout",e\)/);
 });
 
@@ -77,18 +91,21 @@ test('iOS missing resources stop connection visibly before replacing the current
   const connect = app.slice(app.indexOf('private func connect('), app.indexOf('@objc private func refresh()'));
   assert.match(connect, /do \{ scripts = try WebScripts\(\) \}\s+catch \{ info\(error\.localizedDescription\); return \}/);
   assert.ok(connect.indexOf('try WebScripts()') < connect.indexOf('clear()'));
-  assert.equal([...connect.matchAll(/injectionTime: \.atDocumentEnd, forMainFrameOnly: true/g)].length, 4);
-  assert.match(connect, /scripts\.appearance\.replacingOccurrences\(of: "__BRIDGE_CLIPBOARD_TOKEN__", with: clipboardToken\)/);
+  for (const script of ['WebScripts.fixedViewport', 'appearanceScript', 'clipboardScript', 'systemBarsScript']) {
+    assert.match(connect, new RegExp(`addUserScript\\(WKUserScript\\(source: ${script.replace('.', '\\.')}\\, injectionTime: \\.atDocumentEnd, forMainFrameOnly: true\\)\\)`));
+  }
+  assert.match(connect, /addUserScript\(WKUserScript\(source: "window\.BridgeMobileCapabilities = Object\.freeze\(\{ diagnosticsExport: true \}\);", injectionTime: \.atDocumentEnd, forMainFrameOnly: true\)\)/);
+  assert.match(connect, /\(scripts\.route\+"\\n"\+scripts\.appearance\)\.replacingOccurrences\(of: "__BRIDGE_CLIPBOARD_TOKEN__", with: clipboardToken\)/);
   assert.match(connect, /scripts\.clipboard\.replacingOccurrences\(of: "__BRIDGE_CLIPBOARD_TOKEN__", with: clipboardToken\)/);
   assert.doesNotMatch(app, /private static let web(Appearance|Clipboard) =/);
 });
 
 
-test('native apps package the three original client icons from the shared web source',()=>{
+test('native apps package client icons from the shared web source',()=>{
  const objects=xcodeObjects(),resources=[...objects.values()].find(body=>field(body,'isa')==='PBXResourcesBuildPhase'&&field(body,'files')?.includes('A00000000000000000000054'));
  const paths=ids(field(resources,'files')).map(id=>field(objects.get(field(objects.get(id),'fileRef')),'path'));
  const build=read('scripts/build-mobile-android.py'),gradle=read('mobile/android-push/build.gradle');
- for(const provider of ['codex','claude','deepseek'])assert.ok(paths.includes('../../web/client-icons/'+provider+'.png'));
+ for(const provider of ['codex','claude','deepseek','zcode','antigravity'])assert.ok(paths.includes('../../web/client-icons/'+provider+'.png'));
  assert.match(build,/archive.write\(ROOT\/'web\/client-icons'\/f'\{provider\}.png', 'assets\/'\+provider\+'.png'\)/);
  assert.ok(gradle.includes('../../web/client-icons'));
 });

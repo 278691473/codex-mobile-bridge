@@ -4,6 +4,7 @@ This short-lived helper only reads models, skills, login and configuration capab
 All thread mutations and all turns remain on the existing desktop IPC owner.
 """
 import hashlib
+import copy
 import json
 import logging
 import os
@@ -17,21 +18,86 @@ import time
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from bridge.features.accounts.models import model_ids
+from bridge.features.accounts.models import model_catalog
+from bridge.clients.codex.configuration import magpie_managed
 
 logger = logging.getLogger(__name__)
 SKILL_CACHE = 'skill-cache.json'
 SKILL_DB = 'skills-v2.sqlite3'
 SKILL_PAGE_LIMIT = 200
 SKILL_MAX_PAGE_LIMIT = 500
+MODEL_REFRESH_SECONDS = 12 * 60 * 60
 
 
 class CatalogError(RuntimeError):
     pass
 
 
+class CatalogIdentityChanged(CatalogError):
+    code = 'model_identity_changed'
+
+
 class SkillPathChanged(ValueError):
     pass
+
+
+class ModelStore:
+    """Durable catalog keyed by a digest of the execution identity."""
+
+    def __init__(self, home):
+        self.path = Path(home).resolve() / '.codex-mobile-bridge' / 'models-v1.sqlite3'
+
+    @staticmethod
+    def key(*parts):
+        return hashlib.sha256(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()
+
+    @staticmethod
+    def directory(value):
+        """Share discovery metadata, never a conversation's current state."""
+        result = {key: copy.deepcopy(value[key]) for key in
+                  ('models', 'groups', 'modelSource', 'source', 'modelSourcesVersion', 'fastMode', 'usageSummary') if key in value}
+        if isinstance(result.get('groups'), list):
+            result['groups'] = [{key: item for key, item in group.items()
+                if key in ('id', 'name', 'label', 'surface', 'source', 'models', 'modelSourcesVersion')}
+                for group in result['groups'] if isinstance(group, dict)]
+        return result
+
+    def _connect(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        db = sqlite3.connect(str(self.path), timeout=3)
+        db.execute('PRAGMA busy_timeout=3000')
+        db.execute('CREATE TABLE IF NOT EXISTS catalogs (identity TEXT PRIMARY KEY, updated_at REAL NOT NULL, value TEXT NOT NULL)')
+        self.path.chmod(0o600)
+        return db
+
+    def read(self, identity):
+        db = self._connect()
+        try:
+            row = db.execute('SELECT updated_at,value FROM catalogs WHERE identity=?', (identity,)).fetchone()
+        finally:
+            db.close()
+        if row:
+            return row[0], json.loads(row[1])
+        return None
+
+    def write(self, identity, value):
+        updated_at = time.time()
+        db = self._connect()
+        try:
+            db.execute('INSERT INTO catalogs VALUES (?,?,?) ON CONFLICT(identity) DO UPDATE SET updated_at=excluded.updated_at,value=excluded.value',
+                       (identity, updated_at, json.dumps(value, ensure_ascii=False)))
+            db.commit()
+        finally:
+            db.close()
+        return updated_at
+
+    def clear(self):
+        db = self._connect()
+        try:
+            db.execute('DELETE FROM catalogs')
+            db.commit()
+        finally:
+            db.close()
 
 
 class SkillStore:
@@ -250,9 +316,28 @@ class SkillStore:
 
 
 class Catalog:
-    METHODS = {"initialize", "model/list", "skills/list", "config/read", "account/read", "configRequirements/read"}
+    @classmethod
+    def normalize_models(cls, rows):
+        """Public model schema shared by desktop and existing WSL runtimes."""
+        result = []
+        for row in rows:
+            if not isinstance(row, dict) or row.get('hidden'):
+                continue
+            identifier = row.get('model') or row.get('id')
+            if not isinstance(identifier, str) or not identifier.strip():
+                continue
+            result.append({'id': identifier, 'name': row.get('displayName') or identifier,
+                           'description': row.get('description') or '',
+                           'efforts': [e['reasoningEffort'] for e in row.get('supportedReasoningEfforts') or []
+                                       if isinstance(e, dict) and e.get('reasoningEffort')],
+                           'defaultEffort': row.get('defaultReasoningEffort'),
+                           'isDefault': row.get('isDefault', False), 'fastTier': cls.fast_tier(row),
+                           'defaultServiceTier': row.get('defaultServiceTier')})
+        return result
 
-    def __init__(self, codex_home, executable=None, allow_background_refresh=True):
+    METHODS = {"initialize", "model/list", "skills/list", "config/read", "account/read", "getAuthStatus", "configRequirements/read"}
+
+    def __init__(self, codex_home, executable=None, allow_background_refresh=True, auth_status_only=False, observation_enabled=None):
         self.home = Path(codex_home)
         self._automatic_runtime = not executable
         self._executable = Path(executable) if executable else self.find_runtime()
@@ -260,9 +345,17 @@ class Catalog:
         self.lock = threading.Lock()
         self.kind_locks = {'models': threading.Lock(), 'skills': threading.Lock()}
         self.kind_caches = {'models': {}, 'skills': {}}
+        self.model_store = ModelStore(self.home)
+        self.model_provider_aliases = {}
+        self.model_refreshing = set()
+        self.model_retry_at = {}
+        self.model_refresh_lock = threading.Lock()
+        self.model_timers = {}
         self.skill_store = SkillStore(self.home)
         self.skill_refreshing = set()
         self.allow_background_refresh = allow_background_refresh
+        self.observation_enabled = observation_enabled or (lambda: True)
+        self.auth_status_only = auth_status_only
 
     @property
     def executable(self):
@@ -282,6 +375,127 @@ class Catalog:
             self.cache.clear()
         with self.kind_locks['models']:
             self.kind_caches['models'].clear()
+            self.model_provider_aliases.clear()
+        with self.model_refresh_lock:
+            for timer in self.model_timers.values():
+                timer.cancel()
+            self.model_timers.clear()
+        try:
+            self.model_store.clear()
+        except (OSError, sqlite3.DatabaseError):
+            logger.warning('Could not invalidate persisted model cache', exc_info=True)
+
+    def stop_model_refresh(self):
+        self.allow_background_refresh = False
+        with self.model_refresh_lock:
+            for timer in self.model_timers.values():
+                timer.cancel()
+            self.model_timers.clear()
+
+    def _model_scope(self, cwd):
+        """Fingerprint account and project configuration without guessing its provider."""
+        files = []
+        for name in ('auth.json', 'config.toml'):
+            try:
+                files.append(hashlib.sha256((self.home / name).read_bytes()).hexdigest())
+            except OSError:
+                files.append(None)
+        project_files = []
+        directory = Path(cwd).resolve()
+        # Project layers can override model_provider and its auth/base URL.
+        # Hash ancestor candidates conservatively; never cache another route
+        # merely because CODEX_HOME and the project directory stayed the same.
+        for parent in (directory, *directory.parents):
+            path = parent/'.codex/config.toml'
+            try:
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                digest = None
+            project_files.append((str(path), digest))
+        variables = {name: hashlib.sha256(value.encode()).hexdigest()
+                     for name, value in os.environ.items()
+                     if name in ('CODEX_HOME', 'OPENAI_API_KEY', 'OPENAI_BASE_URL')
+                     or name.endswith(('_API_KEY', '_AUTH_TOKEN', '_BEARER_TOKEN', '_BASE_URL'))}
+        # Do not reuse catalogs cached before desktop requests stopped borrowing
+        # gateway environment credentials.
+        return ModelStore.key('codex-desktop-scope-v3', str(self.home.resolve()), str(directory), files, variables, project_files)
+
+    def _model_provider(self, scope, provider):
+        if provider:
+            return provider
+        if scope not in self.model_provider_aliases:
+            record = None
+            if self.model_store.path.is_file():
+                try:
+                    record = self.model_store.read(ModelStore.key('native-default-provider-v1', scope))
+                except (OSError, sqlite3.DatabaseError, ValueError):
+                    pass
+            value = record[1].get('provider') if record and isinstance(record[1], dict) else None
+            self.model_provider_aliases[scope] = value if isinstance(value, str) and value else None
+        return self.model_provider_aliases[scope]
+
+    def model_identity(self, cwd, provider, *, require_verified=False):
+        scope = self._model_scope(cwd)
+        resolved = self._model_provider(scope, provider)
+        if require_verified and resolved is None:
+            return None
+        return ModelStore.key('codex-desktop-v3', scope, resolved)
+
+    def _remember_model_provider(self, scope, raw):
+        # Only the existing native config/read may resolve the default route.
+        # No helper or network request is allowed merely to render an identity.
+        provider = raw.get('_defaultProvider')
+        if not isinstance(provider, str) or not provider:
+            return
+        self.model_provider_aliases[scope] = provider
+        try:
+            self.model_store.write(ModelStore.key('native-default-provider-v1', scope), {'provider': provider})
+        except (OSError, sqlite3.DatabaseError):
+            logger.warning('Could not persist native model provider identity', exc_info=True)
+
+    def _start_model_refresh(self, cwd, provider, identity):
+        if not self.allow_background_refresh or not self.observation_enabled():
+            return
+        with self.model_refresh_lock:
+            if identity in self.model_refreshing or time.time() < self.model_retry_at.get(identity, 0):
+                return
+            self.model_refreshing.add(identity)
+        def run():
+            try:
+                if self.allow_background_refresh and self.observation_enabled():
+                    self.get_kind('models', cwd, refresh=True, provider=provider)
+            except (CatalogError, OSError, ValueError):
+                logger.warning('Background model refresh failed', exc_info=True)
+            finally:
+                with self.model_refresh_lock:
+                    self.model_retry_at[identity] = time.time() + 60
+                    self.model_refreshing.discard(identity)
+                if self.allow_background_refresh and self.observation_enabled() and self.model_identity(cwd, provider) == identity:
+                    try:
+                        record = self.model_store.read(identity)
+                    except (OSError, sqlite3.DatabaseError, ValueError):
+                        record = None
+                    self._schedule_model_refresh(cwd, provider, identity, record[0] if record else time.time(), retry=True)
+        threading.Thread(target=run, daemon=True, name='codex-model-refresh').start()
+
+    def _schedule_model_refresh(self, cwd, provider, identity, updated_at, retry=False, replace=False):
+        if not self.allow_background_refresh or not self.observation_enabled():
+            return
+        with self.model_refresh_lock:
+            if replace and identity in self.model_timers:
+                self.model_timers.pop(identity).cancel()
+            if identity in self.model_timers:
+                return
+            delay = max(60 if retry else 1, updated_at + MODEL_REFRESH_SECONDS - time.time())
+            def due():
+                with self.model_refresh_lock:
+                    self.model_timers.pop(identity, None)
+                if self.allow_background_refresh and self.observation_enabled() and self.model_identity(cwd, provider) == identity:
+                    self._start_model_refresh(cwd, provider, identity)
+            timer = threading.Timer(delay, due)
+            timer.daemon = True
+            self.model_timers[identity] = timer
+            timer.start()
 
     @staticmethod
     def find_runtime():
@@ -320,7 +534,8 @@ class Catalog:
             candidate = Path('/Applications') / (app + '.app') / 'Contents/Resources/codex-cli/bin/codex'
             if candidate.is_file():
                 return candidate
-        return None
+        executable = shutil.which('codex')
+        return Path(executable) if executable else None
 
     @staticmethod
     def find_linux_runtime():
@@ -342,6 +557,28 @@ class Catalog:
         executable = shutil.which('codex')
         return Path(executable) if executable else None
 
+    @staticmethod
+    def find_ssh_runtime(home):
+        """Locate the App-managed SSH runtime without installing or starting a daemon."""
+        home = Path(home)
+        state = home / 'app-server-daemon'
+        dedicated = home / 'packages/app-server-daemon'
+        if os.path.lexists(dedicated / 'current') or any(os.path.lexists(state / name) for name in
+                ('daemon.pid', 'daemon.stderr.log', 'daemon-updater.pid', 'daemon-updater.stderr.log')):
+            root = dedicated
+        elif any(os.path.lexists(state / name) for name in
+                 ('app-server.pid', 'app-server.stderr.log', 'app-server-updater.pid', 'app-server-updater.stderr.log')):
+            root = home / 'packages/standalone'
+        else:
+            root = dedicated
+        for candidate in (root / 'current/bin/codex', root / 'current/codex'):
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        fallback = shutil.which('codex') or str(Path.home() / '.local/bin/codex')
+        if Path(fallback).is_file() and os.access(fallback, os.X_OK):
+            return fallback
+        return None
+
     def linux_permission_capabilities(self, cwd, reader):
         if sys.platform != 'linux':
             raise ValueError('Linux permission discovery is unavailable on this host')
@@ -355,7 +592,12 @@ class Catalog:
         env['CODEX_HOME'] = str(self.home)
         options = {'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {}
         try:
-            process = subprocess.Popen([str(executable), 'app-server', '--listen', 'stdio://'], cwd=cwd, env=env,
+            # History can outlive its project directory. Only move the read-only
+            # helper's launch directory; RPCs and cache keys retain the original cwd.
+            launch_cwd = Path(cwd)
+            while not launch_cwd.is_dir() and launch_cwd != launch_cwd.parent:
+                launch_cwd = launch_cwd.parent
+            process = subprocess.Popen([str(executable), 'app-server', '--listen', 'stdio://'], cwd=launch_cwd, env=env,
                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                        text=True, encoding='utf-8', **options)
         except OSError as exc:
@@ -370,11 +612,17 @@ class Catalog:
                         continue
             finally:
                 messages.put(None)
+                process.stdout.close()
         reader = threading.Thread(target=read, daemon=True)
         reader.start()
         counter = 0
         def request(method, params, timeout=request_timeout):
             nonlocal counter
+            if self.auth_status_only and method == 'account/read':
+                # These callers need auth mode, not workspace routing discovery.
+                # The native runtime remains authoritative and never exports tokens.
+                return self.account_from_auth_status(request('getAuthStatus', {
+                    'includeToken': False, 'refreshToken': False}, timeout=timeout))
             linux_permission_read = (sys.platform == 'linux' and kind == 'linux-permissions' and
                                      method in ('permissionProfile/list', 'experimentalFeature/list'))
             if method not in self.METHODS and not linux_permission_read:
@@ -407,12 +655,13 @@ class Catalog:
             if kind == 'linux-permissions':
                 return permission_reader(request, cwd)
             if kind == 'models':
-                phase = time.monotonic();catalog = self.read_models(request, cwd, provider)
+                phase = time.monotonic();catalog = self.read_models(request, cwd, provider,
+                    metadata_request=lambda method, params: request(method, params, timeout=2))
                 logger.info('catalog models elapsed=%.3fs source=%s count=%d error=%r',
                             time.monotonic()-phase, catalog.get('modelSource'), len(catalog.get('models', [])), catalog.get('modelError'))
                 logger.info('catalog fetch complete elapsed=%.3fs', time.monotonic()-started)
                 return {**catalog, 'skillEntries': [],
-                        'fastMode': self.fast_mode(request, cwd) if catalog['modelSource'] == 'codex' else {'allowed': False}}
+                        'fastMode': self.fast_mode(request, cwd, provider) if catalog['modelSource'] == 'codex' else {'allowed': False}}
             if kind == 'skills':
                 phase = time.monotonic()
                 # A runtime busy with an active task can stall a Skill scan. Run
@@ -423,12 +672,13 @@ class Catalog:
                 logger.info('catalog fetch complete elapsed=%.3fs', time.monotonic()-started)
                 return {'models': [], 'kind': 'skills', 'skillEntries': skills.get('data', []), 'fastMode': {'allowed': False},
                         'modelSource': 'codex'}
-            phase = time.monotonic();catalog = self.read_models(request, cwd, provider)
+            phase = time.monotonic();catalog = self.read_models(request, cwd, provider,
+                metadata_request=lambda method, params: request(method, params, timeout=2))
             logger.info('catalog models elapsed=%.3fs source=%s count=%d error=%r',
                         time.monotonic()-phase, catalog.get('modelSource'), len(catalog.get('models', [])), catalog.get('modelError'))
             phase = time.monotonic();skills = request('skills/list', {'cwds': [cwd], 'forceReload': False}, timeout=request_timeout)
             logger.info('catalog skills elapsed=%.3fs count=%d', time.monotonic()-phase, len(skills.get('data', [])))
-            phase = time.monotonic();fast = self.fast_mode(request, cwd) if catalog['modelSource'] == 'codex' else {'allowed': False}
+            phase = time.monotonic();fast = self.fast_mode(request, cwd, provider) if catalog['modelSource'] == 'codex' else {'allowed': False}
             logger.info('catalog fast-mode elapsed=%.3fs allowed=%s', time.monotonic()-phase, fast.get('allowed'))
             logger.info('catalog fetch complete elapsed=%.3fs', time.monotonic()-started)
             return {**catalog, 'kind': kind, 'skillEntries': skills.get('data', []), 'fastMode': fast}
@@ -447,35 +697,75 @@ class Catalog:
                     process.kill()
                     process.wait()
             reader.join(timeout=1)
-            process.stdout.close()
 
-    def read_models(self, request, cwd, provider=None):
+    @staticmethod
+    def custom_provider(effective, provider=None):
+        provider = provider or effective.get('model_provider') or 'openai'
+        definition = (effective.get('model_providers') or {}).get(provider) or {}
+        # openai_base_url (and OPENAI_BASE_URL) only overrides routing. The
+        # native account still decides whether that route uses ChatGPT or a key.
+        return provider != 'openai' or any(definition.get(key) for key in
+            ('base_url', 'env_key', 'experimental_bearer_token', 'http_headers',
+             'env_http_headers', 'auth', 'gateway_oauth', 'query_params', 'aws'))
+
+    @staticmethod
+    def account_from_auth_status(status):
+        # Preserve the distinction used by upstream model discovery and Fast mode.
+        mode = status.get('authMethod')
+        if 'authMethod' not in status or mode not in (None, 'apikey', 'chatgpt', 'chatgptAuthTokens'):
+            raise CatalogError('无法确认 SSH 模型目录的认证类型')
+        account = None if mode is None else {'type': 'apiKey' if mode == 'apikey' else 'chatgpt'}
+        return {'account': account, 'requiresOpenaiAuth': status.get('requiresOpenaiAuth')}
+
+    def read_models(self, request, cwd, provider=None, metadata_request=None, environment=None):
+        # Desktop catalog reads have no verified owner environment. Only the
+        # native CLI path supplies a verified environment explicitly.
+        environment = {} if environment is None else environment
         config = request('config/read', {'includeLayers': False, 'cwd': cwd}).get('config', {})
         profile = (config.get('profiles') or {}).get(config.get('profile')) or {}
         effective = {**config, **profile}
-        provider = provider or effective.get('model_provider') or 'openai'
+        default_provider = effective.get('model_provider') or 'openai'
+        provider = provider or default_provider
         definition = (effective.get('model_providers') or {}).get(provider) or {}
-        base = definition.get('base_url') or (effective.get('openai_base_url') or os.environ.get('OPENAI_BASE_URL') if provider == 'openai' else None)
-        custom = provider != 'openai' or base or any(definition.get(k) for k in
-            ('env_key', 'experimental_bearer_token', 'http_headers', 'env_http_headers', 'auth', 'gateway_oauth'))
-        auth = {} if custom else request('account/read', {'refreshToken': False}).get('account') or {}
-        if custom or auth.get('type') == 'apiKey':
-            result = {'models': [], 'modelSource': 'api', 'currentEffort': effective.get('model_reasoning_effort')}
+        if magpie_managed(config=effective) and provider == (effective.get('model_provider') or 'openai'):
+            models, cursor = [], None
+            for _ in range(10):
+                response = request('model/list', {'cursor': cursor, 'limit': 100, 'includeHidden': False})
+                models.extend(response.get('data', []))
+                cursor = response.get('nextCursor')
+                if not cursor:
+                    break
+            return {'models': models, 'modelSource': 'magpie', '_defaultProvider': default_provider,
+                    'currentEffort': effective.get('model_reasoning_effort'), 'fastMode': {'allowed': False}}
+        base = definition.get('base_url') or (effective.get('openai_base_url') or environment.get('OPENAI_BASE_URL') if provider == 'openai' else None)
+        custom = self.custom_provider(effective, provider)
+        # The runtime resolves explicit catalog paths and applies model visibility rules.
+        configured_catalog = bool(effective.get('model_catalog_json')) and provider == (effective.get('model_provider') or 'openai')
+        auth = {} if custom or configured_catalog else request('account/read', {'refreshToken': False}).get('account') or {}
+        if not configured_catalog and (custom or auth.get('type') == 'apiKey'):
+            result = {'models': [], 'modelSource': 'api', '_defaultProvider': default_provider,
+                      'currentEffort': effective.get('model_reasoning_effort')}
             try:
-                if any(definition.get(k) for k in ('http_headers', 'env_http_headers', 'auth', 'gateway_oauth', 'query_params', 'aws')):
+                if any(definition.get(k) for k in ('auth', 'gateway_oauth', 'aws')):
                     raise ValueError('此 API 接入使用额外认证配置，请手动填写模型 ID')
-                if not base and provider != 'openai':
+                if not base and custom:
                     raise ValueError('未找到当前 API 地址，请检查接入配置')
-                key = (os.environ.get(definition['env_key'], '') if definition.get('env_key')
+                headers = {name.lower(): value for name, value in (definition.get('http_headers') or {}).items()}
+                for name, variable in (definition.get('env_http_headers') or {}).items():
+                    value = environment.get(variable)
+                    if not value:
+                        raise ValueError('未找到当前 API 认证请求头，请检查接入环境变量')
+                    headers[name.lower()] = value
+                key = (environment.get(definition['env_key'], '') if definition.get('env_key')
                        else definition.get('experimental_bearer_token') or '')
                 if definition.get('env_key') and not key:
                     raise ValueError('未找到当前 API Key，请检查接入配置')
-                if not key and (provider == 'openai' or definition.get('requires_openai_auth')):
+                if not key and (definition.get('requires_openai_auth') or (provider == 'openai' and not headers)):
                     try:
                         saved = json.loads((self.home/'auth.json').read_text(encoding='utf-8'))
                     except (OSError, ValueError):
                         saved = {}
-                    key = saved.get('OPENAI_API_KEY') or os.environ.get('OPENAI_API_KEY', '')
+                    key = saved.get('OPENAI_API_KEY') or environment.get('OPENAI_API_KEY', '')
                     if not key:
                         raise ValueError('未找到当前 API Key，请检查接入配置')
                 base = base or 'https://api.openai.com/v1'
@@ -483,8 +773,32 @@ class Catalog:
                 if (endpoint.scheme not in ('https', 'http') or not endpoint.hostname or
                         endpoint.username or endpoint.password or endpoint.query or endpoint.fragment):
                     raise ValueError('未找到当前 API 地址，请检查接入配置')
-                ids = model_ids(base, key)
-                result['models'] = [{'model': identifier, 'displayName': identifier} for identifier in ids]
+                if key and headers:
+                    headers['authorization'] = 'Bearer ' + key
+                options = {}
+                if headers:
+                    options['headers'] = headers
+                if definition.get('query_params'):
+                    options['query_params'] = definition['query_params']
+                models = model_catalog(base, key, **options)
+                # The upstream remains the authority for availability. Native
+                # capabilities may fill missing metadata only for exact IDs;
+                # never replace a failed upstream list with bundled models.
+                if any(not row['efforts'] for row in models):
+                    try:
+                        response = (metadata_request or request)('model/list', {
+                            'cursor': None, 'limit': 100, 'includeHidden': False})
+                        native = {row.get('model', row.get('id')): row for row in response.get('data', [])}
+                        for row in models:
+                            info = native.get(row['id'], {})
+                            if not row['efforts']:
+                                row['efforts'] = [level['reasoningEffort'] for level in info.get('supportedReasoningEfforts', [])]
+                                row['defaultEffort'] = info.get('defaultReasoningEffort')
+                    except CatalogError:
+                        pass  # Optional metadata must not discard a valid upstream list.
+                result['models'] = [{'model': row['id'], 'displayName': row['name'],
+                    'supportedReasoningEfforts': [{'reasoningEffort': effort} for effort in row['efforts']],
+                    'defaultReasoningEffort': row.get('defaultEffort')} for row in models]
             except ValueError as exc:
                 result['modelError'] = str(exc)
             return result
@@ -495,28 +809,31 @@ class Catalog:
             cursor = response.get('nextCursor')
             if not cursor:
                 break
-        return {'models': models, 'modelSource': 'codex', 'currentEffort': effective.get('model_reasoning_effort')}
+        return {'models': models, 'modelSource': 'codex', '_defaultProvider': default_provider,
+                'currentEffort': effective.get('model_reasoning_effort')}
 
     @staticmethod
-    def fast_mode(request, cwd):
+    def fast_mode(request, cwd, provider=None):
         # Return capability metadata only; credentials/config contents stay in the runtime.
         unavailable = {'allowed': False}
         try:
             config = request('config/read', {'includeLayers': False, 'cwd': cwd}).get('config', {})
             profile = (config.get('profiles') or {}).get(config.get('profile'), {})
             effective = {**config, **profile}
-            provider = effective.get('model_provider') or 'openai'
+            configured_provider = effective.get('model_provider') or 'openai'
+            provider = provider or configured_provider
             definition = (effective.get('model_providers') or {}).get(provider) or {}
-            if provider != 'openai' or effective.get('openai_base_url') or any(definition.get(key) for key in
-                    ('base_url', 'env_key', 'experimental_bearer_token', 'http_headers', 'env_http_headers', 'auth', 'gateway_oauth')):
-                return unavailable
-            auth = request('account/read', {'refreshToken': False})
-            if (auth.get('account') or {}).get('type') != 'chatgpt' or auth.get('requiresOpenaiAuth') is not True:
-                return unavailable
+            configured_catalog = bool(effective.get('model_catalog_json')) and provider == configured_provider
+            if not configured_catalog:
+                if Catalog.custom_provider(effective, provider):
+                    return unavailable
+                auth = request('account/read', {'refreshToken': False})
+                if (auth.get('account') or {}).get('type') != 'chatgpt' or auth.get('requiresOpenaiAuth') is not True:
+                    return unavailable
             requirements = request('configRequirements/read', {}).get('requirements') or {}
             features = {**(config.get('features') or {}), **(profile.get('features') or {})}
             allowed = features.get('fast_mode') is not False and (requirements.get('featureRequirements') or {}).get('fast_mode') is not False
-            return {'allowed': allowed, 'defaultServiceTier': effective.get('service_tier')}
+            return {'allowed': allowed, 'provider': provider, 'defaultServiceTier': effective.get('service_tier')}
         except CatalogError:
             # Older/offline runtimes still expose their existing model and Skill list.
             return unavailable
@@ -558,11 +875,13 @@ class Catalog:
                                   refreshed_at=0, bucket_id=bucket, state='legacy', selected=selected)
 
     def _start_skill_refresh(self, cwd, provider, bucket):
-        if not self.allow_background_refresh or bucket in self.skill_refreshing:
+        if not self.allow_background_refresh or not self.observation_enabled() or bucket in self.skill_refreshing:
             return bucket in self.skill_refreshing
         self.skill_refreshing.add(bucket)
         def run():
             try:
+                if not self.allow_background_refresh or not self.observation_enabled():
+                    return
                 raw = self._fetch(cwd, provider, 'skills', 90)
                 skills, errors = self._skill_rows(raw, cwd)
                 try:
@@ -601,22 +920,65 @@ class Catalog:
         offset = max(0, int(offset))
         limit = min(SKILL_MAX_PAGE_LIMIT, max(1, int(limit)))
         if kind == 'models':
-            key = (cwd, provider)
+            scope = self._model_scope(cwd)
+            identity = self.model_identity(cwd, provider)
+            try:
+                persisted = self.model_store.read(identity)
+            except (OSError, sqlite3.DatabaseError, ValueError):
+                persisted = None
+                logger.warning('Could not read model cache', exc_info=True)
+            if persisted and not refresh:
+                stale = time.time() - persisted[0] >= MODEL_REFRESH_SECONDS
+                if stale:
+                    self._start_model_refresh(cwd, provider, identity)
+                else:
+                    self._schedule_model_refresh(cwd, provider, identity, persisted[0])
+                return {**ModelStore.directory(persisted[1]), 'kind': 'models', 'cache': {'state': 'stale' if stale else 'fresh', 'updatedAt': persisted[0], 'identity': identity}}
             with self.kind_locks[kind]:
-                cached = self.kind_caches[kind].get(key)
-                if cached and not refresh and time.monotonic() - cached[0] < 300:
-                    return cached[1]
-                raw = self._fetch(cwd, provider, kind)
-                models = [{'id': m.get('model', m.get('id')), 'name': m.get('displayName', m.get('model')),
-                           'description': m.get('description', ''), 'efforts': [e['reasoningEffort'] for e in m.get('supportedReasoningEfforts', [])],
-                           'defaultEffort': m.get('defaultReasoningEffort'), 'isDefault': m.get('isDefault', False), 'fastTier': self.fast_tier(m),
-                           'defaultServiceTier': m.get('defaultServiceTier')} for m in raw['models'] if not m.get('hidden')]
+                # A second request may have learned the native provider while this one waited.
+                scope = self._model_scope(cwd)
+                identity = self.model_identity(cwd, provider)
+                if not refresh:
+                    try:
+                        persisted = self.model_store.read(identity)
+                    except (OSError, sqlite3.DatabaseError, ValueError):
+                        persisted = None
+                    if persisted:
+                        return {**ModelStore.directory(persisted[1]), 'kind': 'models', 'cache': {'state': 'fresh', 'updatedAt': persisted[0], 'identity': identity}}
+                try:
+                    raw = self._fetch(cwd, provider, kind)
+                except CatalogError as exc:
+                    if self._model_scope(cwd) != scope:
+                        raise CatalogIdentityChanged('模型接入已变化，请重试') from exc
+                    if persisted:
+                        return {**ModelStore.directory(persisted[1]), 'kind': 'models', 'modelError': str(exc),
+                                'cache': {'state': 'stale', 'updatedAt': persisted[0], 'identity': identity}}
+                    return {'models': [], 'kind': 'models', 'modelError': str(exc),
+                            'fastMode': {'allowed': False}, 'cache': {'state': 'unavailable', 'identity': identity}}
+                if self._model_scope(cwd) != scope:
+                    raise CatalogIdentityChanged('模型接入已变化，请重试')
+                self._remember_model_provider(scope, raw)
+                identity = self.model_identity(cwd, provider)
+                models = self.normalize_models(raw['models'])
                 value = {'models': models, 'kind': 'models', 'modelSource': raw.get('modelSource', 'codex'),
                          'fastMode': raw.get('fastMode', {'allowed': False}),
                          'modelError': raw.get('modelError'), 'currentModel': raw.get('currentModel'),
                          'currentEffort': raw.get('currentEffort')}
-                self.kind_caches[kind][key] = (time.monotonic(), value)
-                return value
+                if self.model_identity(cwd, provider) != identity:
+                    raise CatalogIdentityChanged('模型接入已变化，请重试')
+                if value.get('modelError') or not models:
+                    value['modelError'] = value.get('modelError') or '模型目录暂不可用，可手动填写模型'
+                    return ({**ModelStore.directory(persisted[1]), 'kind': 'models', 'modelError': value['modelError'],
+                             'cache': {'state': 'stale', 'updatedAt': persisted[0], 'identity': identity}} if persisted else
+                            {**value, 'cache': {'state': 'unavailable', 'identity': identity}})
+                try:
+                    updated_at = self.model_store.write(identity, ModelStore.directory(value))
+                except (OSError, sqlite3.DatabaseError):
+                    logger.warning('Could not persist model catalog', exc_info=True)
+                    updated_at = time.time()
+                self._schedule_model_refresh(cwd, provider, identity, updated_at, replace=True)
+                return {**ModelStore.directory(value), 'kind': 'models',
+                        'cache': {'state': 'fresh', 'updatedAt': updated_at, 'identity': identity}}
 
         bucket = self.skill_store.bucket(cwd)
         with self.kind_locks['skills']:
@@ -688,15 +1050,32 @@ class Catalog:
     def get(self, cwd, refresh=False, provider=None):
         cwd = str(Path(cwd).resolve())
         with self.lock:
-            key = (cwd, provider)
+            scope = self._model_scope(cwd)
+            identity = self.model_identity(cwd, provider)
+            key = (cwd, identity)
             cached = self.cache.get(key)
             if cached and not refresh and time.monotonic() - cached[0] < 300:
-                return cached[1]
-            raw = self._fetch(cwd, provider)
-            models = [{'id': m.get('model', m.get('id')), 'name': m.get('displayName', m.get('model')),
-                       'description': m.get('description', ''), 'efforts': [e['reasoningEffort'] for e in m.get('supportedReasoningEfforts', [])],
-                       'defaultEffort': m.get('defaultReasoningEffort'), 'isDefault': m.get('isDefault', False), 'fastTier': self.fast_tier(m),
-                       'defaultServiceTier': m.get('defaultServiceTier')} for m in raw['models'] if not m.get('hidden')]
+                value = copy.deepcopy(cached[1])
+                try:
+                    persisted = self.model_store.read(identity)
+                except (OSError, sqlite3.DatabaseError, ValueError):
+                    persisted = None
+                if persisted:
+                    value.update(ModelStore.directory(persisted[1]))
+                    value['cache'] = {'state': 'stale' if time.time()-persisted[0] >= MODEL_REFRESH_SECONDS else 'fresh',
+                                      'updatedAt': persisted[0], 'identity': identity}
+                return value
+            try:
+                raw = self._fetch(cwd, provider)
+            except CatalogError:
+                self.cache.pop(key, None)
+                raise
+            if self._model_scope(cwd) != scope:
+                raise CatalogIdentityChanged('模型接入已变化，请重试')
+            self._remember_model_provider(scope, raw)
+            identity = self.model_identity(cwd, provider)
+            key = (cwd, identity)
+            models = self.normalize_models(raw['models'])
             skills, errors = [], []
             for entry in raw['skillEntries']:
                 errors.extend(entry.get('errors', []))
@@ -710,5 +1089,37 @@ class Catalog:
             value = {'models': models, 'skills': skills, 'errors': errors, 'fastMode': raw.get('fastMode', {'allowed': False}),
                      'modelSource': raw.get('modelSource', 'codex'), 'modelError': raw.get('modelError'),
                      'currentModel': raw.get('currentModel'), 'currentEffort': raw.get('currentEffort')}
-            self.cache[key] = (time.monotonic(), value)
+            # The legacy combined endpoint uses the same directory as the picker;
+            # only Skill results retain its short in-memory lifetime.
+            value = {key: item for key, item in value.items() if item is not None}
+            if value.get('modelError'):
+                self.cache.pop(key, None)
+            else:
+                directory = ModelStore.directory(value)
+                try:
+                    updated_at = self.model_store.write(identity, directory)
+                except (OSError, sqlite3.DatabaseError):
+                    updated_at = time.time()
+                value['cache'] = {'state': 'fresh', 'updatedAt': updated_at, 'identity': identity}
+                self.cache[key] = (time.monotonic(), {**directory, 'skills': skills, 'errors': errors,
+                                                     'cache': value['cache']})
             return value
+
+
+def normalize_native_skills(raw, cwd):
+    """Normalize enabled skills from the selected execution environment only."""
+    rows, errors = [], []
+    for entry in raw.get('data', []):
+        if entry.get('cwd') != cwd:
+            continue
+        errors.extend(entry.get('errors') or [])
+        for skill in entry.get('skills') or []:
+            if not skill.get('enabled', True) or not skill.get('path') or not skill.get('name'):
+                continue
+            path = skill['path']
+            rows.append({'id': hashlib.sha256(path.encode()).hexdigest(),
+                         'path': path, 'name': skill['name'],
+                         'description': skill.get('description', ''),
+                         'scope': skill.get('scope'),
+                         'displayName': (skill.get('interface') or {}).get('displayName') or skill['name']})
+    return rows, errors

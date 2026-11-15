@@ -12,10 +12,365 @@ import org.json.*;
 import java.util.*;
 import java.util.concurrent.*;
 
-public final class MainActivity extends Activity {
+public final class MainActivity extends Activity implements SharedPreferences.OnSharedPreferenceChangeListener {
+ private GatewayMenu gatewayPopup;
+ private int channelTicket; private long lastProbeMs; private String lastProbeNetwork="";
+ private android.net.ConnectivityManager.NetworkCallback channelNetwork;
+ private final Runnable routeChanged=()->{if(this.resumed){if(this.web!=null)checkChannels(this.web.getUrl(),false,"network");else checkComputers();}};
+ private final Runnable channelCatalogTick=new Runnable(){
+  public void run(){
+   if(!resumed)return;
+   if(web!=null)checkChannels(web.getUrl(),false,"tick");
+   homeHandler.postDelayed(this,30000);
+  }
+ };
+ private void watchChannels(){
+  if(channelNetwork!=null)return;homeHandler.postDelayed(channelCatalogTick,30000);
+  channelNetwork=new android.net.ConnectivityManager.NetworkCallback(){
+   @Override public void onLost(android.net.Network n){homeHandler.removeCallbacks(routeChanged);homeHandler.postDelayed(routeChanged,400);}
+   @Override public void onAvailable(android.net.Network n){homeHandler.removeCallbacks(routeChanged);homeHandler.postDelayed(routeChanged,400);}
+  };
+  getSystemService(android.net.ConnectivityManager.class).registerDefaultNetworkCallback(channelNetwork);
+ }
+ private void stopWatchingChannels(){
+  rollbackPeer();cancelChannelJobs();channelTicket++;lastProbeNetwork="";homeHandler.removeCallbacks(routeChanged);homeHandler.removeCallbacks(channelCatalogTick);
+  if(channelNetwork!=null){getSystemService(android.net.ConnectivityManager.class).unregisterNetworkCallback(channelNetwork);channelNetwork=null;}
+ }
+ private boolean onWifi(){
+  android.net.ConnectivityManager cm=getSystemService(android.net.ConnectivityManager.class);
+  android.net.NetworkCapabilities capabilities=cm.getNetworkCapabilities(cm.getActiveNetwork());
+  return capabilities!=null&&(capabilities.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)||capabilities.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET));
+ }
+ private final Map<String,Map<String,Long>> routeTimes=new HashMap<>();
+ private final Map<String,Long> routeTraffic=new HashMap<>();
+ private final Map<String,LinearLayout> addressLists=new HashMap<>();
+ private final Map<String,TextView> computerTitles=new HashMap<>();
+ private final Map<String,Long> manifestReads=new HashMap<>();
+ private String arrivingVia; private Runnable deferredRoute;
+ private List<String> catalog(String address){
+  JSONObject record=GatewayChannels.record(prefs,address);
+  if(record!=null)try{return GatewayChannels.endpoints(record);}catch(Exception ignored){}
+  return Collections.singletonList(address);
+ }
+ private String preferenceKey(String name,String address){
+  return GatewayChannels.preferenceKey(prefs,name,address);
+ }
+ private List<String> addresses(String address){
+  List<String> enabled=new ArrayList<>(catalog(address));
+  enabled.removeIf(url->!GatewayChannels.enabled(prefs,address,url));return enabled;
+ }
+ private void manageComputer(String address){
+  List<String> urls=catalog(address);String key=preferenceKey("disabled-channels",address);
+  Set<String> disabled=new HashSet<>(prefs.getStringSet(key,Collections.emptySet()));
+  LinearLayout content=ui.column();content.setPadding(dp(16),dp(8),dp(16),dp(8));
+  for(String url:urls){
+   SettingsUi.ToggleRow[] row=new SettingsUi.ToggleRow[1];
+   String id=GatewayChannels.selectionId(url);row[0]=ui.toggle(content,url,!disabled.contains(id),()->{if(!disabled.remove(id))disabled.add(id);row[0].checked(!disabled.contains(id));});
+  }
+  ScrollView scroll=new ScrollView(ui.context);scroll.addView(content);
+  new AlertDialog.Builder(ui.context).setTitle(L("管理这台电脑")).setView(scroll)
+   .setNeutralButton(L("移除此电脑"),(dialog,which)->confirmRemove(address))
+   .setPositiveButton(L("保存"),(dialog,which)->{prefs.edit().putStringSet(key,disabled).apply();MonitorService.bindingsChanged();paintAddresses(address);checkComputers();}).show();
+ }
+ private Map<String,Long> times(JSONObject d){return routeTimes.computeIfAbsent(d.optString("deviceId"),key->new LinkedHashMap<>());}
+ private void paintAddresses(String address){
+  LinearLayout list=addressLists.get(address);if(list==null)return;
+  List<String> urls=addresses(address);JSONObject record=GatewayChannels.record(prefs,address);
+  if(urls.equals(list.getTag())){
+   for(int i=0;i<urls.size();i++){boolean ok=record!=null&&times(record).getOrDefault(urls.get(i),-1L)>=0;TextView dot=(TextView)((LinearLayout)list.getChildAt(i)).getChildAt(0);dot.setText(ok?"●":"○");dot.setTextColor(ok?(ui.dark?0xff73cda6:0xff23815b):mutedColor());}
+   return;
+  }
+  list.setTag(urls);list.removeAllViews();
+  for(String url:urls){
+   boolean online=record!=null&&times(record).getOrDefault(url,-1L)>=0;
+   LinearLayout line=new LinearLayout(ui.context);TextView dot=text(online?"●":"○",14);
+   dot.setTextColor(online?(ui.dark?0xff73cda6:0xff23815b):mutedColor());line.addView(dot);
+   TextView value=text(url,13);value.setPadding(dp(7),0,0,0);value.setTextColor(mutedColor());line.addView(value);list.addView(line);
+   if(record==null)homeStates.put(address,dot);
+  }
+ }
+ private int inspectionGeneration=-1;
+ private JSONObject channelMenu(){
+  JSONObject d=GatewayChannels.record(prefs,origin),out=new JSONObject();if(d==null)return out;
+  try{JSONArray rows=new JSONArray();for(String url:addresses(origin))rows.put(new JSONObject().put("url",url).put("ms",times(d).getOrDefault(url,-1L)));
+   out.put("localNetwork",onWifi()).put("probing",inspectionGeneration==generation).put("current",origin).put("rows",rows).put("mode",prefs.getString(preferenceKey("channel-mode",origin),"auto"));
+  }catch(Exception ignored){}return out;
+ }
+ private void changedChannel(String next){android.widget.Toast.makeText(this,L("已切换连接信道")+" · "+next,android.widget.Toast.LENGTH_SHORT).show();}
+ private void refreshRoutes(String address,JSONObject d,String via,DeviceBinding.Credential root){
+  String id=d.optString("deviceId");long now=android.os.SystemClock.elapsedRealtime();
+  if(now-manifestReads.getOrDefault(id,-90000L)<90000)return;
+  manifestReads.put(id,now);
+  worker.execute(()->{try{
+   JSONObject next=GatewayChannels.refresh(d,via,root);
+   runOnUiThread(()->{
+    String active=activeChannel(address);JSONObject previous=GatewayChannels.record(prefs,active);
+    DeviceBinding.Credential live=DeviceBinding.load(this,GatewayChannels.vault(id));
+    if(!saved().contains(active)||previous==null||!id.equals(previous.optString("deviceId"))||live==null||!live.token.equals(root.token))return;
+    if(previous.toString().equals(next.toString()))return;
+    prefs.edit().putString("channels:"+active,next.toString()).apply();paintAddresses(active);
+    TextView title=computerTitles.get(active);if(title!=null)title.setText(computerName(active));
+    if(web!=null&&active.equals(origin))web.evaluateJavascript("window.dispatchEvent(new Event('bridge-channel-sample'))",null);
+   });
+  }catch(Exception ignored){}});
+ }
+ private final List<Future<?>> channelJobs=new ArrayList<>();
+ private void cancelChannelJobs(){inspectionGeneration=-1;for(Future<?> job:channelJobs)job.cancel(true);channelJobs.clear();}
+ private interface ChannelSample { void accept(String url,long millis,boolean select); }
+ private void sweep(String address,JSONObject d,List<String> targets,java.util.function.BooleanSupplier current,ChannelSample sample,Runnable exhausted){
+  sweep(address,d,targets,current,sample,exhausted,()->{});
+ }
+ private void sweep(String address,JSONObject d,List<String> targets,java.util.function.BooleanSupplier current,ChannelSample sample,Runnable exhausted,Runnable finished){
+  DeviceBinding.Credential primary=DeviceBinding.load(this,GatewayChannels.vault(d.optString("deviceId")));
+  if(primary==null){exhausted.run();finished.run();return;}
+  boolean[] any={false};
+  channelJobs.removeIf(Future::isDone);
+  channelJobs.add(probes.submit(()->{try{
+   GatewayChannels.probe(d,primary.token,targets,(url,ms)->runOnUiThread(()->{
+    if(!current.getAsBoolean())return;
+    DeviceBinding.Credential live=DeviceBinding.load(this,GatewayChannels.vault(d.optString("deviceId")));
+    if(live==null||!live.cookie().equals(primary.cookie())||!d.optString("anchor").equals(GatewayChannels.record(prefs,address)==null?"":GatewayChannels.record(prefs,address).optString("anchor")))return;
+    long trafficAt=routeTraffic.getOrDefault(url,-30000L);
+    long result=ms<0&&pageReady&&url.equals(origin)&&android.os.SystemClock.elapsedRealtime()-trafficAt<30000?times(d).getOrDefault(url,-1L):ms;
+    times(d).put(url,result);
+    boolean first=ms>=0&&!any[0];
+    if(first){any[0]=true;refreshRoutes(address,d,url,primary);}
+    JSONObject policy=d.optJSONObject("race");
+    sample.accept(url,ms,first&&(policy==null||"firstVerified".equals(policy.optString("select"))));
+   }));
+  }catch(Exception ignored){}finally{runOnUiThread(()->{if(current.getAsBoolean()&&!any[0])exhausted.run();finished.run();});}}));
+ }
+ private boolean checkChannels(String requested,boolean failure){return checkChannels(requested,failure,"signal");}
+ private boolean checkChannels(String requested,boolean failure,String reason){
+  if(web==null||GatewayChannels.record(prefs,origin)==null)return false;
+  if(pageReady)web.evaluateJavascript("window.BridgeChannelLink?.check("+JSONObject.quote(reason)+")",null);
+  else if(failure && !"manual".equals(prefs.getString(preferenceKey("channel-mode",origin),"auto"))){
+   List<String> candidates=addresses(origin);candidates.removeIf(url->url.equals(origin)||(!origin.startsWith("http://")&&!(onWifi()&&url.startsWith("http://"))));
+   if(!candidates.isEmpty())raceActive(requested,true,null,false,candidates,false);
+  }
+  return true;
+ }
+ private String channelCommand(String cmd){
+  JSONObject d=GatewayChannels.record(prefs,origin);if(d==null||cmd==null)return null;
+  String key=preferenceKey("channel-mode",origin);
+  if(cmd.equals("mode:auto")||cmd.equals("mode:manual")){channelTicket++;prefs.edit().putString(key,cmd.substring(5)).apply();return channelMenu().toString();}
+  if(cmd.startsWith("verify:")&&cmd.substring(7).matches("[0-9]{1,12}")){
+   String address=origin,id=cmd.substring(7);WebView page=web;
+   java.util.function.BooleanSupplier valid=()->resumed&&web==page&&address.equals(origin);
+   sweep(address,d,Collections.singletonList(address),valid,(u,ms,first)->{if(ms>=0)page.evaluateJavascript("window.BridgeChannelLink?.result("+id+",true)",null);},
+    ()->page.evaluateJavascript("window.BridgeChannelLink?.result("+id+",false)",null));return "started";
+  }
+  if(cmd.startsWith("traffic:")&&cmd.substring(8).matches("[0-9]{1,6}")){
+   long ms=Long.parseLong(cmd.substring(8));if(ms>120000)return "invalid";
+   routeTraffic.put(origin,android.os.SystemClock.elapsedRealtime());times(d).put(origin,ms);return "ok";
+  }
+  if(cmd.equals("unreachable")){channelUnavailable();return "ok";}
+  if(cmd.startsWith("prefer:")||cmd.startsWith("outage:")||cmd.startsWith("retry:")){
+   if(!"manual".equals(prefs.getString(key,"auto"))&&cmd.length()<32768)try{
+    JSONArray selection=new JSONArray(cmd.substring(cmd.indexOf(':')+1));List<String> urls=new ArrayList<>();
+    for(int i=0;i<selection.length();i++)urls.add(selection.getString(i));
+    raceActive(web.getUrl(),!cmd.startsWith("prefer:"),null,false,urls,cmd.startsWith("outage:"));
+   }catch(JSONException invalid){return "invalid";}
+   return "ok";
+  }
+  if(pendingPeer!=null&&cmd.equals("ready:"+pendingPeer.nonce)){
+   Peer next=pendingPeer;endPeerWindow();pendingPeer=null;return next.commit.getAsBoolean()?"accepted":"expired";
+  }
+  if(pendingPeer!=null&&cmd.equals("failed:"+pendingPeer.nonce)){
+   endPeerWindow();rollbackPeer();Toast.makeText(this,L("信道暂不可达"),Toast.LENGTH_SHORT).show();return "ok";
+  }
+  return null;
+ }
+ private void channelUnavailable(){Toast.makeText(this,L("当前信道不可达，请手动切换连接信道"),Toast.LENGTH_LONG).show();}
+ private boolean raceActive(String requested,boolean failure,String forced,boolean inspect){return raceActive(requested,failure,forced,inspect,null,false);}
+ private boolean raceActive(String requested,boolean failure,String forced,boolean inspect,List<String> allowed,boolean notifyFailure){
+  final String address=origin;final JSONObject d=GatewayChannels.record(prefs,address);
+  if(d==null||web==null||!resumed)return false;
+  List<String> targets=addresses(address);if(forced!=null&&!targets.contains(forced))return false;
+  if(allowed!=null)targets.retainAll(allowed);
+  if(targets.isEmpty()){if(notifyFailure)channelUnavailable();return false;}
+  if(inspect && inspectionGeneration==generation)return true;
+  if(inspect)inspectionGeneration=generation;
+  String net=address+"|"+getSystemService(android.net.ConnectivityManager.class).getActiveNetwork();
+  long now=android.os.SystemClock.elapsedRealtime();
+  if(!inspect&&!notifyFailure&&forced==null&&net.equals(lastProbeNetwork)&&now-lastProbeMs<3000)return true;
+  if(!inspect){lastProbeNetwork=net;lastProbeMs=now;}
+  final int ticket=inspect?channelTicket:++channelTicket,screen=generation;
+  java.util.function.BooleanSupplier current=()->ticket==channelTicket&&screen==generation&&resumed&&origin.equals(address)&&web!=null;
+  sweep(address,d,forced==null?targets:Collections.singletonList(forced),current,(url,ms,select)->{
+   web.evaluateJavascript("window.dispatchEvent(new Event('bridge-channel-sample'))",null);
+   if(inspect||!select)return;
+   if(url.equals(address)&&pageReady)web.evaluateJavascript("window.BridgeChannelLink?.check()",null);
+   if(!url.equals(address))moveChannel(address,d,url,requested,false,current,failure);
+  },()->{if(notifyFailure)channelUnavailable();else if(forced!=null)android.widget.Toast.makeText(this,L("信道暂不可达"),android.widget.Toast.LENGTH_SHORT).show();},()->{
+   if(inspect&&inspectionGeneration==screen){inspectionGeneration=-1;if(web!=null)web.evaluateJavascript("window.dispatchEvent(new Event('bridge-channel-sample'))",null);}
+  });
+  return true;
+ }
+ private void openComputer(String address,String suffix){
+  if(addresses(address).isEmpty()){manageComputer(address);return;}
+  JSONObject d=GatewayChannels.record(prefs,address);if(d==null){connect(address+suffix);return;}
+  clear();header(true);origin=address;status.setVisibility(View.VISIBLE);final int screen=generation;
+  bar.removeAllViews();bar.setVisibility(View.VISIBLE);bar.addView(icon("ic_menu_monitor",L("返回电脑列表"),this::home),new LinearLayout.LayoutParams(dp(48),dp(48)));bar.addView(text(L("连接电脑"),18),new LinearLayout.LayoutParams(0,-2,1));ImageButton menu=icon("ic_more",L("电脑与聊天选项"),()->{});menu.setOnClickListener(v->gatewayMenu(v));bar.addView(menu,new LinearLayout.LayoutParams(dp(48),dp(48)));
+  List<String> targets=addresses(address);Map<String,Long> progress=new HashMap<>();
+  status.setVisibility(View.GONE);LinearLayout panel=ui.column();panel.setGravity(Gravity.CENTER_VERTICAL);panel.setPadding(dp(24),0,dp(24),0);
+  entryProgress=panel;root.addView(panel,new LinearLayout.LayoutParams(-1,0,1));TextView title=text(L("正在连接 · ")+computerName(address),20);panel.addView(title);
+  LinearLayout rows=ui.column();rows.setPadding(0,dp(12),0,0);panel.addView(rows);
+  Runnable render=()->{rows.removeAllViews();for(String url:targets){
+   LinearLayout line=new LinearLayout(ui.context);TextView host=text(url,14);line.addView(host,new LinearLayout.LayoutParams(0,-2,1));
+   Long ms=progress.get(url);TextView sample=text(ms==null?L("连接中…"):ms<0?"○":ms+" ms",14);sample.setPadding(dp(10),0,0,0);line.addView(sample);line.setPadding(0,dp(5),0,dp(5));rows.addView(line);
+  }};
+  render.run();
+  java.util.function.BooleanSupplier current=()->generation==screen&&resumed&&web==null&&origin.equals(address);
+  sweep(address,d,targets,current,(url,ms,select)->{progress.put(url,ms);render.run();if(select){if(url.equals(address))connect(address+suffix);else moveChannel(address,d,url,address+suffix,true,current,false);}},
+    ()->{if(targets.contains(address))connect(address+suffix);else message(L("信道暂不可达"));});
+ }
+ private final Map<String,String> channelCookieOwners=new HashMap<>();
+ private void moveChannel(String address,JSONObject d,String next,String requested,boolean opening,java.util.function.BooleanSupplier current,boolean failure){
+  String id=d.optString("deviceId"),anchor=d.optString("anchor");
+  DeviceBinding.Credential primary=DeviceBinding.load(this,GatewayChannels.vault(id));
+  if(primary==null||!current.getAsBoolean()||!EventClient.cookieName(address).equals(primary.name))return;
+  final int ticket=channelTicket;
+  java.util.function.BooleanSupplier rooted=()->{
+   DeviceBinding.Credential live=DeviceBinding.load(this,GatewayChannels.vault(id));JSONObject record=GatewayChannels.record(prefs,address);
+   return live!=null&&live.cookie().equals(primary.cookie())&&record!=null&&
+    id.equals(record.optString("deviceId"))&&anchor.equals(record.optString("anchor"))&&
+    anchor.equals(prefs.getString("channel-anchor:"+id,anchor));
+  };
+  java.util.function.BooleanSupplier valid=()->current.getAsBoolean()&&ticket==channelTicket&&rooted.getAsBoolean()&&addresses(address).contains(next);
+  try{
+   String nextToken=GatewayChannels.token(primary.token,anchor,next),nextCookie=primary.name+"="+nextToken;
+   CookieManager store=CookieManager.getInstance();
+   String sourceCookie=EventClient.sessionCookie(store.getCookie(address+"/"),address);
+   if(!opening&&sourceCookie.isEmpty())return;
+   String existing=BindingSelection.cookie(store.getCookie(next+"/"),primary.name);
+   String secureAddress="https://"+new java.net.URI(next).getRawAuthority()+"/";
+   String stored=BindingSelection.cookie(store.getCookie(secureAddress),primary.name);
+   DeviceBinding.Credential retained=DeviceBinding.load(this,next);
+   Set<String> aliases=new HashSet<>(GatewayChannels.endpoints(d));aliases.add(address);aliases.add(next);aliases.add(anchor);
+   Set<String> known=new HashSet<>();
+   for(String alias:aliases){
+    known.add(primary.name+"="+GatewayChannels.token(primary.token,anchor,alias));
+    DeviceBinding.Credential saved=DeviceBinding.load(this,alias);
+    if(id.equals(GatewayChannels.identity(this,prefs,alias))&&saved!=null&&saved.name.equals(primary.name))known.add(saved.cookie());
+   }
+   String identity=GatewayChannels.identity(this,prefs,next);
+   if((!identity.isEmpty()&&!identity.equals(id))||(retained!=null&&!retained.name.equals(primary.name))||
+      (!stored.isEmpty()&&!known.contains(stored))||(!existing.isEmpty()&&!known.contains(existing))||(!sourceCookie.isEmpty()&&!known.contains(sourceCookie))){
+    if(opening&&addresses(address).contains(address))connect(requested);android.widget.Toast.makeText(this,L("此地址的登录绑定已变化，请重新验证"),android.widget.Toast.LENGTH_SHORT).show();return;
+   }
+   String base=opening?address:pageOrigin;
+   if(requested==null||!GatewayURL.sameOrigin(requested,base))return;
+   final String destination=next+requested.substring(base.length());
+   boolean shared=new java.net.URI(address).getHost().equals(new java.net.URI(next).getHost())&&GatewayURL.cookiePath(address).equals("/");
+   String expectedSource=shared?(!address.startsWith("https://")&&next.startsWith("https://")?"":nextCookie):sourceCookie;
+   java.util.function.BooleanSupplier written=()->nextCookie.equals(BindingSelection.cookie(store.getCookie(next+"/"),primary.name))&&
+    expectedSource.equals(EventClient.sessionCookie(store.getCookie(address+"/"),address));
+   // getCookie omits an HTTP-invisible Secure cookie; use the HTTPS view only for the same storage slot.
+   String rollbackCookie=stored;
+   boolean rollbackSecure=!stored.isEmpty()&&!stored.equals(BindingSelection.cookie(store.getCookie("http://"+new java.net.URI(next).getRawAuthority()+"/"),primary.name));
+   String retainedCookie=retained==null?"":retained.cookie(),owner=UUID.randomUUID().toString();
+   String targetKey=primary.name+"\n"+new java.net.URI(next).getHost()+"\n/",sourceKey=primary.name+"\n"+new java.net.URI(address).getHost()+"\n"+GatewayURL.cookiePath(address);
+   Runnable release=()->{for(String key:new String[]{targetKey,sourceKey})if(owner.equals(channelCookieOwners.get(key)))channelCookieOwners.remove(key);};
+   java.util.function.BooleanSupplier owned=()->owner.equals(channelCookieOwners.get(targetKey))&&owner.equals(channelCookieOwners.get(sourceKey));
+   Runnable rollback=()->{
+    DeviceBinding.Credential live=DeviceBinding.load(this,next);
+    if(!rooted.getAsBoolean()||!owner.equals(channelCookieOwners.get(targetKey))||!written.getAsBoolean()||!retainedCookie.equals(live==null?"":live.cookie())){release.run();return;}
+    store.setCookie(rollbackSecure?secureAddress:next+"/",(rollbackCookie.isEmpty()?primary.name+"=; Max-Age=0":rollbackCookie+"; Max-Age=34560000")+
+      "; Path=/; HttpOnly; SameSite=Strict"+(rollbackSecure?"; Secure":""),ignored->{});
+    release.run();
+   };
+   if(!valid.getAsBoolean())return;
+   channelCookieOwners.put(targetKey,owner);channelCookieOwners.put(sourceKey,owner);
+   store.setCookie(secureAddress,nextCookie+"; Path=/; HttpOnly; SameSite=Strict"+(next.startsWith("https://")?"; Secure":"")+"; Max-Age=34560000",ok->{
+    if(!ok||!valid.getAsBoolean()||!owned.getAsBoolean()||!written.getAsBoolean()){rollback.run();return;}
+    java.util.function.BooleanSupplier commit=()->{
+     DeviceBinding.Credential live=DeviceBinding.load(this,next);
+     if(!valid.getAsBoolean()||!owned.getAsBoolean()||!written.getAsBoolean()||!retainedCookie.equals(live==null?"":live.cookie())){rollback.run();return false;}
+     try{DeviceBinding.save(this,next,primary.name,nextToken);}catch(Exception e){rollback.run();return false;}
+     SharedPreferences.Editor edit=prefs.edit();Set<String> all=saved();all.remove(address);all.add(next);
+     JSONObject latest=GatewayChannels.record(prefs,address);
+     edit.putStringSet("origins",all).putString("channels:"+next,(latest==null?d:latest).toString()).putString("cookieName:"+next,primary.name);
+     for(String prefix:new String[]{"notificationsMuted:","computer-name:"}){Object v=prefs.getAll().get(prefix+address);if(v instanceof String)edit.putString(prefix+next,(String)v);if(v instanceof Boolean)edit.putBoolean(prefix+next,(Boolean)v);}
+     try{NotificationCheckpoint cp=NotificationCheckpoint.restore(prefs.getString("notificationCheckpoint:"+address,null),EventClient.tokenValue(sourceCookie));if(!cp.stream.isEmpty())edit.putString("notificationCheckpoint:"+next,cp.encode(nextToken));}catch(Exception ignored){}
+     edit.putString("active",next).apply();EventClient.setName(next,primary.name);MonitorService.bindingsChanged();
+     release.run();
+     if(opening||!pageReady){connect(destination);arrivingVia=next;}
+     else {origin=next;changedChannel(next);}
+     return true;
+    };
+    if(opening||!pageReady)commit.getAsBoolean();
+    else {
+     Peer peer=new Peer(next,id,commit,rollback);rollbackPeer();pendingPeer=peer;
+     if(!next.equals(pageOrigin)){
+      web.getSettings().setSupportMultipleWindows(true);web.getSettings().setJavaScriptCanOpenWindowsAutomatically(true);
+      homeHandler.postDelayed(()->{if(pendingPeer==peer){endPeerWindow();pendingPeer=null;peer.rollback.run();}},12000);
+     }
+     web.evaluateJavascript("window.BridgeChannelLink?.prepare("+JSONObject.quote(next)+","+JSONObject.quote(peer.nonce)+","+JSONObject.quote(peer.device)+")",null);
+    }
+   });
+  }catch(Exception ignored){}
+ }
+ private void rollbackPeer(){Peer peer=pendingPeer;pendingPeer=null;if(peer!=null)peer.rollback.run();}
+ private LinearLayout entryProgress;
+ private void hideEntryProgress(){if(entryProgress!=null&&entryProgress.getParent() instanceof ViewGroup)((ViewGroup)entryProgress.getParent()).removeView(entryProgress);entryProgress=null;}
+ private String pageOrigin="";private boolean pageReady;
+ private static final class Peer{
+  final String next,device,nonce=UUID.randomUUID().toString();final java.util.function.BooleanSupplier commit;final Runnable rollback;
+  boolean opened;
+  Peer(String next,String device,java.util.function.BooleanSupplier commit,Runnable rollback){this.next=next;this.device=device;this.commit=commit;this.rollback=rollback;}
+  boolean matches(String url){return (next+"/mobile-channel#"+nonce).equals(url);}
+ }
+ private Peer pendingPeer;
+ private final Set<WebView> peerViews=new HashSet<>();
+ private void closePeer(WebView peer){
+  if(!peerViews.remove(peer))return;
+  if(peer.getParent() instanceof ViewGroup)((ViewGroup)peer.getParent()).removeView(peer);peer.stopLoading();peer.destroy();
+ }
+ private void endPeerWindow(){if(web!=null){web.getSettings().setJavaScriptCanOpenWindowsAutomatically(false);web.getSettings().setSupportMultipleWindows(false);}}
+ private boolean openPeer(WebView parent,Message reply){
+  Peer p=pendingPeer;
+  if(parent!=web||p==null||p.opened||!resumed||!GatewayURL.sameOrigin(parent.getUrl(),pageOrigin))return false;
+  p.opened=true;String from=pageOrigin;
+  WebView child=new WebView(ui.context);WebSettings settings=child.getSettings();settings.setJavaScriptEnabled(true);settings.setAllowFileAccess(false);settings.setAllowContentAccess(false);settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
+  settings.setUserAgentString(parent.getSettings().getUserAgentString());CookieManager.getInstance().setAcceptThirdPartyCookies(child,false);
+  child.setFocusable(false);child.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS);child.setAlpha(0.01f);
+  ((FrameLayout)parent.getParent()).addView(child,0,new FrameLayout.LayoutParams(1,1));peerViews.add(child);
+  child.setWebViewClient(new WebViewClient(){
+   @Override public boolean shouldOverrideUrlLoading(WebView view,WebResourceRequest request){return !request.isForMainFrame()||!p.matches(request.getUrl().toString());}
+   @Override public void onPageFinished(WebView view,String url){
+    if(pendingPeer!=p||!p.matches(url)||!url.equals(view.getUrl()))return;
+    try{view.evaluateJavascript(MobileWebScripts.route(getAssets())+";window.BridgeChannelLink.worker("+JSONObject.quote(from)+","+JSONObject.quote(p.nonce)+","+JSONObject.quote(p.device)+")",null);}catch(java.io.IOException ignored){}
+   }
+  });
+  child.setWebChromeClient(new WebChromeClient(){@Override public void onCloseWindow(WebView view){view.post(()->closePeer(view));}});
+  ((WebView.WebViewTransport)reply.obj).setWebView(child);reply.sendToTarget();parent.post(()->{if(pendingPeer==p)endPeerWindow();});return true;
+ }
+ private void clearChannels(String address){
+  JSONObject known=GatewayChannels.record(prefs,address);
+  uu.remove(known==null?UURemote.device(prefs.getString("cookieName:"+address,"")):known.optString("deviceId"));
+  JSONObject record=GatewayChannels.record(prefs,address);prefs.edit().remove(preferenceKey("disabled-channels",address)).remove(preferenceKey("channel-mode",address)).apply();if(record==null)return;
+  String id=record.optString("deviceId");channelTicket++;
+  DeviceBinding.clear(this,GatewayChannels.vault(id));prefs.edit().remove("name:"+id).apply();
+  SharedPreferences.Editor e=prefs.edit().remove("channel-anchor:"+id);
+  for(String key:prefs.getAll().keySet())if(key.startsWith("channels:")){
+   String alias=key.substring(9);JSONObject d=GatewayChannels.record(prefs,alias);
+   if(d!=null&&id.equals(d.optString("deviceId"))){
+    DeviceBinding.clear(this,alias);e.remove(key).remove("connection:"+alias);
+    String name=EventClient.cookieName(alias);CookieManager.getInstance().setCookie(alias+"/",name+"=; Path=/; Max-Age=0"+(alias.startsWith("https://")?"; Secure":""));EventClient.forget(alias);
+   }
+  }
+  e.apply();
+ }
+ private String activeChannel(String address){
+  JSONObject current=GatewayChannels.record(prefs,address);
+  if(current!=null)for(String saved:saved()){JSONObject d=GatewayChannels.record(prefs,saved);if(d!=null&&current.optString("deviceId").equals(d.optString("deviceId")))return saved;}
+  return address;
+ }
  private LinearLayout root,bar;private WebView web;private String origin="";private TextView status;private SystemBars systemBars;
  private android.content.SharedPreferences prefs;private final ExecutorService worker=Executors.newSingleThreadExecutor();
  private final ExecutorService probes=Executors.newFixedThreadPool(3);
+ private Future<?> connectionTask;private Runnable connectionDeadline;
  private final Handler homeHandler=new Handler(Looper.getMainLooper());
  private final Map<String,TextView> homeStates=new LinkedHashMap<>();
  private final Map<String,LinearLayout> homeNotifications=new LinkedHashMap<>();
@@ -31,33 +386,84 @@ public final class MainActivity extends Activity {
  private FrameLayout screen;private DownloadCard downloadCard;private ArtifactDownload.Task downloadTask,choosingDownload;private UpdateInstallSession updateSession;private boolean savingDownload,openingDownload,restoringUpdate,autoInstallUpdate;
  private String choosingUpdateFile;private Bundle pendingSaveResult;
  private GatewayUpdate preparingUpdate;
- private ServiceConnection monitor;private ValueCallback<Uri[]> files;private WebView fileView;private int fileGeneration;private int generation;private boolean authLossAttempted;
+ private ServiceConnection monitor;private ValueCallback<Uri[]> files;private WebView fileView;private int fileGeneration;private int generation;private int navigationRequest;private boolean authLossAttempted;
+ private UURemote uu;
+ private String uuAvailability="checking";
+ private SettingsPage settingsPage;private SettingsUi ui;private ImageButton chatMenu;
+ private int pageColor(){return ui.dark?ui.page:0xfff5f5f3;}
+ private int textColor(){return ui.dark?ui.text:0xff202124;}
+ private int mutedColor(){return ui.dark?ui.muted:0xff777b80;}
+ private int surfaceColor(){return ui.dark?ui.surface:0xffffffff;}
+ private int buttonColor(){return ui.dark?ui.pressed:0xfff4f5f7;}
+ private void syncWebTheme(){if(web!=null&&GatewayURL.sameOrigin(web.getUrl(),pageOrigin))web.evaluateJavascript("window.BridgeNativeTheme={theme:"+JSONObject.quote(SettingsUi.theme(this))+",dark:"+ui.dark+"};document.dispatchEvent(new Event(\"bridge-native-theme\"));",null);}
+ private void applyTheme(){
+  dismissGatewayMenu();
+  ui=new SettingsUi(SettingsUi.themed(this));root.setBackgroundColor(pageColor());status.setTextColor(mutedColor());
+  if(web==null)home();else{web.setBackgroundColor(pageColor());if(chatMenu!=null)chatMenu.setColorFilter(textColor());syncWebTheme();}
+ }
+ @Override public void onSharedPreferenceChanged(SharedPreferences preferences,String key){if("settingsTheme".equals(key))applyTheme();}
  String L(String value){return MobileStrings.text(this,value);}
  int dp(int n){return (int)(getResources().getDisplayMetrics().density*n);}
- TextView text(String value,int size){TextView t=new TextView(this);t.setText(value);t.setTextSize(size);t.setTextColor(0xff202124);t.setPadding(0,dp(5),0,dp(5));return t;}
+ TextView text(String value,int size){TextView t=new TextView(ui.context);t.setText(value);t.setTextSize(size);t.setTextColor(textColor());t.setPadding(0,dp(5),0,dp(5));return t;}
  android.graphics.drawable.GradientDrawable background(int color,int radius){android.graphics.drawable.GradientDrawable d=new android.graphics.drawable.GradientDrawable();d.setColor(color);d.setCornerRadius(dp(radius));return d;}
- Button button(String value,Runnable action){Button b=new Button(this);b.setText(value);b.setTextSize(16);b.setTextColor(0xff202124);b.setAllCaps(false);b.setMinHeight(dp(54));b.setStateListAnimator(null);b.setElevation(0);b.setTranslationZ(0);b.setPadding(dp(18),dp(10),dp(18),dp(10));android.graphics.drawable.GradientDrawable face=background(0xfff4f5f7,12);b.setBackground(new android.graphics.drawable.RippleDrawable(android.content.res.ColorStateList.valueOf(0x18202124),face,null));b.setOnClickListener(v->action.run());return b;}
- LinearLayout column(){LinearLayout c=new LinearLayout(this);c.setOrientation(1);return c;}
+ Button button(String value,Runnable action){Button b=new Button(ui.context);b.setText(value);b.setTextSize(16);b.setTextColor(textColor());b.setAllCaps(false);b.setMinHeight(dp(54));b.setStateListAnimator(null);b.setElevation(0);b.setTranslationZ(0);b.setPadding(dp(18),dp(10),dp(18),dp(10));android.graphics.drawable.GradientDrawable face=background(buttonColor(),12);b.setBackground(new android.graphics.drawable.RippleDrawable(android.content.res.ColorStateList.valueOf(ui.dark?ui.pressed:0x18202124),face,null));b.setOnClickListener(v->action.run());return b;}
+ LinearLayout column(){LinearLayout c=new LinearLayout(ui.context);c.setOrientation(1);return c;}
  void add(View v,LinearLayout parent,int bottom){LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-1,-2);p.bottomMargin=dp(bottom);parent.addView(v,p);}
- LinearLayout card(){LinearLayout c=column();c.setPadding(dp(20),dp(16),dp(20),dp(16));c.setBackground(background(0xffffffff,22));return c;}
- ImageButton icon(String name,String description,Runnable action){ImageButton b=new ImageButton(this);b.setImageResource(getResources().getIdentifier(name,"drawable",getPackageName()));b.setContentDescription(description);b.setPadding(dp(12),dp(12),dp(12),dp(12));android.util.TypedValue ripple=new android.util.TypedValue();getTheme().resolveAttribute(android.R.attr.selectableItemBackgroundBorderless,ripple,true);b.setBackgroundResource(ripple.resourceId);b.setOnClickListener(v->action.run());return b;}
- void header(boolean chat){bar.setVisibility(chat?View.GONE:View.VISIBLE);if(chat)return;bar.removeAllViews();ImageView logo=new ImageView(this);logo.setImageResource(getResources().getIdentifier("ic_bridge","drawable",getPackageName()));LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(dp(30),dp(30));lp.setMarginEnd(dp(8));bar.addView(logo,lp);TextView title=text("Codex Bridge",18);title.setTypeface(null,android.graphics.Typeface.BOLD);bar.addView(title,new LinearLayout.LayoutParams(0,-2,1));bar.addView(icon("ic_bell",L("通知收件箱"),this::inbox),new LinearLayout.LayoutParams(dp(48),dp(48)));bar.addView(icon("ic_settings",L("手机设置"),this::settings),new LinearLayout.LayoutParams(dp(48),dp(48)));}
- void webAction(String selector){if(web!=null&&GatewayURL.sameOrigin(web.getUrl(),origin))web.evaluateJavascript("document.querySelector("+JSONObject.quote(selector)+")?.click()",null);}
+ LinearLayout card(){LinearLayout c=column();c.setPadding(dp(20),dp(16),dp(20),dp(16));c.setBackground(background(surfaceColor(),22));return c;}
+ ImageButton icon(String name,String description,Runnable action){ImageButton b=new ImageButton(ui.context);b.setImageResource(getResources().getIdentifier(name,"drawable",getPackageName()));b.setColorFilter(textColor());b.setContentDescription(description);b.setPadding(dp(12),dp(12),dp(12),dp(12));android.util.TypedValue ripple=new android.util.TypedValue();ui.context.getTheme().resolveAttribute(android.R.attr.selectableItemBackgroundBorderless,ripple,true);b.setBackgroundResource(ripple.resourceId);b.setOnClickListener(v->action.run());return b;}
+ void header(boolean chat){bar.setVisibility(chat?View.GONE:View.VISIBLE);if(chat)return;bar.removeAllViews();ImageView logo=new ImageView(ui.context);logo.setImageResource(getResources().getIdentifier("ic_bridge","drawable",getPackageName()));LinearLayout.LayoutParams lp=new LinearLayout.LayoutParams(dp(30),dp(30));lp.setMarginEnd(dp(8));bar.addView(logo,lp);TextView title=text("Codex Bridge",18);title.setTypeface(null,android.graphics.Typeface.BOLD);bar.addView(title,new LinearLayout.LayoutParams(0,-2,1));bar.addView(icon("ic_bell",L("通知收件箱"),this::inbox),new LinearLayout.LayoutParams(dp(48),dp(48)));bar.addView(icon("ic_settings",L("手机设置"),this::settings),new LinearLayout.LayoutParams(dp(48),dp(48)));}
+ void webAction(String selector){if(web!=null&&GatewayURL.sameOrigin(web.getUrl(),pageOrigin))web.evaluateJavascript("document.querySelector("+JSONObject.quote(selector)+")?.click()",null);}
  void rememberConnection(){
   final String address=origin;final int ticket=generation;final String snapshot=CookieManager.getInstance().getCookie(address+"/");
-  worker.execute(()->{try{JSONObject auth=EventClient.request(address,"/api/auth",null,null);String name=auth.optString("cookieName","codex_mobile_session");String binding=BindingSelection.cookie(CookieManager.getInstance().getCookie(address+"/"),name);JSONObject data=ZCodeConnection.manages(this,address)?null:ConnectionDiscovery.descriptor(auth,binding);
+  worker.execute(()->{try{JSONObject auth=EventClient.request(address,"/api/auth",null,null);String name=auth.optString("cookieName","codex_mobile_session");String binding=BindingSelection.cookie(CookieManager.getInstance().getCookie(address+"/"),name);boolean zcode=ZCodeConnection.manages(this,address);JSONObject data=zcode?null:ConnectionDiscovery.descriptor(auth,binding);
+   GatewayChannels.Enrollment enrollment=!zcode&&auth.optBoolean("authenticated")&&auth.optBoolean("trustedDevice")?GatewayChannels.enroll(this,prefs,address,auth.optJSONObject("mobileRoutes"),name,EventClient.tokenValue(binding)):null;
    runOnUiThread(()->{String current=BindingSelection.match(snapshot,CookieManager.getInstance().getCookie(address+"/"),name);
     if(ticket!=generation||!saved().contains(address)||current.isEmpty()||!binding.equals(current))return;
-    if(auth.optBoolean("authenticated"))prefs.edit().putString("cookieName:"+address,name).apply();
+    if(auth.optBoolean("authenticated")){
+     prefs.edit().putString("cookieName:"+address,name).apply();
+     if(address.equals(arrivingVia)){changedChannel(address);arrivingVia=null;}
+    }
     if(auth.optBoolean("authenticated")&&auth.optBoolean("trustedDevice")&&DeviceBinding.name(name))try{DeviceBinding.save(this,address,name,EventClient.tokenValue(current));}catch(Exception ignored){}
     else if(!auth.optBoolean("authenticated"))DeviceBinding.clear(this,address);
+    if(enrollment!=null){try{
+     JSONObject channels=enrollment.descriptor;String id=channels.getString("deviceId"),vault=GatewayChannels.vault(id);
+     DeviceBinding.Credential live=DeviceBinding.load(this,vault);
+     if((live==null&&enrollment.previous==null)||(live!=null&&enrollment.previous!=null&&live.token.equals(enrollment.previous.token))){
+      boolean replaced=live==null||!live.token.equals(enrollment.root.token)||!live.name.equals(enrollment.root.name);
+      if(replaced)DeviceBinding.save(this,vault,enrollment.root.name,enrollment.root.token);
+      live=DeviceBinding.load(this,vault);
+      if(live!=null&&live.token.equals(enrollment.root.token)){
+       Set<String> entries=saved();SharedPreferences.Editor edit=prefs.edit();Set<String> migrated=new HashSet<>();
+       List<String> aliases=new ArrayList<>(entries);aliases.remove(address);aliases.add(address);
+       for(String other:aliases)if(id.equals(GatewayChannels.identity(this,prefs,other))||other.equals(address)){
+        for(String key:new String[]{"name:","channel-mode:","disabled-channels:"})if(!prefs.contains(key+id)&&prefs.contains(key+other)&&migrated.add(key)){
+         Object value=prefs.getAll().get(key+other);if(value instanceof String)edit.putString(key+id,(String)value);
+         if(value instanceof Set)edit.putStringSet(key+id,new HashSet<>((Set<String>)value));
+        }
+       }
+       entries.removeIf(other->!other.equals(address)&&id.equals(GatewayChannels.identity(this,prefs,other)));
+       edit.putString("channels:"+address,channels.toString()).putString("channel-anchor:"+id,channels.getString("anchor")).putStringSet("origins",entries).apply();
+       if(replaced){manifestReads.remove(id);MonitorService.bindingsChanged();}
+      }
+     }
+    }catch(Exception ignored){}}
+    JSONObject computer=auth.optJSONObject("computer");
+    String platform=computer==null?"":computer.optString("platform");
+    uu.scope=auth.optBoolean("authenticated")&&("Windows".equals(platform)||"Darwin".equals(platform))?UURemote.device(name):"";
+    uuAvailability=!uu.scope.isEmpty()?"ready":auth.optBoolean("authenticated")&&!platform.isEmpty()?"unsupported":"unavailable";
+    if(web!=null)web.evaluateJavascript("window.BridgeUURemote?.refresh()",null);
+    if(enrollment!=null&&web!=null)web.evaluateJavascript("window.BridgeMobileChannels?.bound()",null);
     if(data!=null)prefs.edit().putString("connection:"+address,data.toString()).apply();else prefs.edit().remove("connection:"+address).apply();});
-  }catch(Exception ignored){}});
+  }catch(Exception ignored){runOnUiThread(()->{if(ticket==generation&&address.equals(origin)){uuAvailability="unavailable";if(web!=null)web.evaluateJavascript("window.BridgeUURemote?.refresh()",null);}});}});
  }
  void loadWithRecovery(String address,String url,WebView current,int ticket){
+  if(ticket!=generation||web!=current||!address.equals(origin)||!saved().contains(address))return;
   final String before=EventClient.sessionCookie(CookieManager.getInstance().getCookie(address+"/"),address);
-  worker.execute(()->{
-   DeviceBinding.Credential saved=DeviceBinding.load(this,address);
+  if(connectionTask!=null)connectionTask.cancel(true);
+  final DeviceBinding.Credential saved=DeviceBinding.load(this,address);
+  if(saved==null||saved.cookie().equals(before)){current.loadUrl(url);return;}
+  connectionTask=worker.submit(()->{
+   if(ticket!=generation||Thread.currentThread().isInterrupted())return;
    boolean recover=false;
    if(saved!=null&&!saved.cookie().equals(before)){
     Boolean existing=before.isEmpty()?false:DeviceBinding.verify(address,new DeviceBinding.Credential(before.substring(0,before.indexOf('=')),before.substring(before.indexOf('=')+1)));
@@ -81,8 +487,8 @@ public final class MainActivity extends Activity {
    });
   });
  }
- void recoverConnection(String requested){
-  if(ZCodeConnection.manages(this,origin))return;
+ void recoverConnection(String requested){if(ZCodeConnection.manages(this,origin))return;if(!checkChannels(requested,true))recoverLegacy(requested);}
+ void recoverLegacy(String requested){
   if(routeAttempted||!resumed||web==null)return;routeAttempted=true;
   final String address=origin,encoded=prefs.getString("connection:"+address,null),cookie=EventClient.sessionCookie(CookieManager.getInstance().getCookie(address+"/"),address);final int ticket=generation;
   if(encoded==null||cookie.isEmpty())return;
@@ -92,53 +498,138 @@ public final class MainActivity extends Activity {
    final String[] snapshot={null};
    Runnable relocate=()->{String existing=EventClient.sessionCookie(CookieManager.getInstance().getCookie(next+"/"),next);if(!existing.isEmpty()&&!existing.equals(cookie))return;if(ticket!=generation||!resumed||routeDiscovery!=resolver||!saved().contains(address)||!cookie.equals(EventClient.sessionCookie(CookieManager.getInstance().getCookie(address+"/"),address)))return;
     CookieManager.getInstance().setCookie(next+"/",cookie+"; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=34560000",ok->{if(!ok||ticket!=generation||!resumed||routeDiscovery!=resolver||!saved().contains(address)||!cookie.equals(EventClient.sessionCookie(CookieManager.getInstance().getCookie(address+"/"),address)))return;
-     Set<String> values=saved();values.remove(address);values.add(next);android.content.SharedPreferences.Editor edit=prefs.edit().putStringSet("origins",values).putString("connection:"+next,encoded).remove("connection:"+address);
-     for(String prefix:new String[]{"name:","computer-name:","cursor:","stream:","last-opened:","cookieName:"}){Object value=prefs.getAll().get(prefix+address);if(value instanceof String)edit.putString(prefix+next,(String)value);else if(value instanceof Long)edit.putLong(prefix+next,(Long)value);edit.remove(prefix+address);}edit.apply();
-     DeviceBinding.Credential backup=DeviceBinding.load(MainActivity.this,address);if(backup!=null&&backup.cookie().equals(cookie)&&DeviceBinding.load(MainActivity.this,next)==null)try{DeviceBinding.save(MainActivity.this,next,backup.name,backup.token);DeviceBinding.clear(MainActivity.this,address);}catch(Exception ignored){}EventClient.setName(next,EventClient.cookieName(address));EventClient.forget(address);connect(next+requested.substring(address.length()));pendingStorage=snapshot[0];routeAttempted=true;
+     if(!saved().contains(next))NotificationSources.setEnabled(prefs,next,NotificationSources.enabled(prefs,address));
+     Set<String> values=saved();values.remove(address);values.add(next);android.content.SharedPreferences.Editor edit=prefs.edit().putStringSet("origins",values).putString("connection:"+next,encoded).remove("connection:"+address).remove("notificationsMuted:"+address).remove("notificationSourceRevision:"+address);
+     for(String prefix:new String[]{"name:","computer-name:","notificationCheckpoint:","last-opened:","cookieName:"}){Object value=prefs.getAll().get(prefix+address);if(value instanceof String)edit.putString(prefix+next,(String)value);else if(value instanceof Long)edit.putLong(prefix+next,(Long)value);edit.remove(prefix+address);}edit.apply();
+     DeviceBinding.Credential backup=DeviceBinding.load(MainActivity.this,address);if(backup!=null&&backup.cookie().equals(cookie)&&DeviceBinding.load(MainActivity.this,next)==null)try{DeviceBinding.save(MainActivity.this,next,backup.name,backup.token);DeviceBinding.clear(MainActivity.this,address);}catch(Exception ignored){}EventClient.setName(next,EventClient.cookieName(address));EventClient.forget(address);connect(next+requested.substring(address.length()));pendingStorage=snapshot[0];routeAttempted=true;arrivingVia=next;
     });};
    if(web!=null&&GatewayURL.sameOrigin(web.getUrl(),address))web.evaluateJavascript("(()=>{if(typeof saveDraft==='function')saveDraft();return JSON.stringify(Object.fromEntries(Object.entries(localStorage)));})()",value->{if(ticket!=generation)return;try{Object parsed=new org.json.JSONTokener(value).nextValue();if(parsed instanceof String&&((String)parsed).length()<524288){JSONObject data=new JSONObject((String)parsed);snapshot[0]=data.toString();}}catch(Exception ignored){}relocate.run();});else relocate.run();
   });}catch(Exception ignored){}});
  }
- void webAccounts(){if(web!=null&&GatewayURL.sameOrigin(web.getUrl(),origin))web.evaluateJavascript("(()=>{if(typeof window.BridgeNavigation?.accounts==='function')return window.BridgeNavigation.accounts();document.getElementById('accounts-button')?.click();return true;})()",null);}
- void gatewayMenu(View anchor){PopupMenu menu=new PopupMenu(this,anchor);menu.getMenu().add(L("返回电脑列表")).setOnMenuItemClickListener(i->{home();return true;});menu.getMenu().add(L("账号与接入")).setOnMenuItemClickListener(i->{webAccounts();return true;});menu.getMenu().add(L("通知收件箱")).setOnMenuItemClickListener(i->{inbox();return true;});menu.getMenu().add(L("外观与显示")).setOnMenuItemClickListener(i->{webAction("[data-open-appearance]");return true;});menu.getMenu().add(L("手机设置")).setOnMenuItemClickListener(i->{settings();return true;});menu.getMenu().add(L("刷新页面")).setOnMenuItemClickListener(i->{if(web!=null){routeAttempted=false;if(ZCodeConnection.manages(this,origin))connect(web.getUrl());else web.reload();}return true;});for(int n=0;n<menu.getMenu().size();n++){int[] icons={android.R.drawable.ic_menu_revert,android.R.drawable.ic_menu_myplaces,android.R.drawable.ic_dialog_email,android.R.drawable.ic_menu_edit,android.R.drawable.ic_menu_preferences,android.R.drawable.ic_popup_sync};menu.getMenu().getItem(n).setIcon(icons[n]);}final WebView current=web;final String address=origin;final int ticket=generation;
-  final android.view.MenuItem appIcons=menu.getMenu().add(L("隐藏底部 APP 图标")).setIcon(android.R.drawable.ic_menu_view).setVisible(false);appIcons.setOnMenuItemClickListener(i->{if(web==current&&generation==ticket)webAction("#client-switch-toggle");return true;});
-  if(current!=null&&GatewayURL.sameOrigin(current.getUrl(),address))current.evaluateJavascript("(()=>{const button=document.getElementById('client-switch-toggle');return document.getElementById('app')?.hidden===false&&button&&!button.hidden?button.getAttribute('aria-expanded')==='false':null;})()",value->{if(web!=current||generation!=ticket||!GatewayURL.sameOrigin(current.getUrl(),address))return;if("true".equals(value)||"false".equals(value)){appIcons.setTitle(L("true".equals(value)?"显示底部 APP 图标":"隐藏底部 APP 图标"));appIcons.setVisible(true);}});
-  if(Build.VERSION.SDK_INT>=29)menu.setForceShowIcon(true);menu.show();}
+ void webAccounts(){if(web!=null&&GatewayURL.sameOrigin(web.getUrl(),pageOrigin))web.evaluateJavascript("(()=>{if(typeof window.BridgeNavigation?.accounts==='function')return window.BridgeNavigation.accounts();document.getElementById('accounts-button')?.click();return true;})()",null);}
+ void dismissGatewayMenu(){GatewayMenu popup=gatewayPopup;gatewayPopup=null;if(popup!=null)popup.dismiss();}
+ void gatewayMenu(View anchor){
+  if((web==null&&entryProgress==null)||!anchor.isShown()||!anchor.isEnabled())return;
+  dismissGatewayMenu();
+  final WebView current=web;final String address=origin;final int ticket=generation;
+  GatewayMenu menu=new GatewayMenu(ui.context);gatewayPopup=menu;
+  menu.setOnDismissListener(()->{if(gatewayPopup==menu)gatewayPopup=null;});
+  menu.add(L("返回电脑列表"),"ic_menu_monitor",this::home);
+  if(current==null){menu.add(L("通知收件箱"),"ic_menu_bell",this::inbox);menu.add(L("手机设置"),"ic_menu_settings",this::settings);menu.show(anchor);return;}
+  menu.separator();
+  menu.add(L("账号与接入"),"ic_menu_user_round",this::webAccounts);
+  menu.add(L("通知收件箱"),"ic_menu_bell",this::inbox);
+  menu.separator();
+  menu.add(L("外观与显示"),"ic_menu_palette",()->webAction("[data-open-appearance]"));
+  menu.add(L("手机设置"),"ic_menu_settings",this::settings);
+  menu.separator();
+  menu.add(L("刷新页面"),"ic_menu_refresh_cw",()->{if(web==current&&generation==ticket){routeAttempted=false;if(ZCodeConnection.manages(this,origin))connect(current.getUrl());else if(origin.equals(pageOrigin))current.reload();else connect(origin+current.getUrl().substring(pageOrigin.length()));}});
+  final String uuDevice=uu.scope;
+  if(uu.enabled()&&uuContext())current.evaluateJavascript("window.BridgeUURemote?.menu("+uu.settings("read")+")||[]", value->{
+   if(web!=current||generation!=ticket||gatewayPopup!=menu||!uuDevice.equals(uu.scope)||!uuContext())return;
+   try{JSONArray actions=new JSONArray(value);
+    for(int i=0;i<actions.length();i++){
+     JSONObject action=actions.getJSONObject(i);String mode=action.getString("mode");
+     if(!("pip".equals(mode)||"full".equals(mode)))continue;
+     menu.add(action.getString("title"),"ic_menu_monitor",()->{
+      if(web==current&&generation==ticket&&uuDevice.equals(uu.scope)&&uuContext())uuNotice(uu.open(mode));
+     });
+    }
+    menu.resize(anchor);
+   }catch(org.json.JSONException ignored){}
+  });
+  final LinearLayout appIcons=menu.add(L("隐藏底部 APP 图标"),"ic_menu_eye_off",()->{if(web==current&&generation==ticket)webAction("#client-switch-toggle");});
+  appIcons.setVisibility(View.GONE);
+  current.evaluateJavascript("(()=>{const button=document.getElementById('client-switch-toggle');return document.getElementById('app')?.hidden===false&&button&&!button.hidden?button.getAttribute('aria-expanded')==='false':null;})()",value->{
+   if(web!=current||generation!=ticket||gatewayPopup!=menu||!GatewayURL.sameOrigin(current.getUrl(),pageOrigin))return;
+   if("true".equals(value)||"false".equals(value)){
+    boolean hidden="true".equals(value);
+    menu.update(appIcons,L(hidden?"显示底部 APP 图标":"隐藏底部 APP 图标"),hidden?"ic_menu_eye":"ic_menu_eye_off");
+    appIcons.setVisibility(View.VISIBLE);menu.resize(anchor);
+   }
+  });
+  current.evaluateJavascript("(()=>{const style=getComputedStyle(document.documentElement),color=name=>style.getPropertyValue(name).trim();return {surface:color('--raised'),text:color('--text'),muted:color('--muted'),line:color('--line'),pressed:color('--surface')};})()",value->{
+   if(web!=current||generation!=ticket||gatewayPopup!=menu||!anchor.isShown()||!anchor.isEnabled()||!GatewayURL.sameOrigin(current.getUrl(),pageOrigin))return;
+   menu.palette(value);if(!menu.isShowing())menu.show(anchor);
+  });
+  anchor.postDelayed(()->{if(web==current&&generation==ticket&&gatewayPopup==menu&&anchor.isShown()&&anchor.isEnabled()&&!menu.isShowing())menu.show(anchor);},120);
+ }
 
- void message(String value){resetExitGesture();new AlertDialog.Builder(this).setMessage(L(value)).setPositiveButton(L("好"),null).show();}
+ private boolean uuContext(){
+  if(web==null||!resumed||!saved().contains(origin)||!GatewayURL.sameOrigin(web.getUrl(),pageOrigin))return false;
+  String cookie=prefs.getString("cookieName:"+origin,"");
+  return !uu.scope.isEmpty()&&uu.scope.equals(UURemote.device(cookie))&&!BindingSelection.cookie(CookieManager.getInstance().getCookie(origin+"/"),cookie).isEmpty();
+ }
+ private void uuNotice(String text){if(text!=null&&!text.isEmpty())Toast.makeText(this,L(text),Toast.LENGTH_LONG).show();}
+ void message(String value){resetExitGesture();new AlertDialog.Builder(ui.context).setMessage(L(value)).setPositiveButton(L("好"),null).show();}
  Set<String> saved(){return new LinkedHashSet<>(prefs.getStringSet("origins",new HashSet<>()));}
- @Override public void onCreate(Bundle state){super.onCreate(state);prefs=getSharedPreferences("bridge",0);for(String address:prefs.getStringSet("origins",java.util.Collections.emptySet()))EventClient.setName(address,prefs.getString("cookieName:"+address,null));root=new LinearLayout(this);root.setOrientation(1);root.setBackgroundColor(0xfff5f5f3);screen=new FrameLayout(this);screen.addView(root,new FrameLayout.LayoutParams(-1,-1));setContentView(screen);systemBars=new SystemBars(this,screen,()->{if(downloadCard!=null)downloadCard.post(downloadCard::place);});
+ @Override public void onCreate(Bundle state){super.onCreate(state);prefs=getSharedPreferences("bridge",0);uu=new UURemote(this,prefs);ui=new SettingsUi(SettingsUi.themed(this));prefs.registerOnSharedPreferenceChangeListener(this);for(String address:prefs.getStringSet("origins",java.util.Collections.emptySet()))EventClient.setName(address,prefs.getString("cookieName:"+address,null));root=new LinearLayout(ui.context);root.setOrientation(1);root.setBackgroundColor(pageColor());screen=new FrameLayout(this);screen.addView(root,new FrameLayout.LayoutParams(-1,-1));setContentView(screen);systemBars=new SystemBars(this,screen,()->{if(downloadCard!=null)downloadCard.post(downloadCard::place);});
   if(state!=null){choosingUpdateFile=state.getString("choosingUpdateFile");pendingSaveResult=state.getBundle("pendingSaveResult");}
   if(Build.VERSION.SDK_INT>=33)getOnBackInvokedDispatcher().registerOnBackInvokedCallback(android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT,this::handleBack);
-  bar=new LinearLayout(this);bar.setGravity(Gravity.CENTER_VERTICAL);bar.setPadding(dp(20),dp(4),dp(12),dp(4));root.addView(bar);header(false);
+  bar=new LinearLayout(ui.context);bar.setGravity(Gravity.CENTER_VERTICAL);bar.setPadding(dp(20),dp(4),dp(12),dp(4));root.addView(bar);header(false);
   downloadCard=new DownloadCard(this,screen,this::downloadAction,this::openDownload,this::cancelDownload);
-  status=text("",12);status.setTextColor(0xff6b7075);status.setGravity(Gravity.CENTER);root.addView(status);
-  if(!openIntent(getIntent())){String active=prefs.getString("active","");if(saved().contains(active))connect(active+"/");else home();}monitor();root.post(this::requestStartupNotifications);restoreUpdate();
+  status=text("",12);status.setTextColor(mutedColor());status.setGravity(Gravity.CENTER);root.addView(status);
+  String uuResult=uu.callback(getIntent().getData());uuNotice(uuResult);
+  if(uuResult!=null||!openIntent(getIntent())){String active=prefs.getString("active","");if(saved().contains(active))connect(active+"/");else home();}monitor();root.post(this::requestStartupNotifications);restoreUpdate();
+  if(state!=null&&state.getBoolean("settingsOpen",false)){int offset=state.getInt("settingsScroll",0);root.post(()->{settingsPage=new SettingsPage(this,offset,false);settingsPage.show();});}
  }
- void clear(){if(preparingUpdate!=null){preparingUpdate.cancel();preparingUpdate=null;}pendingStorage=null;if(routeDiscovery!=null){routeDiscovery.cancel();routeDiscovery=null;}if(files!=null){files.onReceiveValue(null);files=null;fileView=null;}stopComputerChecks();homeStates.clear();homeNotifications.clear();resetExitGesture();generation++;if(web!=null){web.stopLoading();web.destroy();web=null;}systemBars.update(0xfff5f5f3,0xfff5f5f3);while(root.getChildCount()>2)root.removeViewAt(2);}
- void home(){clear();header(false);status.setVisibility(View.GONE);ScrollView scroll=new ScrollView(this);scroll.setFillViewport(true);LinearLayout content=column();content.setPadding(dp(20),dp(16),dp(20),dp(24));scroll.addView(content);root.addView(scroll,new LinearLayout.LayoutParams(-1,0,1));
-  ImageView icon=new ImageView(this);icon.setImageResource(getResources().getIdentifier("ic_computer","drawable",getPackageName()));icon.setScaleType(ImageView.ScaleType.FIT_CENTER);LinearLayout.LayoutParams ip=new LinearLayout.LayoutParams(dp(64),dp(58));ip.gravity=Gravity.CENTER;ip.bottomMargin=dp(24);content.addView(icon,ip);
+ private View connectionError;private boolean navigationFailed;
+ void hideConnectionError(){if(connectionError!=null){((ViewGroup)connectionError.getParent()).removeView(connectionError);connectionError=null;}if(chatMenu!=null)chatMenu.setVisibility(View.VISIBLE);}
+ void showConnectionError(String url){
+  if(web==null||connectionError!=null)return;
+  hideEntryProgress();status.setVisibility(View.GONE);if(chatMenu!=null)chatMenu.setVisibility(View.GONE);
+  final String address=origin;final int ticket=generation;LinearLayout content=column();connectionError=content;
+  content.setGravity(Gravity.CENTER_VERTICAL);content.setPadding(dp(24),dp(24),dp(24),dp(24));content.setBackgroundColor(pageColor());
+  TextView title=text(L("暂时无法连接电脑"),22);title.setTypeface(null,android.graphics.Typeface.BOLD);add(title,content,12);
+  add(text(L("网关暂时无法访问。请检查电脑和网络后重试，或返回电脑列表。"),15),content,20);
+  add(button(L("重试"),()->{if(ticket==generation&&saved().contains(address))openComputer(address,url.substring(pageOrigin.length()));}),content,12);
+  add(button(L("管理这台电脑"),()->{if(ticket==generation)manageComputer(address);}),content,12);
+  add(button(L("返回电脑列表"),this::home),content,0);
+  ((FrameLayout)web.getParent()).addView(content,new FrameLayout.LayoutParams(-1,-1));
+ }
+ void cancelConnectionDeadline(){if(connectionDeadline!=null){homeHandler.removeCallbacks(connectionDeadline);connectionDeadline=null;}}
+ void watchConnection(String url,WebView current,int ticket){
+  cancelConnectionDeadline();connectionDeadline=()->{
+   if(ticket!=generation||web!=current)return;
+   connectionDeadline=null;showConnectionError(url);recoverConnection(url);
+  };homeHandler.postDelayed(connectionDeadline,30000);
+ }
+ void clear(){hideConnectionError();navigationFailed=false;routeTraffic.clear();if(uu!=null)uu.scope="";uuAvailability="checking";hideEntryProgress();pageReady=false;rollbackPeer();for(WebView peer:new ArrayList<>(peerViews))closePeer(peer);cancelChannelJobs();dismissGatewayMenu();cancelConnectionDeadline();if(connectionTask!=null){connectionTask.cancel(true);connectionTask=null;}if(preparingUpdate!=null){preparingUpdate.cancel();preparingUpdate=null;}pendingStorage=null;if(routeDiscovery!=null){routeDiscovery.cancel();routeDiscovery=null;}if(files!=null){files.onReceiveValue(null);files=null;fileView=null;}stopComputerChecks();homeStates.clear();addressLists.clear();computerTitles.clear();arrivingVia=null;deferredRoute=null;homeNotifications.clear();resetExitGesture();generation++;if(web!=null){web.stopLoading();web.destroy();web=null;}systemBars.update(pageColor(),pageColor());while(root.getChildCount()>2)root.removeViewAt(2);}
+ void home(){clear();header(false);status.setVisibility(View.GONE);ScrollView scroll=new ScrollView(ui.context);scroll.setFillViewport(true);LinearLayout content=column();content.setPadding(dp(20),dp(16),dp(20),dp(24));scroll.addView(content);root.addView(scroll,new LinearLayout.LayoutParams(-1,0,1));
+  ImageView icon=new ImageView(ui.context);icon.setImageResource(getResources().getIdentifier("ic_computer","drawable",getPackageName()));icon.setColorFilter(textColor());icon.setScaleType(ImageView.ScaleType.FIT_CENTER);LinearLayout.LayoutParams ip=new LinearLayout.LayoutParams(dp(64),dp(58));ip.gravity=Gravity.CENTER;ip.bottomMargin=dp(24);content.addView(icon,ip);
   TextView headline=text(L("电脑上的工作，\n带在身边。"),30);headline.setTypeface(null,android.graphics.Typeface.BOLD);headline.setGravity(Gravity.CENTER);add(headline,content,10);
-  TextView intro=text(L("继续聊天、查看结果，让电脑替你运行。"),15);intro.setTextColor(0xff777b80);intro.setGravity(Gravity.CENTER);add(intro,content,26);
-  LinearLayout connection=card();Button scan=button(L("扫码连接电脑"),this::scan);scan.setTextColor(0xffffffff);scan.setBackground(background(0xff202124,16));add(scan,connection,8);add(button(L("输入网关地址"),this::manualAddress),connection,0);add(button(L("智谱中继连接"),this::zcodeAddress),connection,0);add(connection,content,24);
-  LinearLayout sectionRow=new LinearLayout(this);sectionRow.setGravity(Gravity.CENTER_VERTICAL);TextView section=text(L("我的电脑"),19);section.setTypeface(null,android.graphics.Typeface.BOLD);sectionRow.addView(section,new LinearLayout.LayoutParams(0,-2,1));sectionRow.addView(button(L("刷新状态"),()->{checkComputers();MonitorService.refresh();}));add(sectionRow,content,12);
-  if(saved().isEmpty()){LinearLayout empty=card();add(text(L("还没有连接的电脑"),17),empty,6);TextView hint=text(L("在电脑网关中展开“扫码登录”，然后用上方按钮扫描。"),14);hint.setTextColor(0xff777b80);add(hint,empty,0);add(empty,content,18);}
+  TextView intro=text(L("继续聊天、查看结果，让电脑替你运行。"),15);intro.setTextColor(mutedColor());intro.setGravity(Gravity.CENTER);add(intro,content,26);
+  LinearLayout connection=card();Button scan=button(L("扫码连接电脑"),this::scan);scan.setTextColor(surfaceColor());scan.setBackground(background(textColor(),16));add(scan,connection,8);add(button(L("输入网关地址"),this::manualAddress),connection,8);add(button("DSH Mobile",()->manualDsh()),connection,8);add(button(L("智谱中继连接"),this::zcodeAddress),connection,0);add(connection,content,24);
+  LinearLayout sectionRow=new LinearLayout(ui.context);sectionRow.setGravity(Gravity.CENTER_VERTICAL);TextView section=text(L("我的电脑"),19);section.setTypeface(null,android.graphics.Typeface.BOLD);sectionRow.addView(section,new LinearLayout.LayoutParams(0,-2,1));sectionRow.addView(button(L("刷新状态"),()->{checkComputers();MonitorService.refresh();}));add(sectionRow,content,12);
+  if(saved().isEmpty()&&DshMobileStore.ids(this).isEmpty()){LinearLayout empty=card();add(text(L("还没有连接的电脑"),17),empty,6);TextView hint=text(L("在电脑网关中展开“扫码登录”，然后用上方按钮扫描。"),14);hint.setTextColor(mutedColor());add(hint,empty,0);add(empty,content,18);}
   for(String entry:recentComputers()){
-   LinearLayout computer=card(),heading=new LinearLayout(this);heading.setGravity(Gravity.CENTER_VERTICAL);
-   TextView reachability=text(L("检查中…"),12);reachability.setTextColor(0xff777b80);reachability.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);heading.addView(reachability);homeStates.put(entry,reachability);
-   TextView name=text(computerName(entry),17);name.setTypeface(null,android.graphics.Typeface.BOLD);name.setSingleLine();name.setEllipsize(android.text.TextUtils.TruncateAt.END);name.setPadding(dp(10),dp(5),dp(8),dp(5));heading.addView(name,new LinearLayout.LayoutParams(0,-2,1));LinearLayout apps=new LinearLayout(this);apps.setGravity(Gravity.CENTER_VERTICAL);heading.addView(apps);homeNotifications.put(entry,apps);add(heading,computer,4);
-   TextView address=text(entry,13);address.setTextColor(0xff777b80);add(address,computer,4);
-   LinearLayout actions=new LinearLayout(this);Button rename=button(L("重命名"),()->renameComputer(entry));Button remove=button(L("移除这台电脑"),()->confirmRemove(entry));remove.setTextColor(0xffb44235);
+   if(entry.startsWith("dsh:")){add(dshComputer(entry.substring(4)),content,12);continue;}
+   LinearLayout computer=card(),heading=new LinearLayout(ui.context);heading.setGravity(Gravity.CENTER_VERTICAL);
+   TextView name=text(computerName(entry),17);name.setTypeface(null,android.graphics.Typeface.BOLD);name.setSingleLine();name.setEllipsize(android.text.TextUtils.TruncateAt.END);name.setPadding(dp(10),dp(5),dp(8),dp(5));heading.addView(name,new LinearLayout.LayoutParams(0,-2,1));LinearLayout apps=new LinearLayout(ui.context);apps.setGravity(Gravity.CENTER_VERTICAL);heading.addView(apps);homeNotifications.put(entry,apps);add(heading,computer,4);
+   computerTitles.put(entry,name);LinearLayout addresses=column();addressLists.put(entry,addresses);paintAddresses(entry);add(addresses,computer,4);
+   LinearLayout actions=new LinearLayout(ui.context);Button rename=button(L("重命名"),()->renameComputer(entry));Button remove=button(L("管理这台电脑"),()->manageComputer(entry));
    LinearLayout.LayoutParams renameSize=new LinearLayout.LayoutParams(0,-2,1);renameSize.setMarginEnd(dp(8));actions.addView(rename,renameSize);actions.addView(remove,new LinearLayout.LayoutParams(0,-2,1));add(actions,computer,0);
-   computer.setOnClickListener(v->connect(entry+"/"));computer.setContentDescription(L("连接 ")+computerName(entry));add(computer,content,12);
+   computer.setOnClickListener(v->openComputer(entry,"/"));computer.setContentDescription(L("连接 ")+computerName(entry));add(computer,content,12);
   }
-  TextView foot=text(L("外出使用 HTTPS 地址；局域网地址需要连接同一网络。"),13);foot.setTextColor(0xff777b80);foot.setGravity(Gravity.CENTER);add(foot,content,0);renderComputerNotifications();checkComputers();
+  TextView foot=text(L("外出使用 HTTPS 地址；局域网地址需要连接同一网络。"),13);foot.setTextColor(mutedColor());foot.setGravity(Gravity.CENTER);add(foot,content,0);renderComputerNotifications();checkComputers();
  }
- List<String> recentComputers(){List<String> entries=new ArrayList<>(saved());entries.sort((a,b)->{int order=Long.compare(prefs.getLong("last-opened:"+b,0),prefs.getLong("last-opened:"+a,0));return order!=0?order:a.compareTo(b);});return entries;}
- String computerName(String address){return prefs.getString("name:"+address,Uri.parse(address).getHost());}
+ List<String> recentComputers(){List<String> entries=new ArrayList<>(saved());for(String id:DshMobileStore.ids(this))entries.add("dsh:"+id);entries.sort((a,b)->{int order=Long.compare(prefs.getLong("last-opened:"+b,0),prefs.getLong("last-opened:"+a,0));return order!=0?order:a.compareTo(b);});return entries;}
+ LinearLayout dshComputer(String id){
+  String url=DshMobileStore.load(this,id);LinearLayout item=card();
+  TextView name=text("DSH Mobile",17);name.setTypeface(null,android.graphics.Typeface.BOLD);add(name,item,4);
+  String address=L("连接凭据不可用");try{address=DshMobileURL.display(url);}catch(Exception ignored){}
+  TextView detail=text(address,13);detail.setTextColor(mutedColor());add(detail,item,4);
+  Runnable connect=()->{if(url==null)message(L("连接凭据不可用，请移除后重新添加"));else openDsh(id,url);};
+  LinearLayout actions=new LinearLayout(ui.context);Button open=button(L("连接"),connect);
+  Button remove=button(L("移除这台电脑"),()->new AlertDialog.Builder(ui.context).setMessage(L("移除这台电脑")+"？").setNegativeButton(L("取消"),null).setPositiveButton(L("移除"),(d,w)->{DshMobileStore.remove(this,id);prefs.edit().remove("last-opened:dsh:"+id).apply();home();}).show());remove.setTextColor(ui.dark?ui.danger:0xffb44235);
+  LinearLayout.LayoutParams size=new LinearLayout.LayoutParams(0,-1,1);size.setMarginEnd(dp(8));actions.addView(open,size);actions.addView(remove,new LinearLayout.LayoutParams(0,-1,1));add(actions,item,0);
+  item.setOnClickListener(v->connect.run());item.setContentDescription(L("连接 ")+"DSH Mobile · "+address);return item;
+ }
+ String computerNameKey(String address){JSONObject d=GatewayChannels.record(prefs,address);return "name:"+(d==null?address:d.optString("deviceId",address));}
+ String computerName(String address){JSONObject d=GatewayChannels.record(prefs,address);return prefs.getString(computerNameKey(address),prefs.getString("name:"+address,d==null?Uri.parse(address).getHost():d.optString("name",Uri.parse(address).getHost())));}
  void renameComputer(String address){
-  EditText field=new EditText(this);field.setSingleLine();field.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(80)});field.setText(computerName(address));field.selectAll();field.setPadding(dp(24),dp(16),dp(24),dp(16));
-  new AlertDialog.Builder(this).setTitle(L("重命名电脑")).setMessage(address+"\n"+L("留空恢复默认名称")).setView(field).setNegativeButton(L("取消"),null).setPositiveButton(L("保存"),(d,w)->{String name=field.getText().toString().trim();android.content.SharedPreferences.Editor edit=prefs.edit();if(name.isEmpty())edit.remove("name:"+address);else edit.putString("name:"+address,name);edit.apply();home();}).show();
+  EditText field=new EditText(ui.context);field.setSingleLine();field.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(80)});field.setText(computerName(address));field.selectAll();field.setPadding(dp(24),dp(16),dp(24),dp(16));
+  new AlertDialog.Builder(ui.context).setTitle(L("重命名电脑")).setMessage(address+"\n"+L("留空恢复默认名称")).setView(field).setNegativeButton(L("取消"),null).setPositiveButton(L("保存"),(d,w)->{String name=field.getText().toString().trim();android.content.SharedPreferences.Editor edit=prefs.edit();edit.remove("name:"+address);if(name.isEmpty())edit.remove(computerNameKey(address));else edit.putString(computerNameKey(address),name);edit.apply();home();}).show();
  }
  void renderComputerNotifications(){
   if(!resumed||web!=null)return;
@@ -146,16 +637,17 @@ public final class MainActivity extends Activity {
    LinearLayout apps=entry.getValue();apps.removeAllViews();JSONArray rows=ComputerNotifications.clients(this,entry.getKey());
    for(int i=0;i<rows.length();i++){
     JSONObject row=rows.optJSONObject(i);if(row==null||!row.optBoolean("enabled"))continue;
-    String provider=row.optString("id"),name=provider.equals("codex")?"Codex":provider.equals("claude")?"Claude":provider.equals("deepseek")?"DeepSeek Harness":"";if(name.isEmpty())continue;
-    long count=Math.max(0,row.optLong("unread"));FrameLayout slot=new FrameLayout(this);ImageButton app=new ImageButton(this);app.setBackgroundColor(android.graphics.Color.TRANSPARENT);app.setScaleType(ImageView.ScaleType.FIT_CENTER);app.setPadding(dp(11),dp(11),dp(11),dp(11));
+    String provider=row.optString("id"),name=provider.equals("codex")?"Codex":provider.equals("claude")?"Claude":provider.equals("deepseek")?"DeepSeek Harness":provider.equals("zcode")?"ZCode":provider.equals("antigravity")?"Antigravity":"";if(name.isEmpty())continue;
+    long count=Math.max(0,row.optLong("unread"));FrameLayout slot=new FrameLayout(this);ImageButton app=new ImageButton(ui.context);app.setBackgroundColor(android.graphics.Color.TRANSPARENT);app.setScaleType(ImageView.ScaleType.FIT_CENTER);app.setPadding(dp(11),dp(11),dp(11),dp(11));
     if(!clientIcons.containsKey(provider))try(java.io.InputStream input=getAssets().open(provider+".png")){clientIcons.put(provider,android.graphics.BitmapFactory.decodeStream(input));}catch(java.io.IOException ignored){}
-    app.setImageBitmap(clientIcons.get(provider));app.setContentDescription(name+(row.has("connected")&&!row.isNull("connected")&&!row.optBoolean("connected")?" · "+L("尚未连接"):"")+" · "+L("未读通知")+" "+count);app.setOnClickListener(v->connect(entry.getKey()+"/?client="+provider));slot.addView(app,new FrameLayout.LayoutParams(dp(48),dp(48)));
+    app.setImageBitmap(clientIcons.get(provider));app.setContentDescription(name+(row.has("connected")&&!row.isNull("connected")&&!row.optBoolean("connected")?" · "+L("尚未连接"):"")+" · "+L("未读通知")+" "+count);app.setOnClickListener(v->openComputer(entry.getKey(),"/?client="+provider));slot.addView(app,new FrameLayout.LayoutParams(dp(48),dp(48)));
     if(count>0){TextView badge=text(count>99?"99+":String.valueOf(count),10);badge.setPadding(dp(4),0,dp(4),0);badge.setMinWidth(dp(18));badge.setGravity(Gravity.CENTER);badge.setTextColor(0xffffffff);badge.setBackground(background(0xffcf3939,10));badge.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);slot.addView(badge,new FrameLayout.LayoutParams(-2,dp(18),Gravity.TOP|Gravity.START));}
     slot.setAlpha(ComputerNotifications.fresh(entry.getKey())&&(!row.has("connected")||row.isNull("connected")||row.optBoolean("connected"))?1f:.5f);apps.addView(slot,new LinearLayout.LayoutParams(dp(48),dp(48)));
    }
   }
  }
  void stopComputerChecks(){probeGeneration++;homeHandler.removeCallbacks(homeRefresh);for(GatewayProbe probe:homeProbes)probe.cancel();homeProbes.clear();for(Future<?> task:probeTasks)task.cancel(true);probeTasks.clear();}
+ void clearZCodeCookie(String base){if(base==null||base.isEmpty())return;CookieManager.getInstance().setCookie(base+"/","localcap=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict",ignored->CookieManager.getInstance().flush());}
  void zcodeAddress(){
   EditText field=new EditText(this);field.setSingleLine();field.setInputType(17);field.setHint("https://zcode.z.ai/remote/v4?sid=…");field.setPadding(dp(24),dp(16),dp(24),dp(16));
   AlertDialog.Builder dialog=new AlertDialog.Builder(this).setTitle(L("智谱中继连接")).setMessage(L("粘贴这台电脑打印的智谱配对链接，登录同一智谱账号后进入原版网关。若连接被其他终端接管，请先断开那个终端，再在这里重新连接。")).setView(field).setNegativeButton(L("取消"),null).setPositiveButton(L("继续"),(d,w)->chooseZCode(field.getText().toString()));
@@ -180,60 +672,107 @@ public final class MainActivity extends Activity {
   }catch(Exception failed){runOnUiThread(()->{if(attempt==relayLoginGeneration&&!isFinishing()&&!isDestroyed()){progress.dismiss();message(L("登录或配对失败。请确认账号与电脑一致；登录失效时，先退出智谱再重新登录。"));}});}});
  }
  void forgetZCode(){
-  relayLoginGeneration++;String base=ZCodeConnection.origin(this);ZCodeConnection.forget(getApplicationContext());ZCodeAccount.clear(getApplicationContext());
+  relayLoginGeneration++;String base=ZCodeConnection.origin(this);if(!base.isEmpty())clearZCodeCookie(base);ZCodeConnection.forget(getApplicationContext());ZCodeAccount.clear(getApplicationContext());
   if(!base.isEmpty()){DeviceBinding.clear(this,base);EventClient.forget(base);Set<String> entries=saved();entries.remove(base);android.content.SharedPreferences.Editor edit=prefs.edit().putStringSet("origins",entries);for(String prefix:new String[]{"name:","computer-name:","cookieName:","cursor:","stream:","connection:","last-opened:"})edit.remove(prefix+base);if(base.equals(prefs.getString("active","")))edit.remove("active");edit.apply();if(base.equals(origin))origin="";}
   MonitorService.bindingsChanged();home();
  }
  void checkComputers(){
-  stopComputerChecks();if(!resumed||web!=null||homeStates.isEmpty())return;final int ticket=probeGeneration;
+  stopComputerChecks();if(!resumed||web!=null||addressLists.isEmpty())return;final int ticket=probeGeneration;
+  for(String address:addressLists.keySet()){JSONObject d=GatewayChannels.record(prefs,address);if(d!=null)
+   sweep(address,d,addresses(address),()->ticket==probeGeneration&&web==null&&resumed,(url,ms,select)->paintAddresses(address),()->{});}
   for(Map.Entry<String,TextView> entry:homeStates.entrySet()){
-   entry.getValue().setText(L("检查中…"));entry.getValue().setTextColor(0xff777b80);GatewayProbe probe=new GatewayProbe();homeProbes.add(probe);
-   probeTasks.add(probes.submit(()->{boolean online=probe.check(entry.getKey());runOnUiThread(()->{if(ticket!=probeGeneration||!resumed||web!=null)return;TextView label=entry.getValue();label.setText((online?"● ":"○ ")+L(online?"在线":"暂不可达"));label.setTextColor(online?0xff23815b:0xff777b80);});}));
+   entry.getValue().setText("○");entry.getValue().setTextColor(mutedColor());GatewayProbe probe=new GatewayProbe();homeProbes.add(probe);
+   probeTasks.add(probes.submit(()->{boolean online=probe.check(entry.getKey());runOnUiThread(()->{if(ticket!=probeGeneration||!resumed||web!=null)return;TextView label=entry.getValue();label.setText(online?"●":"○");label.setTextColor(online?(ui.dark?0xff73cda6:0xff23815b):mutedColor());});}));
   }
   homeHandler.postDelayed(homeRefresh,30000);
  }
- void manualAddress(){resetExitGesture();EditText field=new EditText(this);field.setSingleLine();field.setInputType(17);field.setText("https://");field.setSelection(field.length());field.setPadding(dp(24),dp(16),dp(24),dp(16));new AlertDialog.Builder(this).setTitle(L("连接电脑")).setMessage(L("粘贴电脑网关提供的访问地址")).setView(field).setPositiveButton(L("继续"),(d,w)->choose(field.getText().toString())).setNegativeButton(L("取消"),null).show();}
- void choose(String value){resetExitGesture();if(ZCodePairing.accepts(value)){chooseZCode(value);return;}try{String target=GatewayURL.connection(value);String base=GatewayURL.origin(value);new AlertDialog.Builder(this).setTitle(L("连接到这台电脑？")).setMessage(base+L("\n请确认这是你自己的网关。")).setPositiveButton(L("连接"),(d,w)->connect(target)).setNegativeButton(L("取消"),null).show();}catch(Exception e){message(e.getMessage());}}
- void connect(String url){
+ void manualAddress(){resetExitGesture();EditText field=new EditText(ui.context);field.setSingleLine();field.setInputType(17);field.setText("https://");field.setSelection(field.length());field.setPadding(dp(24),dp(16),dp(24),dp(16));new AlertDialog.Builder(ui.context).setTitle(L("连接电脑")).setMessage(L("粘贴电脑网关提供的访问地址")).setView(field).setPositiveButton(L("继续"),(d,w)->choose(field.getText().toString())).setNegativeButton(L("取消"),null).show();}
+ boolean isolatedPreviewShell(String target){return target!=null&&(target.equals(pageOrigin+"/html-preview-shell")||target.equals(pageOrigin+"/visualize-shell"));}
+ void manualDsh(){EditText field=new EditText(ui.context);field.setSingleLine();field.setInputType(17);field.setHint("https://…/?auth=…");new AlertDialog.Builder(ui.context).setTitle("DSH Mobile").setMessage(L("粘贴 DSH 客户端 Mobile 功能提供的完整链接")).setView(field).setPositiveButton(L("继续"),(d,w)->chooseDsh(field.getText().toString())).setNegativeButton(L("取消"),null).show();}
+ void chooseDsh(String input){try{String url=DshMobileURL.connection(input);new AlertDialog.Builder(ui.context).setTitle(L("连接 DSH Mobile？")).setMessage(DshMobileURL.display(url)+L("\n请确认这是你自己的 DSH 客户端。将打开它自带的手机界面。")).setPositiveButton(L("连接"),(d,w)->{try{String id=DshMobileStore.save(this,url);openDsh(id,url);}catch(Exception invalid){message(L("无法保存 DSH Mobile 连接"));}}).setNegativeButton(L("取消"),null).show();}catch(Exception invalid){message(invalid.getMessage());}}
+ void openDsh(String id,String url){prefs.edit().putLong("last-opened:dsh:"+id,System.currentTimeMillis()).apply();home();if(Build.VERSION.SDK_INT<28){new AlertDialog.Builder(ui.context).setMessage(L("Android 8 请使用浏览器打开 DSH Mobile；App 内连接需要 Android 9 或更高版本。")).setPositiveButton(L("打开"),(d,w)->startActivity(new Intent(Intent.ACTION_VIEW,Uri.parse(url)))).setNegativeButton(L("取消"),null).show();return;}startActivity(new Intent(this,DshMobileActivity.class).putExtra("url",url).putExtra("theme",SettingsUi.theme(this)));}
+ void choose(String value){resetExitGesture();if(ZCodePairing.accepts(value)){chooseZCode(value);return;}try{String target=GatewayURL.connection(value);String base=GatewayURL.origin(value);new AlertDialog.Builder(ui.context).setTitle(L("连接到这台电脑？")).setMessage(base+L("\n请确认这是你自己的网关。")).setPositiveButton(L("连接"),(d,w)->connect(target)).setNeutralButton("DSH Mobile",(d,w)->chooseDsh(value)).setNegativeButton(L("取消"),null).show();}catch(Exception e){chooseDsh(value);}}
+
+ void connect(String url){routeAttempted=false;
   try{String base=GatewayURL.targetBase(url);if(!ZCodeConnection.manages(this,base)){connectReady(url);return;}
    clear();header(false);status.setVisibility(View.VISIBLE);status.setText(L("正在连接智谱中继…"));final int ticket=generation;
    relayWorker.execute(()->{try{ZCodeConnection.ensure(getApplicationContext());String capability=ZCodeConnection.cookie(base);runOnUiThread(()->{if(ticket!=generation||isFinishing()||isDestroyed())return;CookieManager.getInstance().setCookie(base+"/",capability+"; Path=/; HttpOnly; SameSite=Strict",ok->{if(ticket!=generation||isFinishing()||isDestroyed())return;if(ok){CookieManager.getInstance().flush();connectReady(url);}else message(L("无法保存本地中继连接，请重试"));});});}catch(Exception failed){runOnUiThread(()->{if(ticket==generation&&!isFinishing()&&!isDestroyed()){home();message(L("智谱中继连接失败，请检查账号、网络和电脑端连接，再从智谱中继入口重新连接。"));}});}});
   }catch(Exception invalid){message(L("连接地址无效"));}
  }
- void connectReady(String url){routeAttempted=false;try{String base=GatewayURL.targetBase(url);clear();header(true);status.setVisibility(View.VISIBLE);origin=base;Set<String> saved=saved();saved.add(origin);prefs.edit().putStringSet("origins",saved).putString("active",origin).putLong("last-opened:"+origin,System.currentTimeMillis()).apply();status.setText(L("正在连接 · ")+origin);
-  FrameLayout viewport=new FrameLayout(this);root.addView(viewport,new LinearLayout.LayoutParams(-1,0,1));web=new WebView(this);web.setBackgroundColor(0xfff7f9fc);viewport.addView(web,new FrameLayout.LayoutParams(-1,-1));ImageButton menu=icon("ic_more",L("电脑与聊天选项"),()->{});menu.setOnClickListener(v->gatewayMenu(v));FrameLayout.LayoutParams menuPosition=new FrameLayout.LayoutParams(dp(48),dp(48),Gravity.TOP|Gravity.END);menuPosition.topMargin=dp(4);menuPosition.setMarginEnd(dp(8));viewport.addView(menu,menuPosition);final String clipboardToken=UUID.randomUUID().toString();final String appearance=MobileWebScripts.appearance(getAssets()).replace("__BRIDGE_CLIPBOARD_TOKEN__",clipboardToken);WebSettings s=web.getSettings();s.setJavaScriptEnabled(true);s.setDomStorageEnabled(true);s.setAllowFileAccess(false);s.setAllowContentAccess(true);s.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);s.setSupportMultipleWindows(false);s.setUserAgentString(s.getUserAgentString()+" BridgeMobile/0.1-Android");CookieManager.getInstance().setAcceptThirdPartyCookies(web,false);
+ void connectReady(String url){routeAttempted=false;try{String base=GatewayURL.targetBase(url);if(!ZCodeConnection.manages(this,base)&&saved().contains(base)&&!GatewayChannels.enabled(prefs,base,base)){openComputer(base,url.substring(base.length()));return;}clear();header(true);status.setVisibility(View.VISIBLE);origin=base;pageOrigin=base;Set<String> saved=saved();saved.add(origin);prefs.edit().putStringSet("origins",saved).putString("active",origin).putLong("last-opened:"+origin,System.currentTimeMillis()).apply();status.setText(L("正在连接 · ")+computerName(origin));
+  FrameLayout viewport=new FrameLayout(this);root.addView(viewport,new LinearLayout.LayoutParams(-1,0,1));web=new WebView(ui.context);web.setBackgroundColor(pageColor());viewport.addView(web,new FrameLayout.LayoutParams(-1,-1));ImageButton menu=icon("ic_more",L("电脑与聊天选项"),()->{});chatMenu=menu;menu.setOnClickListener(v->gatewayMenu(v));FrameLayout.LayoutParams menuPosition=new FrameLayout.LayoutParams(dp(48),dp(48),Gravity.TOP|Gravity.END);menuPosition.topMargin=dp(4);menuPosition.setMarginEnd(dp(8));viewport.addView(menu,menuPosition);final String clipboardToken=UUID.randomUUID().toString();final String appearance=MobileWebScripts.appearance(getAssets()).replace("__BRIDGE_CLIPBOARD_TOKEN__",clipboardToken).replace("__BRIDGE_ROUTE_BOUND__",GatewayChannels.record(prefs,origin)==null?"no":"yes").replace("'__BRIDGE_CONNECTION_NAME__'",JSONObject.quote(computerName(origin))).replace("'__BRIDGE_NATIVE_LANGUAGE__'",JSONObject.quote(prefs.getString("language",java.util.Locale.getDefault().getLanguage()).startsWith("en")?"en":"zh"));WebSettings s=web.getSettings();s.setJavaScriptEnabled(true);s.setDomStorageEnabled(true);s.setAllowFileAccess(false);s.setAllowContentAccess(true);s.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);s.setSupportMultipleWindows(false);s.setUserAgentString(s.getUserAgentString()+" BridgeMobile/0.1-Android");CookieManager.getInstance().setAcceptThirdPartyCookies(web,false);
+  // Keep the WebView glyph size aligned with the terminal's 6px lower bound.
+  s.setMinimumFontSize(6);s.setMinimumLogicalFontSize(6);
   web.setWebViewClient(new WebViewClient(){
-   public boolean shouldOverrideUrlLoading(WebView view,WebResourceRequest request){String target=request.getUrl().toString();if(target.equals("codexbridge://home")&&request.isForMainFrame()&&request.hasGesture()&&GatewayURL.sameOrigin(view.getUrl(),origin)){home();return true;}if(ArtifactDownload.accepts(target,origin)&&request.isForMainFrame()&&request.hasGesture()){downloadArtifact(target);return true;}if(GatewayURL.sameOrigin(target,origin))return false;if(request.isForMainFrame()&&request.hasGesture()&&("https".equals(request.getUrl().getScheme())||"http".equals(request.getUrl().getScheme())))new AlertDialog.Builder(MainActivity.this).setMessage(L("在浏览器打开外部链接？\n")+request.getUrl().getHost()).setPositiveButton(L("打开"),(d,w)->startActivity(new Intent(Intent.ACTION_VIEW,request.getUrl()))).setNegativeButton(L("取消"),null).show();return true;}
-   public void onPageFinished(WebView view,String target){if(view==web&&GatewayURL.sameOrigin(target,origin)){CookieManager.getInstance().flush();view.evaluateJavascript(appearance,null);status.setVisibility(View.GONE);registerPushToken();rememberConnection();
-    if(pendingStorage!=null){String snapshot=pendingStorage;pendingStorage=null;view.evaluateJavascript("(()=>{const data="+snapshot+";if(data&&typeof data==='object'){for(const [k,v] of Object.entries(data))if(typeof v==='string')localStorage.setItem(k,v);location.reload();}})()",null);}}}
-   public void onReceivedError(WebView view,WebResourceRequest req,WebResourceError e){if(view==web&&req.isForMainFrame()){status.setVisibility(View.VISIBLE);status.setText(L("连接失败，请在更多菜单中刷新"));recoverConnection(url);}}
-   public void onReceivedHttpError(WebView view,WebResourceRequest req,WebResourceResponse response){if(view==web&&req.isForMainFrame()&&GatewayURL.sameOrigin(req.getUrl().toString(),origin)&&ConnectionDiscovery.retryableStatus(response.getStatusCode()))recoverConnection(url);}
+   public void onPageStarted(WebView view,String target,android.graphics.Bitmap favicon){if(view==web){channelTicket++;rollbackPeer();navigationFailed=false;dismissGatewayMenu();}}
+   public boolean shouldOverrideUrlLoading(WebView view,WebResourceRequest request){String target=request.getUrl().toString();if(!request.isForMainFrame())return !isolatedPreviewShell(target);if(isolatedPreviewShell(target))return true;if(target.equals("codexbridge://home")&&request.hasGesture()&&GatewayURL.sameOrigin(view.getUrl(),pageOrigin)){home();return true;}if(ArtifactDownload.accepts(target,pageOrigin)&&request.hasGesture()){downloadArtifact(target);return true;}if(GatewayURL.sameOrigin(target,pageOrigin))return false;if(request.hasGesture()&&("https".equals(request.getUrl().getScheme())||"http".equals(request.getUrl().getScheme())))new AlertDialog.Builder(ui.context).setMessage(L("在浏览器打开外部链接？\n")+request.getUrl().getHost()).setPositiveButton(L("打开"),(d,w)->startActivity(new Intent(Intent.ACTION_VIEW,request.getUrl()))).setNegativeButton(L("取消"),null).show();return true;}
+   public void onPageCommitVisible(WebView view,String target){if(view==web&&!navigationFailed&&GatewayURL.sameOrigin(target,pageOrigin)){cancelConnectionDeadline();hideConnectionError();hideEntryProgress();syncWebTheme();status.setVisibility(View.GONE);}}
+   public void onPageFinished(WebView view,String target){if(view==web&&!navigationFailed&&GatewayURL.sameOrigin(target,pageOrigin)){cancelConnectionDeadline();hideConnectionError();hideEntryProgress();pageReady=true;CookieManager.getInstance().flush();view.evaluateJavascript("window.BridgeMobileCapabilities = Object.freeze({ diagnosticsExport: true });",null);view.evaluateJavascript(appearance,null);syncWebTheme();status.setVisibility(View.GONE);registerPushToken();rememberConnection();
+    if(pendingStorage!=null){String snapshot=pendingStorage;pendingStorage=null;view.evaluateJavascript("(()=>{const data=JSON.parse("+JSONObject.quote(snapshot)+");if(data.version===2){window.BridgeMobileHandoff?.restore(data);return;}if(data&&typeof data==='object'){for(const [k,v] of Object.entries(data))if(typeof v==='string')localStorage.setItem(k,v);location.reload();}})()",null);}}}
+   public void onReceivedError(WebView view,WebResourceRequest req,WebResourceError e){if(view==web&&req.isForMainFrame()){navigationFailed=true;cancelConnectionDeadline();showConnectionError(url);recoverConnection(url);}}
+   public void onReceivedHttpError(WebView view,WebResourceRequest req,WebResourceResponse response){if(view==web&&req.isForMainFrame()&&GatewayURL.sameOrigin(req.getUrl().toString(),pageOrigin)&&ConnectionDiscovery.retryableStatus(response.getStatusCode())){navigationFailed=true;cancelConnectionDeadline();showConnectionError(url);recoverConnection(url);}}
   });
   web.setWebChromeClient(new WebChromeClient(){
+   @Override public boolean onCreateWindow(WebView parent,boolean dialog,boolean gesture,Message reply){return openPeer(parent,reply);}
+   @Override public boolean onJsAlert(WebView view,String url,String message,JsResult result){if(view==web&&isolatedPreviewShell(url)){result.cancel();return true;}return super.onJsAlert(view,url,message,result);}
+   @Override public boolean onJsConfirm(WebView view,String url,String message,JsResult result){if(view==web&&isolatedPreviewShell(url)){result.cancel();return true;}return super.onJsConfirm(view,url,message,result);}
    @Override public boolean onJsPrompt(WebView view,String url,String prompt,String value,JsPromptResult result){
+    if(isolatedPreviewShell(url)){result.cancel();return true;}
     if(prompt.equals("codexbridge-system-bars:"+clipboardToken)){
-     if(view==web&&view.hasWindowFocus()&&GatewayURL.sameOrigin(url,origin)&&GatewayURL.sameOrigin(view.getUrl(),origin)&&value!=null&&value.length()<100){try{JSONObject colors=new JSONObject(value);String top=colors.getString("top"),bottom=colors.getString("bottom");if(top.matches("#[0-9a-fA-F]{6}")&&bottom.matches("#[0-9a-fA-F]{6}")){systemBars.update(android.graphics.Color.parseColor(top),android.graphics.Color.parseColor(bottom));result.confirm("saved");return true;}}catch(Exception ignored){}}
+     if(view==web&&view.hasWindowFocus()&&GatewayURL.sameOrigin(url,pageOrigin)&&GatewayURL.sameOrigin(view.getUrl(),pageOrigin)&&value!=null&&value.length()<100){try{JSONObject colors=new JSONObject(value);String top=colors.getString("top"),bottom=colors.getString("bottom");if(top.matches("#[0-9a-fA-F]{6}")&&bottom.matches("#[0-9a-fA-F]{6}")){systemBars.update(android.graphics.Color.parseColor(top),android.graphics.Color.parseColor(bottom));result.confirm("saved");return true;}}catch(Exception ignored){}}
      result.cancel();return true;
     }
-    if(prompt.equals("codexbridge-computer:"+clipboardToken)){
-     if(view==web&&GatewayURL.sameOrigin(url,origin)&&GatewayURL.sameOrigin(view.getUrl(),origin))result.confirm(computerName(origin));else result.cancel();return true;
+    if(prompt.equals("codexbridge-uu:"+clipboardToken)){
+     if(view==web&&view.hasWindowFocus()&&GatewayURL.sameOrigin(url,pageOrigin)&&GatewayURL.sameOrigin(view.getUrl(),pageOrigin)&&
+       ("read".equals(value)||"retry".equals(value))){
+      if("retry".equals(value)&&saved().contains(origin)){uuAvailability="checking";rememberConnection();}
+      if(uuContext())result.confirm(uu.settings("read"));
+      else result.confirm("{\"supported\":false,\"availability\":\""+uuAvailability+"\"}");
+      return true;
+     }
+     if(view==web&&view.hasWindowFocus()&&GatewayURL.sameOrigin(url,pageOrigin)&&uuContext()&&
+       ("enable".equals(value)||"disable".equals(value)||"forget".equals(value)))result.confirm(uu.settings(value));else result.cancel();
+     return true;
+    }
+    if(prompt.equals("codexbridge-modal:"+clipboardToken)){
+     if(view==web&&view.hasWindowFocus()&&GatewayURL.sameOrigin(url,pageOrigin)&&GatewayURL.sameOrigin(view.getUrl(),pageOrigin)&&("open".equals(value)||"closed".equals(value))){boolean open="open".equals(value);menu.setVisibility(open?View.GONE:View.VISIBLE);menu.setEnabled(!open);if(open)dismissGatewayMenu();result.confirm("saved");}else result.cancel();return true;
     }
     if(prompt.equals("codexbridge-session:"+clipboardToken)){
-     if(view==web&&GatewayURL.sameOrigin(url,origin)&&GatewayURL.sameOrigin(view.getUrl(),origin)){authLossAttempted=false;CookieManager.getInstance().flush();MonitorService.bindingsChanged();rememberConnection();result.confirm("saved");}else result.cancel();return true;
+     if(view==web&&GatewayURL.sameOrigin(url,pageOrigin)&&GatewayURL.sameOrigin(view.getUrl(),pageOrigin)){authLossAttempted=false;CookieManager.getInstance().flush();MonitorService.bindingsChanged();rememberConnection();result.confirm("saved");}else result.cancel();return true;
     }
-    if(prompt.equals("codexbridge-auth-lost:"+clipboardToken)){
-     if(view==web&&view.hasWindowFocus()&&GatewayURL.sameOrigin(url,origin)&&GatewayURL.sameOrigin(view.getUrl(),origin)&&!authLossAttempted){authLossAttempted=true;loadWithRecovery(origin,origin+"/",view,generation);result.confirm("recovering");}else result.cancel();return true;
-    }
-    if(prompt.equals("codexbridge-logout:"+clipboardToken)){
-     if(view==web&&view.hasWindowFocus()&&GatewayURL.sameOrigin(url,origin)&&GatewayURL.sameOrigin(view.getUrl(),origin)){
-      DeviceBinding.clear(MainActivity.this,origin);EventClient.forget(origin);MonitorService.bindingsChanged();result.confirm("cleared");
+    if(prompt.equals("codexbridge-chat-visible:"+clipboardToken)){
+     if(view==web&&resumed&&view.hasWindowFocus()&&saved().contains(origin)&&GatewayURL.sameOrigin(url,pageOrigin)&&GatewayURL.sameOrigin(view.getUrl(),pageOrigin)&&value!=null&&value.length()<=4096){
+      try{JSONObject chat=new JSONObject(value);String thread=chat.getString("threadId"),host=chat.getString("host");GatewayURL.chat(origin,thread,host);TaskNotifications.clearChat(MainActivity.this,origin,thread,host);result.confirm("cleared");}catch(Exception e){result.cancel();}
      }else result.cancel();return true;
     }
+    if(prompt.equals("codexbridge-auth-lost:"+clipboardToken)){
+     if(view==web&&view.hasWindowFocus()&&GatewayURL.sameOrigin(url,pageOrigin)&&GatewayURL.sameOrigin(view.getUrl(),pageOrigin)&&!authLossAttempted){authLossAttempted=true;loadWithRecovery(origin,origin+"/",view,generation);result.confirm("recovering");}else result.cancel();return true;
+    }
+    if(prompt.equals("codexbridge-channels:"+clipboardToken)){
+     if(view!=web||!resumed||!GatewayURL.sameOrigin(url,pageOrigin)||!GatewayURL.sameOrigin(view.getUrl(),pageOrigin)){result.cancel();return true;}
+     String response=channelCommand(value);if(response!=null){result.confirm(response);return true;}
+     if("settled".equals(value)){Runnable retry=deferredRoute;deferredRoute=null;if(retry!=null)retry.run();}
+     else if("probe".equals(value))raceActive(view.getUrl(),false,null,true);
+     else if(value!=null&&value.startsWith("pick:"))raceActive(view.getUrl(),false,value.substring(5),false);
+     result.confirm(channelMenu().toString());return true;
+    }
+    if(prompt.equals("codexbridge-channel-failure:"+clipboardToken)){
+     if(view==web&&GatewayURL.sameOrigin(url,pageOrigin)&&GatewayURL.sameOrigin(view.getUrl(),pageOrigin))checkChannels(view.getUrl(),true);
+     result.confirm("");return true;
+    }
+    if(prompt.equals("codexbridge-logout:"+clipboardToken)){
+     if(view==web&&view.hasWindowFocus()&&GatewayURL.sameOrigin(url,pageOrigin)&&GatewayURL.sameOrigin(view.getUrl(),pageOrigin)){
+      clearChannels(origin);DeviceBinding.clear(MainActivity.this,origin);EventClient.forget(origin);MonitorService.bindingsChanged();result.confirm("cleared");
+     }else result.cancel();return true;
+    }
+    if(prompt.equals("codexbridge-theme:"+clipboardToken)){
+     if(view==web&&view.hasWindowFocus()&&GatewayURL.sameOrigin(url,pageOrigin)&&GatewayURL.sameOrigin(view.getUrl(),pageOrigin)&&("system".equals(value)||"light".equals(value)||"dark".equals(value))){prefs.edit().putString("settingsTheme",value).apply();result.confirm("saved");}else result.cancel();return true;
+    }
     if(prompt.equals("codexbridge-language:"+clipboardToken)){
-     if(view==web&&GatewayURL.sameOrigin(url,origin)&&GatewayURL.sameOrigin(view.getUrl(),origin)&&("en".equals(value)||"zh".equals(value))){prefs.edit().putString("language",value).apply();menu.setContentDescription(L("电脑与聊天选项"));renderDownload();result.confirm("saved");}else result.cancel();return true;
+     if(view==web&&GatewayURL.sameOrigin(url,pageOrigin)&&GatewayURL.sameOrigin(view.getUrl(),pageOrigin)&&("en".equals(value)||"zh".equals(value))){prefs.edit().putString("language",value).apply();menu.setContentDescription(L("电脑与聊天选项"));renderDownload();result.confirm("saved");}else result.cancel();return true;
     }
     if(!prompt.startsWith("codexbridge-copy:"))return false;
-    if(view!=web||!view.hasWindowFocus()||!GatewayURL.sameOrigin(url,origin)||!GatewayURL.sameOrigin(view.getUrl(),origin)||!prompt.equals("codexbridge-copy:"+clipboardToken)||value==null||value.length()>262144){result.cancel();return true;}
+    if(view!=web||!view.hasWindowFocus()||!GatewayURL.sameOrigin(url,pageOrigin)||!GatewayURL.sameOrigin(view.getUrl(),pageOrigin)||!prompt.equals("codexbridge-copy:"+clipboardToken)||value==null||value.length()>262144){result.cancel();return true;}
     try{android.content.ClipboardManager clipboard=(android.content.ClipboardManager)getSystemService(CLIPBOARD_SERVICE);clipboard.setPrimaryClip(ClipData.newPlainText("Codex Bridge",value));result.confirm("copied");}catch(RuntimeException e){result.cancel();}
     return true;
    }
@@ -246,14 +785,14 @@ public final class MainActivity extends Activity {
    }});
 
   web.setDownloadListener((target,agent,disposition,mime,length)->downloadArtifact(target));
-  loadWithRecovery(base,url,web,generation);monitor();
+  watchConnection(url,web,generation);loadWithRecovery(base,url,web,generation);monitor();
  }catch(Exception e){message(e.getMessage());}}
  void renderDownload(){downloadCard.render(downloadTask,savingDownload||choosingDownload!=null,openingDownload,updateSession!=null);}
  void downloadArtifact(String target){
   if(preparingUpdate!=null){message(L("电脑正在准备更新，请稍候"));return;}
   if(downloadTask!=null){downloadCard.showTask();renderDownload();message(L("已有下载任务，请先完成或取消"));return;}
-  if(web==null||!GatewayURL.sameOrigin(web.getUrl(),origin)||!ArtifactDownload.accepts(target,origin)){message(L("此下载不是当前电脑的附件，请在浏览器中打开"));return;}
-  startDownload(target,origin);
+  if(web==null||!GatewayURL.sameOrigin(web.getUrl(),pageOrigin)||!ArtifactDownload.accepts(target,pageOrigin)){message(L("此下载不是当前电脑的附件，请在浏览器中打开"));return;}
+  startDownload(origin+target.substring(pageOrigin.length()),origin);
  }
  void startDownload(String target,String base){
   if(restoringUpdate){message(L("正在恢复更新，请稍候"));return;}
@@ -311,14 +850,26 @@ public final class MainActivity extends Activity {
    final boolean saved=ok;runOnUiThread(()->{savingDownload=false;if(isFinishing()||isDestroyed())return;if(task==downloadTask){if(saved)cancelDownload();else renderDownload();Toast.makeText(this,L(saved?"文件已保存":"保存失败，请重试"),Toast.LENGTH_LONG).show();}else renderDownload();});
   });
  }
- boolean openIntent(Intent intent){try{String base=intent.getStringExtra("origin"),thread=intent.getStringExtra("thread"),host=intent.getStringExtra("host");Uri link=intent.getData();if(link!=null){if(!"codexbridge".equals(link.getScheme())||!"open".equals(link.getHost()))return false;base=link.getQueryParameter("origin");thread=link.getQueryParameter("thread");host=link.getQueryParameter("host");}if(base==null)return false;if(!saved().contains(base)){message(L("请先扫码保存通知对应的电脑，再打开聊天。"));return false;}connect(thread==null||thread.isEmpty()?base+"/":GatewayURL.chat(base,thread,host==null?"local":host));return true;}catch(Exception e){message(L("通知链接无效"));return false;}}
- @Override protected void onNewIntent(Intent intent){super.onNewIntent(intent);setIntent(intent);openIntent(intent);}
+ boolean openIntent(Intent intent){final int request=++navigationRequest;try{String base=intent.getStringExtra("origin"),thread=intent.getStringExtra("thread"),host=intent.getStringExtra("host");Uri link=intent.getData();if(link!=null){if(!"codexbridge".equals(link.getScheme())||!"open".equals(link.getHost()))return false;base=link.getQueryParameter("origin");thread=link.getQueryParameter("thread");host=link.getQueryParameter("host");}if(base==null)return false;base=activeChannel(base);if(!saved().contains(base)){message(L("请先扫码保存通知对应的电脑，再打开聊天。"));return false;}String target=thread==null||thread.isEmpty()?base+"/":GatewayURL.chat(base,thread,host==null?"local":host);if(thread==null||thread.isEmpty()||!reuseChat(target,base,request))connect(target);return true;}catch(Exception e){message(L("通知链接无效"));return false;}}
+ boolean reuseChat(String target,String base,int request){
+  if(web==null||!base.equals(origin)||!GatewayURL.isChatPage(web.getUrl(),pageOrigin))return false;
+  final WebView current=web;final int ticket=generation;
+  final String binding=EventClient.sessionCookie(CookieManager.getInstance().getCookie(base+"/"),base);
+  if(binding.isEmpty())return false;
+  String hash="#"+Uri.parse(target).getEncodedFragment();
+  current.evaluateJavascript("(()=>typeof window.BridgeOpenChatLink==='function'&&window.BridgeOpenChatLink("+JSONObject.quote(hash)+"))()",accepted->{
+   if(web!=current||ticket!=generation||request!=navigationRequest||!base.equals(origin)||!saved().contains(base)||!GatewayURL.isChatPage(current.getUrl(),pageOrigin)||!binding.equals(EventClient.sessionCookie(CookieManager.getInstance().getCookie(base+"/"),base)))return;
+   if(!"true".equals(accepted))connect(target);
+  });
+  return true;
+ }
+ @Override protected void onNewIntent(Intent intent){super.onNewIntent(intent);setIntent(intent);String result=uu.callback(intent.getData());if(result==null)openIntent(intent);else uuNotice(result);}
  Dialog panel(String title,LinearLayout content){
   resetExitGesture();
-  Dialog dialog=new Dialog(this);dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+  Dialog dialog=new Dialog(ui.context);dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
   LinearLayout body=column();body.setBackground(background(0xfff5f5f3,22));body.setPadding(dp(18),dp(12),dp(18),dp(12));
-  LinearLayout heading=new LinearLayout(this);heading.setGravity(Gravity.CENTER_VERTICAL);TextView name=text(title,23);name.setTypeface(null,android.graphics.Typeface.BOLD);heading.addView(name,new LinearLayout.LayoutParams(0,-2,1));Button done=button(L("完成"),dialog::dismiss);heading.addView(done);body.addView(heading);
-  ScrollView scroll=new ScrollView(this);content.setPadding(0,dp(20),0,dp(16));scroll.addView(content);body.addView(scroll,new LinearLayout.LayoutParams(-1,0,1));
+  LinearLayout heading=new LinearLayout(ui.context);heading.setGravity(Gravity.CENTER_VERTICAL);TextView name=text(title,23);name.setTypeface(null,android.graphics.Typeface.BOLD);heading.addView(name,new LinearLayout.LayoutParams(0,-2,1));Button done=button(L("完成"),dialog::dismiss);heading.addView(done);body.addView(heading);
+  ScrollView scroll=new ScrollView(ui.context);content.setPadding(0,dp(20),0,dp(16));scroll.addView(content);body.addView(scroll,new LinearLayout.LayoutParams(-1,0,1));
   dialog.setContentView(body);dialog.show();dialog.getWindow().setBackgroundDrawableResource(android.R.color.transparent);dialog.getWindow().setLayout(getResources().getDisplayMetrics().widthPixels-dp(24),getResources().getDisplayMetrics().heightPixels-dp(100));return dialog;
  }
  void clearInbox(String base,JSONObject data,Runnable done){
@@ -339,23 +890,16 @@ public final class MainActivity extends Activity {
    if(events.length()==0){LinearLayout empty=card();add(text(L("暂无通知"),18),empty,8);add(text(L("在聊天中开启“提醒”，任务完成或需要你处理时，会记录在这里。"),14),empty,0);add(empty,content,12);return;}
    for(int i=events.length()-1;i>=0;i--){JSONObject event=events.optJSONObject(i);if(event==null)continue;LinearLayout item=card();TextView title=text(event.optString("title",L("任务提醒")),17);title.setTypeface(null,android.graphics.Typeface.BOLD);add(title,item,8);
     if(!event.optString("body").isEmpty())add(text(event.optString("body"),14),item,8);
-    if(event.has("createdAt")){TextView time=text(java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.SHORT,java.text.DateFormat.SHORT).format(new Date((long)(event.optDouble("createdAt")*1000))),12);time.setTextColor(0xff777b80);add(time,item,8);}
+    if(event.has("createdAt")){TextView time=text(java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.SHORT,java.text.DateFormat.SHORT).format(new Date((long)(event.optDouble("createdAt")*1000))),12);time.setTextColor(mutedColor());add(time,item,8);}
     add(button(L("查看聊天  ↗"),()->{try{String target=GatewayURL.chat(base,event.getString("threadId"),event.getString("host"));dialog.dismiss();connect(target);}catch(Exception e){message(L("聊天链接无效"));}}),item,0);add(item,content,12);
    }
   });}catch(Exception e){runOnUiThread(()->{if(ticket==generation){status.setVisibility(View.GONE);message(e.getMessage());}});}});
  }
- void settings(){
-  LinearLayout content=column();Dialog dialog=panel(L("设置"),content);add(text(L("通知"),19),content,12);
-  LinearLayout notifications=card();Button toggle=button(prefs.getBoolean("alerts",false)?L("关闭任务通知"):L("开启任务通知"),()->{dialog.dismiss();toggleNotifications();});add(toggle,notifications,8);add(text(L("App 打开时提醒已连接电脑的新任务消息。离开 App 或锁屏后不保证通知；可在电脑端配置 Bark 或 ntfy。"),14),notifications,12);
-  add(button(L("测试本机通知"),()->{dialog.dismiss();testNotification();}),notifications,4);add(text(L("10 秒后显示，用于检查手机的通知权限。"),13),notifications,0);add(notifications,content,22);
-  add(text(L("当前电脑"),19),content,12);LinearLayout computer=card();if(origin.isEmpty()){add(text(L("尚未选择电脑"),17),computer,8);add(text(L("返回首页扫码或输入网关地址。"),14),computer,0);}else{add(text(computerName(origin),17),computer,8);add(text(origin,13),computer,12);Button remove=button(L("移除这台电脑"),()->{dialog.dismiss();confirmRemove();});remove.setTextColor(0xffb44235);add(remove,computer,0);}add(computer,content,24);
-  LinearLayout updates=card();add(text(L("应用更新"),19),updates,8);add(text("Codex Mobile Bridge · "+appVersion(),14),updates,8);add(text(L("手动检查更新，确认后下载并安装"),13),updates,8);
-  TextView updateStatus=text("",13);Button check=button(L("检查更新"),()->{});check.setOnClickListener(v->checkUpdate(dialog,check,updateStatus));add(check,updates,6);add(updateStatus,updates,0);add(updates,content,20);
-  TextView version=text("Codex Mobile Bridge",13);version.setTextColor(0xff777b80);version.setGravity(Gravity.CENTER);add(version,content,0);
- }
+ void settings(){if(settingsPage==null||!settingsPage.isShowing()){settingsPage=new SettingsPage(this,0);settingsPage.show();}}
+ void reopenSettings(SettingsPage previous){if(previous!=settingsPage||!previous.isShowing()||previous.isClosing())return;SettingsPage replacement=previous.replacement();previous.dismiss();settingsPage=replacement;settingsPage.show();}
  String appVersion(){try{return getPackageManager().getPackageInfo(getPackageName(),0).versionName;}catch(Exception e){return "2.0.0";}}
  void openUpdateUrl(String url){try{startActivity(new Intent(Intent.ACTION_VIEW,Uri.parse(url)));}catch(ActivityNotFoundException e){message(L("没有可用的浏览器，请在电脑上打开 GitHub Release。"));}}
- void checkUpdate(Dialog dialog,Button check,TextView updateStatus){
+ void checkUpdate(Dialog dialog,View check,TextView updateStatus){
   check.setEnabled(false);updateStatus.setText(L("正在检查更新…"));final String current=appVersion(),gateway=selectedUpdateGateway();final int ticket=generation;
   worker.execute(()->{
    MobileRelease candidate=null;String problem=null;
@@ -378,28 +922,29 @@ public final class MainActivity extends Activity {
    }
    final MobileRelease result=candidate;final String error=problem;
    runOnUiThread(()->{if(isFinishing()||isDestroyed()||!dialog.isShowing())return;check.setEnabled(true);if(ticket!=generation){updateStatus.setText(L("电脑连接已变化，请重新检查更新"));return;}
-    if(error!=null){updateStatus.setText(error);new AlertDialog.Builder(this).setMessage(error).setNegativeButton(L("关闭"),null).setPositiveButton(L("打开 GitHub 版本页"),(d,w)->openUpdateUrl(MobileRelease.REPO+"/releases")).show();return;}
+    if(error!=null){updateStatus.setText(error);new AlertDialog.Builder(ui.context).setMessage(error).setNegativeButton(L("关闭"),null).setPositiveButton(L("打开 GitHub 版本页"),(d,w)->openUpdateUrl(MobileRelease.REPO+"/releases")).show();return;}
     if(result==null){updateStatus.setText(L("当前已是此通道最新版本。"));return;}
-    updateStatus.setText(L("发现新版本")+" · "+result.version);
-    new AlertDialog.Builder(this).setTitle(L("发现新版本")+" · "+result.version).setMessage(L("App 会在本机下载并打开系统安装器，已保存的电脑与登录状态会保留。")+"\n\n"+result.notes).setNegativeButton(L("稍后"),null).setNeutralButton(L("打开 GitHub 版本页"),(d,w)->openUpdateUrl(result.page())).setPositiveButton(L("下载并安装"),(d,w)->chooseUpdateDownload(result,dialog)).show();
+    final String skipKey="skip-mobile-update:"+MobileRelease.channel(current),title=L(result.version.equals(prefs.getString(skipKey,""))?"已跳过此版本，仍可手动更新":"发现新版本")+" "+result.version;
+    updateStatus.setText(title);
+    new AlertDialog.Builder(ui.context).setTitle(title).setMessage(L("App 会在本机下载并打开系统安装器，已保存的电脑与登录状态会保留。")+"\n\n"+result.notes).setNegativeButton(L("跳过此版本"),(d,w)->{prefs.edit().putString(skipKey,result.version).apply();updateStatus.setText(L("已跳过此版本，仍可手动更新")+" "+result.version);}).setNeutralButton(L("打开 GitHub 版本页"),(d,w)->openUpdateUrl(result.page())).setPositiveButton(L("下载并安装"),(d,w)->chooseUpdateDownload(result,dialog)).show();
    });
   });
  }
  java.io.File updateDirectory(){return new java.io.File(getFilesDir(),"pending-update");}
- void updateProblem(String text,MobileRelease release){new AlertDialog.Builder(this).setMessage(L(text)).setNegativeButton(L("关闭"),null).setPositiveButton(L("打开 GitHub 版本页"),(d,w)->openUpdateUrl(release.page())).show();}
+ void updateProblem(String text,MobileRelease release){new AlertDialog.Builder(ui.context).setMessage(L(text)).setNegativeButton(L("关闭"),null).setPositiveButton(L("打开 GitHub 版本页"),(d,w)->openUpdateUrl(release.page())).show();}
  void chooseUpdateDownload(MobileRelease release,Dialog settingsDialog){
-  Dialog dialog=new Dialog(this);dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
-  LinearLayout content=column();content.setPadding(dp(22),dp(22),dp(22),dp(16));content.setBackground(background(0xffffffff,26));
+  Dialog dialog=new Dialog(ui.context);dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+  LinearLayout content=column();content.setPadding(dp(22),dp(22),dp(22),dp(16));content.setBackground(background(surfaceColor(),26));
   TextView title=text(L("选择下载方式"),22);title.setTypeface(null,android.graphics.Typeface.BOLD);title.setPadding(0,0,0,0);add(title,content,22);
   add(updateDownloadOption("ic_phone","手机下载","从 GitHub 直接下载到手机",()->{if(startUpdateDownload(release)){dialog.dismiss();if(settingsDialog!=null)settingsDialog.dismiss();}}),content,10);
   add(updateDownloadOption("ic_computer","电脑下载","电脑从 GitHub 下载，再传到手机",()->{if(startGatewayUpdate(release,selectedUpdateGateway())){dialog.dismiss();if(settingsDialog!=null)settingsDialog.dismiss();}}),content,14);
-  Button cancel=button(L("取消"),dialog::dismiss);cancel.setTextColor(0xff727782);cancel.setBackground(new android.graphics.drawable.RippleDrawable(android.content.res.ColorStateList.valueOf(0x10202124),background(0xffffffff,12),null));add(cancel,content,0);
-  ScrollView scroll=new ScrollView(this);scroll.setFillViewport(true);scroll.addView(content);dialog.setContentView(scroll);dialog.setCanceledOnTouchOutside(true);dialog.show();
+  Button cancel=button(L("取消"),dialog::dismiss);cancel.setTextColor(0xff727782);cancel.setBackground(new android.graphics.drawable.RippleDrawable(android.content.res.ColorStateList.valueOf(0x10202124),background(surfaceColor(),12),null));add(cancel,content,0);
+  ScrollView scroll=new ScrollView(ui.context);scroll.setFillViewport(true);scroll.addView(content);dialog.setContentView(scroll);dialog.setCanceledOnTouchOutside(true);dialog.show();
   Window window=dialog.getWindow();window.setBackgroundDrawableResource(android.R.color.transparent);window.setDimAmount(.34f);window.setLayout(Math.min(dp(420),getResources().getDisplayMetrics().widthPixels-dp(32)),WindowManager.LayoutParams.WRAP_CONTENT);
  }
  LinearLayout updateDownloadOption(String drawable,String title,String detail,Runnable action){
-  LinearLayout row=new LinearLayout(this);row.setGravity(Gravity.CENTER_VERTICAL);row.setPadding(dp(14),dp(17),dp(12),dp(17));row.setMinimumHeight(dp(88));row.setBackground(new android.graphics.drawable.RippleDrawable(android.content.res.ColorStateList.valueOf(0x14202124),background(0xfff5f6f8,17),null));
-  ImageView image=new ImageView(this);image.setImageResource(getResources().getIdentifier(drawable,"drawable",getPackageName()));image.setScaleType(ImageView.ScaleType.FIT_CENTER);image.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);row.addView(image,new LinearLayout.LayoutParams(dp(30),dp(30)));
+  LinearLayout row=new LinearLayout(ui.context);row.setGravity(Gravity.CENTER_VERTICAL);row.setPadding(dp(14),dp(17),dp(12),dp(17));row.setMinimumHeight(dp(88));row.setBackground(new android.graphics.drawable.RippleDrawable(android.content.res.ColorStateList.valueOf(0x14202124),background(0xfff5f6f8,17),null));
+  ImageView image=new ImageView(ui.context);image.setImageResource(getResources().getIdentifier(drawable,"drawable",getPackageName()));image.setScaleType(ImageView.ScaleType.FIT_CENTER);image.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);row.addView(image,new LinearLayout.LayoutParams(dp(30),dp(30)));
   LinearLayout labels=column();LinearLayout.LayoutParams labelParams=new LinearLayout.LayoutParams(0,-2,1);labelParams.setMarginStart(dp(13));labelParams.setMarginEnd(dp(8));row.addView(labels,labelParams);
   TextView heading=text(L(title),16);heading.setTypeface(null,android.graphics.Typeface.BOLD);heading.setPadding(0,0,0,dp(5));heading.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);labels.addView(heading);
   TextView description=text(L(detail),13);description.setTextColor(0xff747983);description.setPadding(0,0,0,0);description.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);labels.addView(description);
@@ -425,7 +970,7 @@ public final class MainActivity extends Activity {
   final GatewayUpdate helper;try{helper=new GatewayUpdate(gateway,()->CookieManager.getInstance().getCookie(gateway+"/"));}catch(java.io.IOException e){updateProblem(e.getMessage(),release);return false;}
   preparingUpdate=helper;final int ticket=generation;LinearLayout content=column();content.setPadding(dp(24),dp(12),dp(24),dp(12));
   TextView detail=text(L("电脑正在下载更新…"),15);add(detail,content,12);ProgressBar progress=new ProgressBar(this,null,android.R.attr.progressBarStyleHorizontal);progress.setMax(1000);progress.setIndeterminate(true);add(progress,content,8);
-  AlertDialog dialog=new AlertDialog.Builder(this).setTitle(L("通过电脑更新")+" · "+release.version).setView(content).setNegativeButton(L("取消"),(d,w)->{helper.cancel();if(preparingUpdate==helper)preparingUpdate=null;}).create();dialog.setCanceledOnTouchOutside(false);dialog.setOnCancelListener(d->{helper.cancel();if(preparingUpdate==helper)preparingUpdate=null;});dialog.show();
+  AlertDialog dialog=new AlertDialog.Builder(ui.context).setTitle(L("通过电脑更新")+" · "+release.version).setView(content).setNegativeButton(L("取消"),(d,w)->{helper.cancel();if(preparingUpdate==helper)preparingUpdate=null;}).create();dialog.setCanceledOnTouchOutside(false);dialog.setOnCancelListener(d->{helper.cancel();if(preparingUpdate==helper)preparingUpdate=null;});dialog.show();
   downloads.execute(()->{
    ArtifactDownload.Task ready=null;String error=null;
    try{String identifier=helper.prepare(release,(downloaded,size)->runOnUiThread(()->{if(preparingUpdate!=helper||isDestroyed())return;progress.setIndeterminate(false);progress.setProgress((int)(downloaded*1000/size));detail.setText(L("电脑正在下载更新…")+" "+(downloaded*100/size)+"%");}));
@@ -474,21 +1019,28 @@ public final class MainActivity extends Activity {
   try{Class<?> provider=Class.forName("io.github.try2love.codexbridge.FirebaseBootstrap");prefs.edit().putBoolean("nativePushEnabled",true).apply();provider.getMethod("enable",MainActivity.class).invoke(null,this);}catch(Exception e){prefs.edit().putBoolean("nativePushEnabled",false).apply();message(L("此预览尚未配置系统推送项目。当前仅同步收件箱；配置 Firebase 或厂商推送后才能启用后台任务提醒。"));}
  }
  void registerPushToken(){String token=prefs.getString("fcmToken","");if(!token.isEmpty()&&prefs.getBoolean("nativePushEnabled",false))worker.execute(()->{try{EventClient.register(this,token);}catch(Exception ignored){/* Retry after authenticated page load or resume. */}});}
+ void toggleBackgroundNotifications(){
+  if(prefs.getBoolean("backgroundNotifications",false)){prefs.edit().putBoolean("backgroundNotifications",false).apply();MonitorService.refresh();return;}
+  if(Build.VERSION.SDK_INT>=33&&checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)!=PackageManager.PERMISSION_GRANTED){requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS},26);return;}
+  if(!((NotificationManager)getSystemService(NOTIFICATION_SERVICE)).areNotificationsEnabled()){message(L("请在系统设置中允许通知。"));return;}
+  prefs.edit().putBoolean("alerts",true).putBoolean("backgroundNotifications",true).apply();monitor();
+  if(!MonitorService.startBackground(this))message(L("后台通知启动失败，请重新打开 App 后再试。"));
+ }
  void requestStartupNotifications(){
-  MonitorService.createNotificationChannel(this,"foreground-tasks");
+  TaskNotifications.createChannel(this,"foreground-tasks");
   // A stored false is an explicit choice (including a denied startup request).
   if(prefs.contains("alerts"))return;
   prefs.edit().putBoolean("alerts",false).apply();
   if(Build.VERSION.SDK_INT>=33&&checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)!=PackageManager.PERMISSION_GRANTED){requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS},25);return;}
   prefs.edit().putBoolean("alerts",((NotificationManager)getSystemService(NOTIFICATION_SERVICE)).areNotificationsEnabled()).apply();
  }
- void toggleNotifications(){if(prefs.getBoolean("alerts",false)){prefs.edit().putBoolean("alerts",false).apply();return;}if(Build.VERSION.SDK_INT>=33&&checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)!=PackageManager.PERMISSION_GRANTED){requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS},22);return;}if(!((NotificationManager)getSystemService(NOTIFICATION_SERVICE)).areNotificationsEnabled()){message(L("请在系统设置中允许通知。"));return;}prefs.edit().putBoolean("alerts",true).apply();monitor();}
- void testNotification(){if(Build.VERSION.SDK_INT>=33&&checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)!=PackageManager.PERMISSION_GRANTED){requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS},23);return;}String base=origin;new Handler().postDelayed(()->{try{MonitorService.notifyEvent(this,base,new JSONObject().put("id","test").put("title",L("手机通知测试")).put("body",L("本机通知已开启")));}catch(Exception ignored){}},10000);message(L("10 秒后显示本地测试通知，可以先返回桌面。此测试不代表远程推送已经接通。"));}
+ void toggleNotifications(){if(prefs.getBoolean("alerts",false)){prefs.edit().putBoolean("alerts",false).putBoolean("backgroundNotifications",false).apply();MonitorService.refresh();return;}if(Build.VERSION.SDK_INT>=33&&checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)!=PackageManager.PERMISSION_GRANTED){requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS},22);return;}if(!((NotificationManager)getSystemService(NOTIFICATION_SERVICE)).areNotificationsEnabled()){message(L("请在系统设置中允许通知。"));return;}prefs.edit().putBoolean("alerts",true).apply();monitor();}
+ void testNotification(){if(Build.VERSION.SDK_INT>=33&&checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)!=PackageManager.PERMISSION_GRANTED){requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS},23);return;}String base=origin;new Handler().postDelayed(()->{try{TaskNotifications.show(this,base,new JSONObject().put("id","test").put("title",L("手机通知测试")).put("body",L("本机通知已开启")));}catch(Exception ignored){}},10000);message(L("10 秒后显示本地测试通知，可以先返回桌面。此测试不代表远程推送已经接通。"));}
  void confirmRemove(){confirmRemove(origin);}
- void confirmRemove(String target){new AlertDialog.Builder(this).setTitle(L("移除这台电脑？")).setMessage(target+"\n\n"+L("清除本机保存的连接和登录状态，电脑上的聊天不受影响。")).setNegativeButton(L("取消"),null).setPositiveButton(L("移除"),(d,w)->{if(downloadTask!=null&&downloadTask.origin.equals(target))cancelDownload();final int ticket=generation;worker.execute(()->{try{JSONObject auth=EventClient.request(target,"/api/auth",null,null);if(auth.optBoolean("authenticated"))EventClient.request(target,"/api/logout",new JSONObject(),auth.getString("csrf"));}catch(Exception ignored){/* Offline removal is local; server session expiry still applies. */}DeviceBinding.clear(this,target);if(ZCodeConnection.manages(this,target))ZCodeConnection.forget(getApplicationContext());runOnUiThread(()->{MonitorService.bindingsChanged();Set<String> values=saved();values.remove(target);EventClient.forget(target);android.content.SharedPreferences.Editor edit=prefs.edit().putStringSet("origins",values).remove("cursor:"+target).remove("stream:"+target).remove("connection:"+target).remove("name:"+target).remove("last-opened:"+target).remove("cookieName:"+target);if(target.equals(prefs.getString("active","")))edit.remove("active");edit.apply();if(target.equals(origin))origin="";if(ticket==generation)home();});});}).show();}
+ void confirmRemove(String target){new AlertDialog.Builder(ui.context).setTitle(L("移除这台电脑？")).setMessage(target+"\n\n"+L("清除本机保存的连接和登录状态，电脑上的聊天不受影响。")).setNegativeButton(L("取消"),null).setPositiveButton(L("移除"),(d,w)->{if(downloadTask!=null&&downloadTask.origin.equals(target))cancelDownload();final int ticket=generation;worker.execute(()->{final boolean zcode=ZCodeConnection.manages(this,target);try{JSONObject auth=EventClient.request(target,"/api/auth",null,null);if(auth.optBoolean("authenticated"))EventClient.request(target,"/api/logout",new JSONObject(),auth.getString("csrf"));}catch(Exception ignored){/* Offline removal is local; server session expiry still applies. */}DeviceBinding.clear(this,target);if(zcode)ZCodeConnection.forget(getApplicationContext());runOnUiThread(()->{if(zcode)clearZCodeCookie(target);clearChannels(target);Set<String> values=saved();values.remove(target);EventClient.forget(target);android.content.SharedPreferences.Editor edit=prefs.edit().putStringSet("origins",values).remove("notificationCheckpoint:"+target).remove("cursor:"+target).remove("stream:"+target).remove("connection:"+target).remove("name:"+target).remove("last-opened:"+target).remove("cookieName:"+target).remove("notificationsMuted:"+target).remove("notificationSourceRevision:"+target);if(target.equals(prefs.getString("active","")))edit.remove("active");edit.apply();MonitorService.bindingsChanged();if(target.equals(origin))origin="";if(ticket==generation)home();});});}).show();}
  void monitor(){if(monitor==null){monitor=new ServiceConnection(){public void onServiceConnected(ComponentName n,IBinder b){}public void onServiceDisconnected(ComponentName n){}};getApplicationContext().bindService(new Intent(this,MonitorService.class),monitor,BIND_AUTO_CREATE);}}
  void scan(){if(checkSelfPermission(Manifest.permission.CAMERA)!=PackageManager.PERMISSION_GRANTED){requestPermissions(new String[]{Manifest.permission.CAMERA},21);return;}startActivityForResult(new Intent(this,ScanActivity.class),20);}
- @Override public void onRequestPermissionsResult(int code,String[] names,int[] results){super.onRequestPermissionsResult(code,names,results);boolean allowed=results.length>0&&results[0]==PackageManager.PERMISSION_GRANTED;if(code==25){prefs.edit().putBoolean("alerts",allowed).apply();if(allowed)monitor();return;}if(!allowed){message(L(code==21?"未获得权限，可继续粘贴地址使用。":"请在系统设置中允许通知。"));return;}if(code==24)enableNativePush();if(code==21)scan();if(code==23)testNotification();if(code==22){prefs.edit().putBoolean("alerts",true).apply();monitor();}}
+ @Override public void onRequestPermissionsResult(int code,String[] names,int[] results){super.onRequestPermissionsResult(code,names,results);boolean allowed=results.length>0&&results[0]==PackageManager.PERMISSION_GRANTED;if(code==25){prefs.edit().putBoolean("alerts",allowed).apply();if(allowed)monitor();return;}if(!allowed){message(L(code==21?"未获得权限，可继续粘贴地址使用。":"请在系统设置中允许通知。"));return;}if(code==26)toggleBackgroundNotifications();if(code==24)enableNativePush();if(code==21)scan();if(code==23)testNotification();if(code==22){prefs.edit().putBoolean("alerts",true).apply();monitor();}}
  void selectedFiles(int result,Intent data){
   ValueCallback<Uri[]> callback=files;WebView target=fileView;int ticket=fileGeneration;files=null;fileView=null;
   if(callback==null)return;
@@ -504,13 +1056,13 @@ public final class MainActivity extends Activity {
   });
  }
  @Override protected void onActivityResult(int code,int result,Intent data){super.onActivityResult(code,result,data);if(code==32){saveDownload(result,data);return;}if(code==20&&result==RESULT_OK&&data!=null)choose(data.getStringExtra("code"));if(code==31)selectedFiles(result,data);}
- @Override protected void onSaveInstanceState(Bundle state){state.putString("choosingUpdateFile",choosingUpdateFile);if(pendingSaveResult!=null)state.putBundle("pendingSaveResult",pendingSaveResult);super.onSaveInstanceState(state);}
- @Override protected void onResume(){super.onResume();resumed=true;ComputerNotifications.onChange=()->runOnUiThread(this::renderComputerNotifications);checkComputers();MonitorService.setVisible(true);if(web!=null)web.onResume();registerPushToken();resumeUpdateInstall();}
+ @Override protected void onSaveInstanceState(Bundle state){state.putString("choosingUpdateFile",choosingUpdateFile);if(pendingSaveResult!=null)state.putBundle("pendingSaveResult",pendingSaveResult);if(settingsPage!=null&&settingsPage.isShowing()&&!settingsPage.isClosing()){state.putBoolean("settingsOpen",true);state.putInt("settingsScroll",settingsPage.scrollPosition());}super.onSaveInstanceState(state);}
+ @Override protected void onResume(){super.onResume();resumed=true;watchChannels();if(ui.dark!=new SettingsUi(SettingsUi.themed(this)).dark)applyTheme();ComputerNotifications.onChange=()->runOnUiThread(this::renderComputerNotifications);checkComputers();MonitorService.setVisible(true);if(!MonitorService.startBackground(this))message(L("后台通知启动失败，请重新打开 App 后再试。"));if(web!=null)web.onResume();registerPushToken();resumeUpdateInstall();if(settingsPage!=null&&settingsPage.isShowing())settingsPage.refresh();}
  // Keep the live WebView and its drafts/tabs when rotating or resizing the window.
- @Override public void onConfigurationChanged(android.content.res.Configuration config){super.onConfigurationChanged(config);screen.requestApplyInsets();downloadCard.post(downloadCard::place);if(web!=null){web.requestLayout();web.invalidate();}}
- @Override protected void onPause(){if(routeDiscovery!=null){routeDiscovery.cancel();routeDiscovery=null;}routeAttempted=false;ComputerNotifications.onChange=null;resumed=false;stopComputerChecks();resetExitGesture();MonitorService.setVisible(false);if(web!=null)web.onPause();CookieManager.getInstance().flush();super.onPause();}
+ @Override public void onConfigurationChanged(android.content.res.Configuration config){super.onConfigurationChanged(config);dismissGatewayMenu();if("system".equals(SettingsUi.theme(this))&&ui.dark!=new SettingsUi(SettingsUi.themed(this)).dark)applyTheme();screen.requestApplyInsets();downloadCard.post(downloadCard::place);if(web!=null){web.requestLayout();web.invalidate();}if(settingsPage!=null&&"system".equals(SettingsUi.theme(this)))reopenSettings(settingsPage);}
+ @Override protected void onPause(){stopWatchingChannels();dismissGatewayMenu();if(routeDiscovery!=null){routeDiscovery.cancel();routeDiscovery=null;}routeAttempted=false;ComputerNotifications.onChange=null;resumed=false;stopComputerChecks();resetExitGesture();MonitorService.setVisible(false);if(web!=null)web.onPause();CookieManager.getInstance().flush();super.onPause();}
  void resetExitGesture(){homeBackAt=0;if(exitToast!=null){exitToast.cancel();exitToast=null;}}
  @Override public void onBackPressed(){handleBack();}
- void handleBack(){if(web==null){long now=SystemClock.elapsedRealtime();if(homeBackAt!=0&&now-homeBackAt<=2000){resetExitGesture();finishAndRemoveTask();}else{homeBackAt=now;if(exitToast!=null)exitToast.cancel();exitToast=Toast.makeText(this,L("再按一次返回退出 App"),Toast.LENGTH_SHORT);exitToast.show();}return;}resetExitGesture();if(!GatewayURL.sameOrigin(web.getUrl(),origin)){home();return;}final int ticket=generation;web.evaluateJavascript("(()=>{const dialog=document.querySelector('dialog[open]');if(dialog){dialog.close();return true;}if(typeof window.BridgeNavigation?.back==='function')return window.BridgeNavigation.back();if(window.BridgeWorkbench?.back())return true;if(document.getElementById('app')?.classList.contains('chat-open')){document.getElementById('back')?.click();return true;}return false;})()",result->{if(ticket==generation&&!"true".equals(result))home();});}
- @Override public void onDestroy(){relayLoginGeneration++;relayWorker.shutdownNow();if(downloadTask!=null&&(updateSession==null||downloadTask.state!=ArtifactDownload.State.COMPLETE))downloadTask.cancel();downloads.shutdownNow();clear();probes.shutdownNow();worker.shutdownNow();if(monitor!=null)getApplicationContext().unbindService(monitor);super.onDestroy();}
+ void handleBack(){if(gatewayPopup!=null){dismissGatewayMenu();return;}if(entryProgress!=null&&web==null){home();return;}if(web==null){long now=SystemClock.elapsedRealtime();if(homeBackAt!=0&&now-homeBackAt<=2000){resetExitGesture();finishAndRemoveTask();}else{homeBackAt=now;if(exitToast!=null)exitToast.cancel();exitToast=Toast.makeText(this,L("再按一次返回退出 App"),Toast.LENGTH_SHORT);exitToast.show();}return;}resetExitGesture();if(!GatewayURL.sameOrigin(web.getUrl(),pageOrigin)){home();return;}final int ticket=generation;web.evaluateJavascript("(()=>{const dialog=document.querySelector('dialog[open]');if(dialog){if(dialog.dispatchEvent(new Event('cancel',{cancelable:true})))dialog.close();return true;}if(typeof window.BridgeNavigation?.back==='function')return window.BridgeNavigation.back();if(window.BridgeWorkbench?.back())return true;if(document.getElementById('app')?.classList.contains('chat-open')){document.getElementById('back')?.click();return true;}return false;})()",result->{if(ticket==generation&&!"true".equals(result))home();});}
+ @Override public void onDestroy(){relayLoginGeneration++;relayWorker.shutdownNow();prefs.unregisterOnSharedPreferenceChangeListener(this);if(settingsPage!=null)settingsPage.dismiss();if(downloadTask!=null&&(updateSession==null||downloadTask.state!=ArtifactDownload.State.COMPLETE))downloadTask.cancel();downloads.shutdownNow();clear();probes.shutdownNow();worker.shutdownNow();if(monitor!=null)getApplicationContext().unbindService(monitor);super.onDestroy();}
 }

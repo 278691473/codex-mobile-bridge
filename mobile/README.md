@@ -2,9 +2,80 @@
 
 手机扫描网关二维码后连接 Codex、Claude Desktop 和 DeepSeek Harness，电脑继续执行任务。手机 App 保存多台电脑，提供原生扫码、剪贴板、文件下载和通知；浏览器入口同时保留。
 
-**[v2.0.3 发布页](https://github.com/try2love/codex-mobile-bridge/releases/tag/v2.0.3)** · [完整更新说明](../RELEASE_NOTES.md) · [桌面客户端接入](../docs/deepseek-harness.md)
+**[v2.2.1 发布页](https://github.com/try2love/codex-mobile-bridge/releases/tag/v2.2.1)** · [完整更新说明](../RELEASE_NOTES.md) · [桌面客户端接入](../docs/deepseek-harness.md)
 
-> v2.0.3 正式版；下列安装包名称和
+## v2.2.1 安装 / Installation
+
+**Android 安装说明：** 新版 **Bridge** 与旧版 v2.2.0 App 独立安装，不能直接覆盖旧版。请先安装新版、重新添加电脑并确认连接正常，保留好旧版中需要的草稿后，再卸载旧版。旧版绑定和草稿不会自动迁移。已安装 v2.2.1-preview.1 独立 **Bridge Preview** 的用户可直接覆盖升级，保留该预览 App 的连接和草稿。
+
+**Android installation:** The new **Bridge** app installs alongside the old v2.2.0 app and cannot replace it in place. Install Bridge, add your computers and verify the connections first. Preserve any drafts you need from the old app before uninstalling it; old bindings and drafts do not migrate automatically. Users of the separate v2.2.1-preview.1 **Bridge Preview** app can upgrade in place and retain that preview app’s connections and drafts.
+
+iOS 仍需自行签名；覆盖安装时使用原应用标识和签名身份。 / iOS requires your own signing; retain the existing bundle identifier and signing identity for in-place upgrades.
+
+## v2.1.7：通知与聊天恢复 / Notifications and chat recovery
+
+网关与手机版本为 **2.1.7**，Android/iOS 构建号 **40**。新增 Android 可选后台任务通知与按连接选择通知来源，统一两端主题，改善 iOS 前台提醒、通知返回聊天和附件选择器恢复。共享页面提供统一会话菜单、项目引用、历史图片与代码高亮。功能和关联 Issue/PR 见 [完整更新说明](../RELEASE_NOTES.md#v217)。
+
+Android 后台接收默认关闭，启用后有常驻通知，仍受系统权限与省电策略影响。iOS 未新增 APNs 后台推送。覆盖安装应保留原签名、应用标识和数据；请勿先卸载或清空数据。
+
+**English:** v2.1.7/build 40 adds optional Android background reception and per-connection notification choices, consistent Android/iOS themes, improved iOS foreground reminders, notification navigation and attachment picker recovery. Shared pages add session organization, project references, history image previews and code highlighting. Android background reception is opt-in and subject to OS policies; no new iOS APNs background push is included. Preserve matching identifiers, signing and app data when upgrading. See the [release notes and credits](../RELEASE_NOTES.md#v217).
+
+## v2.1.6：会话整理、复制与阅读 / Chat organization, copying and reading
+
+网关与手机版本为 **2.1.6**，Android/iOS 构建号 **39**。完善最近交互列表的本地优先置顶、二次确认归档、原生剪贴板复制、Markdown 阅读与文件字号，以及 API 表单和上游模型获取。归档能力取决于原生接入，部分 Codex App 会话、Cowork 等仍有限制，详见 [v2.1.6 更新说明](../RELEASE_NOTES.md#v216)。
+
+覆盖安装匹配的原 App，不要卸载或清除数据；Android 沿用原签名，iOS 使用相同应用标识和签名身份。更新网关后刷新共享页面。正式版与 Test 如共用 DSH 连接器，应一并升级到兼容版本，并仅在原生任务停止后显式重启接入。
+
+**English:** v2.1.6/build 39 improves local-first pinning, confirmed archival where supported, native clipboard writes, Markdown/file reading and API setup. Native archive limitations remain; see the release notes. Install over the matching app with the same signing identity and retain data. Refresh shared pages after updating the gateway; shared DSH connectors require compatible gateways and an explicit restart after tasks stop.
+
+## v2.1.5：WSL CLI 与聊天管理 / WSL CLI and message management
+
+网关与手机版本为 **2.1.5**，Android/iOS 构建号 **38**。支持 WSL Codex / Claude Code CLI、跨客户端新建项目、回复审查与引用、图片添加到对话，以及待发送消息的原位编辑、排序、撤回和未确认记录管理。WSL 账号管理为实验性，尚未完成真实多账号全流程验证。详情及升级边界见 [v2.1.5 更新说明](../RELEASE_NOTES.md#v215)。
+
+覆盖安装匹配的原 App，保留数据与绑定；iOS 仍需使用自己的签名。更新网关后刷新共享页面；旧 Android 请在原电脑连接选择“更多 → 刷新页面”，再打开聊天。
+
+**English:** v2.1.5/build 38 adds WSL CLI access, project creation, review/quote/image interactions and message management. WSL account management remains experimental without completed real multi-account end-to-end validation. Install over the matching existing app and retain data; iOS requires your own signing. Refresh the shared page after the gateway update; older Android apps may need **More → Refresh page** in the existing computer connection.
+
+## v2.1.4：启动、长会话与 Web 复制 / Startup, long chats and Web copying
+
+网关与手机版本为 **2.1.4**，Android/iOS 构建号 **37**。配合新版网关改善公网首次加载、资源缓存复用、长会话最近内容和按需翻页；手机/Web 可管理默认关闭的网络变化自动恢复。
+
+覆盖安装匹配的原 App，保留电脑列表、设置和有效绑定，不要先卸载或清除数据。Android 沿用原签名；iOS 沿用正式应用标识，需要使用自己的原签名身份安装。独立 Test 与正式发布 App 使用不同标识，不能互相覆盖。
+
+**English:** v2.1.4/build 37 accompanies public-entry startup and cache recovery, recent-history-first loading, on-demand paging and optional network recovery controls. Install over the matching existing app to retain saved computers, settings and valid bindings. Android keeps its signing identity; iOS keeps its official identifiers and requires your own signing. Independent Test apps do not replace the release app. See the [release notes](../RELEASE_NOTES.md#v214).
+
+## v2.1.3：通知、图表与连接恢复
+
+手机 App 与网关配合管理多个 Webhook 接收目标，提供飞书、钉钉、Discord、Telegram 和自定义模板；保存的地址与密钥默认隐藏。聊天与 Markdown 文件中的 Mermaid 图表支持源码查看、复制和全屏缩放。iOS App 修复图表子页面被导航策略拦截的问题，并在网关或隧道不可达时提供原生重试及返回电脑列表入口。手机界面也改善弹窗、焦点和补充回答输入框的键盘可见性。
+
+网关与手机版本统一为 **2.1.3**，Android/iOS 构建号 **35**。覆盖安装并保留原电脑列表及配对；iOS 保留正式 Bundle ID，使用原签名身份安装。Mermaid 子页面和 iOS 原生连接恢复需要同时更新网关与 App。详见 [v2.1.3 更新说明](../RELEASE_NOTES.md#v213)。
+
+**English:** v2.1.3/build 35 adds multiple Webhook destinations with editable service presets, Mermaid source and fullscreen reading, and native iOS Retry/Back to computers actions when the gateway is unreachable. The iOS app also fixes diagram-subframe navigation. Mobile dialogs, focus appearance and answer-card keyboard visibility are refined. Update both gateway and app for native iOS changes; install over the existing app to retain saved computers and pairings.
+
+## v2.1.2：终端输入、触摸滚动与显示
+
+手机与宽屏 Web 默认直接在终端输入，保留可选的“编写后发送模式”。新增 Enter，改善中文输入、Tab 路径补全、OpenCode 类终端 CLI 的触摸滚动及断线恢复。终端字号可独立调节为 6–24px，修复小字号重叠、字符对齐和内容覆盖工具栏。主题与语言移到设置顶部，正文字号为 10–32px、代码字号为 8–28px。
+
+网关与手机版本统一为 **2.1.2**，手机构建号为 **34**。请同时更新网关和手机 App；Android 的小字号修复包含原生 WebView 设置。iOS 沿用正式应用标识，需自行签名，使用相同签名身份和 Bundle ID 覆盖安装。
+
+**English:** v2.1.2/build34 improves direct terminal input, Chinese composition, Enter and Tab, touch scrolling in terminal CLIs such as OpenCode, reconnection and 6–24px rendering. Update both the gateway and mobile app; Android also includes a native WebView font correction. iOS retains its official bundle IDs and requires your own signing for installation.
+
+### v2.1.1：模型缓存、草稿与文件定位
+
+模型目录按电脑、客户端和接入身份缓存，显示更新时间；未发送草稿在切换聊天或电脑后恢复。文件定位自动滚动并高亮，左上角返回直接回聊天列表。新增工具截图显示控制与跳过当前版本提醒；iOS 改善场景恢复与通知跳转。网关与手机版本统一为 2.1.1，手机构建号为 33。
+
+### 已有 CLI 与文件阅读功能
+
+- 在手机与 Web 中发现 Codex / Claude Code CLI 聊天、读取历史并显式继续；原终端可以关闭。支持新建 CLI 聊天及执行端提供的模型、权限、Skill、上传和审批能力；Codex 兼容原生运行时另支持 Goal。SSH 使用服务器自己的配置。
+- Codex 与 Claude 各自账号面板管理 CLI 接入；桌面切换可选择“同时应用到本机 CLI”。SSH 连接诊断、类型筛选和上下文圆环沿用共享界面。
+- 左上角返回直接回聊天列表；文件区上级目录和系统返回保留层级导航，全屏的系统返回先退出全屏。
+- 源码增加高亮、行号与复制，可选自动换行以适应屏幕；复制保留原始内容。
+- PDF 支持连续滑动、双指缩放和全屏，混合尺寸页面分别适配宽度；切换标签保留阅读位置，快速缩放与邻页回看减少闪烁。
+- 自包含 HTML 支持内联交互、动画与源码切换，采用隔离预览；全屏进出保留状态，切换文件标签后返回重新加载 HTML。
+- 文件描述与下载、复制、全屏等操作并排，兼顾窄屏中英文显示。Claude 额度改为手动查询，并显示原成功查询时间。
+- Codex 列表逐主机呈现，Claude 混合列表按最近日期排序；来源标签持续显示。iOS Safari 输入和缩放时保留原有视区，减少空白和抖动；滑动切换应用的列表布局更稳定，点按弹窗外部可关闭弹窗。
+
+完整能力需更新网关及 Android/iOS App：源码和 PDF 阅读由网关提供，HTML 子页面导航与权限隔离还包含原生壳调整。PDF 在线预览限 20 MiB 且受普通点击下载限额约束；源码与 HTML 限 512 KiB UTF-8 文本。详见[文件阅读说明](../README.md#workspace-reading)。
 
 ## v2.0.3 更新
 
@@ -15,13 +86,13 @@
 
 ## 安装与升级
 
-- **Android 8.0 及以上**：从 Release 下载 `Codex-Mobile-Bridge-2.0.3-Android.apk`，按系统提示安装。升级时覆盖安装，不要先卸载，以保留电脑列表和登录。相机权限仅供扫码，拒绝后仍可粘贴地址登录。
+- **Android 8.0 及以上**：从 Release 下载 `Codex-Mobile-Bridge-2.1.4-Android.apk`，按系统提示安装。升级时覆盖安装，不要先卸载，以保留电脑列表和登录。相机权限仅供扫码，拒绝后仍可粘贴地址登录。
 - **iPhone / iPad**：Release 提供未签名 IPA 和 Xcode 源码包，需使用自己的 Apple 账号签名；不能直接点击 IPA 安装，暂无 App Store / TestFlight 分发。免费签名可能需要定期重新安装。
 - 使用 Release 中的 `SHA256SUMS.txt` 校验下载。编译通过不代表已验证所有机型、系统版本和网络环境。
 
-首次从较旧版本升级到 v2.0.3，可先下载 APK 覆盖安装；新版 Android 再次更新时可直接使用以下应用内流程。
+首次从较旧版本升级到 v2.1.4，可先下载 APK 覆盖安装；新版 Android 再次更新时可直接使用以下应用内流程。
 
-在「手机设置 → 应用更新」查看当前版本并检查更新。正式版只检查正式发布，预览版也可检查后续预览；不会在后台自动下载或安装。确认更新后，Android 会在 App 内下载 APK 并打开系统安装器，iOS 打开新版与签名安装指引。访问公开 GitHub Release 的请求不携带网关凭据或 Cookie。
+Android 在「手机设置 → 应用 → 检查更新」查看当前版本并检查更新，iOS 使用「手机设置 → 应用更新」。正式版只检查正式发布，预览版也可检查后续预览；不会在后台自动下载或安装。确认更新后，Android 会在 App 内下载 APK 并打开系统安装器，iOS 打开新版与签名安装指引。访问公开 GitHub Release 的请求不携带网关凭据或 Cookie。
 
 Android 在安装前核对发布信息中的大小和 SHA-256；缺少校验信息时提供版本页下载入口。首次安装更新需按系统提示允许此 App 安装应用。已完成的更新可在重新打开 App 后继续安装，也可选择「保存」导出 APK。
 
@@ -69,14 +140,30 @@ Android 手机无法查询 GitHub 时，会尝试通过当前已连接并登录�
 
 同一电脑上的多个手机会在下次同步时得到一致未读数。网关收件箱保留最近 200 条事件正文，未读计数独立保留；默认不包含聊天标题和正文。
 
+### Android 手机设置
+
+手机设置使用全屏原生窗口，返回后继续原来的聊天与下载。页面按「通知」「系统权限」「应用」分组：关闭任务通知会同时关闭后台通知并收起权限项；仅开启任务通知时保留通知权限和十秒本机测试；开启后台通知后增加厂商后台设置与 Android 标准电池优化入口。权限、通知频道和电池豁免状态在返回页面时刷新，电脑连接异常时显示诊断入口。
+
+「应用 → 主题」提供跟随系统、浅色、深色，选择保存在手机本地，目前仅覆盖设置页。主题旁的说明按钮提示此范围，聊天网页继续使用自己的外观设置。「后台通知」旁的说明按钮提示该功能仍在完善中及可能增加耗电或发热，点击以对话框完整显示，可阅读后关闭。
+
+设置页进出采用 24dp 轻滑与淡入淡出，开关圆点与轨道颜色同步过渡，相关权限平滑展开收起。主题弹层从底部轻滑进出，浅深色切换保持滚动位置并交叉淡化。所有动效遵循系统动画时长设置；系统关闭动画时直接呈现最终状态。主题过渡仅短暂保存有大小上限的原生设置页画面，窗口关闭时释放。
+
 ### 系统通知
 
 1. 网关「消息通知」开启手机 App 通知收件箱，并在聊天或全局设置选择请求处理/运行完毕提醒。
 2. 首次打开 App 会申请系统通知权限；允许后默认使用横幅和提示音。明确关闭或拒绝的选择会保留，手机的静音、专注模式及系统通知设置始终优先。
-3. App 在前台同步已保存电脑的新事件，切入后台取消巡检。首次同步、回前台或事件流重置不会集中弹出旧提醒，历史仍在收件箱。
-4. 点击通知回到相应电脑和聊天。手机设置的十秒测试只检验本机显示，不证明远程推送已经接通。
+3. Android 在「手机设置 → 通知」手动开启「后台通知」，通过常驻服务同步所有已登录电脑，并接收已开启来源的提醒；常驻通知提供暂停按钮。常驻提示仅显示“正在接收任务提醒”“正在重试”或“请重新登录”；多个地址中有正常接收的连接时显示接收中，其余地址独立重试。具体错误记录在 Android 的 `BridgeNotifications` 日志中。默认关闭，开启后沿用电脑端已有的全局和聊天通知选择。iOS 在前台每 5 秒独立同步各台已登录电脑，支持 Codex、Claude、DSH 的任务提醒；离开 App 或锁屏后不能保证持续通知。首次连接和事件流重置以当前收件箱建立接收起点，历史仍可在收件箱查看。
+4. Android 每台电脑独立读取增量事件。连接时先立即查询能力，支持长轮询的网关最多等待 60 秒，事件到达立即返回，手机读取超时为 80 秒，成功后立即接续等待；旧网关和手机通知渠道关闭时沿用 15 秒查询。连接失败逐步退避至 120 秒，网络恢复时取消旧请求并立即重试。后台通知开启期间按登录身份持久化接收游标，服务重建后补收网关保留的近期事件（最多 200 条）；切换登录身份重新建立起点。关闭后台通知时，回前台建立新的接收起点。
 
-**标准手机包不保证离开 App、锁屏或被系统终止后的通知送达。** 可在「第三方通知」配置 Bark、ntfy、PushPlus；启用「通知链接优先打开手机 App」后，支持该链接的通道可跳转至已保存的电脑。
+5. Android 同一电脑的同一聊天仅保留最新一条系统通知；新事件按系统通知设置提醒，同一事件重试只更新已有通知。点击通知回到相应电脑和聊天；聊天加载完成并在前台显示后，自动撤下该聊天的系统通知，其他聊天的提醒和收件箱记录继续保留。手机设置的十秒测试只检验本机显示，不证明远程推送已经接通。
+
+手机可在「通知来源」按保存的完整连接地址单独开关任务提醒，默认全部开启。Android 入口为「手机设置 → 系统权限 → 通知来源」，iOS 入口位于设置的「前台任务提醒」中。电脑名称与地址同时显示，局域网、HTTPS、正式版与 Test 可分别选择。关闭某个来源仍能聊天和同步收件箱；重新开启时以首次成功读取建立新起点，不补弹关闭期间的旧消息。选择仅影响当前手机，不改变其他手机或网关的 ntfy、Bark 等第三方通知配置。
+
+`GET /api/mobile/events` 默认立即返回，兼容 Web、iOS 和旧版 Android。响应中的 `longPoll: 60` 表示支持等待，`revision` 标识当前通知快照。后续请求携带 `after`、`streamId`、`revision` 和 `wait=60`；新事件、已读或通知策略变化会提前返回，事件流更换会立即建立新起点。网关通过条件变量等待，桌面进程保存的偏好和应用状态保留最长 15 秒复核间隔；HTTP 连接持续等待，手机期间沿用同一请求。等待结束后再次校验登录与访问规则。
+
+网关开启“包含聊天标题”时，手机收件箱提醒的正文仅显示聊天标题；关闭时显示运行完成或待确认的通用提示。
+
+Android 后台通知以用户开启的 `specialUse` 前台服务运行，Android 14 及以上声明对应权限与用途，两种 Android 构建共用接收实现。长时间锁屏进入深度休眠时，系统可能延后网络读取；设置页提供系统电池优化入口供用户调整。系统强制停止后，再次打开 App 恢复接收。需要系统推送的使用方式可在「第三方通知」配置 Bark、ntfy、PushPlus；启用「通知链接优先打开手机 App」后，支持该链接的通道可跳转至已保存的电脑。
 
 Android 通知大图标显示来源应用，状态栏遵守单色图标要求；iOS 使用来源名称和图片附件，系统小图标仍属于 Bridge，不能逐条替换成其他应用图标。图片由 App 自带，不从远端下载。
 
@@ -90,7 +177,7 @@ Android 通知大图标显示来源应用，状态栏遵守单色图标要求；
 
 需要 iOS 16.2 或更新版本。在聊天更多菜单选择「在灵动岛显示此聊天」，支持的机型显示灵动岛，其他兼容机型可显示锁屏活动；点击回到聊天，选择结束显示可关闭。卡片不含聊天标题/正文。
 
-普通构建仅在 App 前台更新状态，后台可能显示最后状态及同步时间，不能替代远程推送。「预览灵动岛」只显示演示，不发送聊天或启动任务。
+iOS 普通构建在 App 前台更新实时活动，后台显示最后状态及同步时间。「预览灵动岛」只显示演示，不发送聊天或启动任务。
 
 ## 项目工作台
 
@@ -120,7 +207,7 @@ Android 通知大图标显示来源应用，状态栏遵守单色图标要求；
 
 连续终端保留 `cd`、环境变量和交互状态。电脑浏览器直接输入，手机编写多行后发送；支持 Ctrl+C、清屏和重新打开已退出终端。切换标签保留会话，关闭标签结束对应 shell。
 
-macOS/Linux 使用登录 shell 与 PTY；Windows 10 1809 及以上使用 ConPTY 和 COMSPEC。Windows 驱动器切换在持续 shell 中处理。页面后台暂停读取、保留 shell，返回时按游标补读；超过缓冲上限的内容会提示截断。终端使用当前用户权限，请核对主机和命令。
+macOS/Linux 使用登录 shell 与 PTY；Windows 10 1809 及以上使用 ConPTY 和 COMSPEC。Windows 驱动器切换在持续 shell 中处理；CMD 跨盘切换可输入 `cd /d D:\` 进入 D 盘根目录。页面后台暂停读取、保留 shell，返回时按游标补读；超过缓冲上限的内容会提示截断。终端使用当前用户权限，请核对主机和命令。
 
 ### Codex 侧边聊天
 
@@ -146,10 +233,12 @@ Android 首页新增“智谱中继连接”，使用本项目原版页面和所
 
 两端共用的页面适配、剪贴板等在 `shared/web/` 保留单一源码，原生平台分开维护。源码资源回归使用 `node --test mobile/tests/*.test.cjs`，不会运行原生编译器。
 
-Android 入口是 `scripts/build-mobile-android.py`，使用项目 `.tmp/mobile-tools` 中已准备的 JDK、SDK 和 ZXing；发布必须保留既有签名，不能以新建密钥替代升级验证。地址边界验证见 `scripts/test-mobile-urls.py`，会话验证见 `scripts/test-mobile-session.py`，通知事件见 `tests/test_mobile_events.py`。
+Android 入口是 `scripts/build-mobile-android.py`，使用项目 `.tmp/mobile-tools` 中已准备的 JDK、SDK 和 ZXing；构建必须通过 `--keystore` 指定已有签名文件，并使用 `CMB_ANDROID_STORE_PASSWORD` 环境变量传入密码；签名缺失时停止，不自动生成。密钥与备份应长期保存在非临时、未跟踪目录。覆盖升级必须保留既有签名，不能以新建密钥替代升级验证。`--isolated-preview` 生成独立的 `io.github.try2love.codexbridge.previewchannel`（Bridge Preview），隔离下载提供程序及远控回调，与原 App 并存，数据不自动迁移。CI 仅显式生成短期夹具签名，不发布该 APK。地址边界验证见 `scripts/test-mobile-urls.py`，会话验证见 `scripts/test-mobile-session.py`，通知事件见 `tests/test_mobile_events.py`。
 
 **签名限制：** 本地脚本使用 `.tmp/mobile-tools/preview-debug.p12` 生成预览签名。该签名与官方发布 APK 不一致，不能覆盖安装官方 APK，也不能通过应用内更新替换官方版本；直接安装时必须先卸载官方版，并会清除应用数据。需要覆盖升级并保留数据时，必须使用原官方签名密钥完成发布签名。
 
 iOS 构建入口 `scripts/build-mobile-ios.py` 生成未签名 IPA 和包含受版本管理源码的 Xcode ZIP；`--source-only` 只导出源码，无需 Xcode。脚本不会自动安装模拟器运行时；模拟器 SDK 编译与实际启动测试应分别记录。
 
 可选 APNs/FCM 接入见 [推送开发说明](push/README.md)。普通 APK 不含 Firebase SDK；没有配置自有推送服务和签名时，源码能力不等于远程推送可用。iOS 远程通知图片由 BridgeNotifications 扩展处理，需一同构建和签名。第三方许可见 [NOTICE.md](NOTICE.md)。
+
+手机 App 的主题在「手机设置」和聊天「外观与显示」之间同步，可选择跟随系统、浅色或深色；电脑连接页、列表、聊天和设置使用同一选择。切换时保留当前聊天和草稿，其他显示偏好不变。

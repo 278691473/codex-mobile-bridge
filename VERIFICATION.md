@@ -1,3 +1,736 @@
+<a id="v217"></a>
+
+## v2.1.7 发布验收 / Release verification
+
+功能基线为 `25bd5c48e1b6a8b1d54e416457a131dbd62b3b3c`，正式版本整理提交为 `404d584`。候选 `9ac8f0e` 只补齐代码高亮静态资源的两处测试清单，没有改变产品逻辑。桌面与手机版本统一为 **2.1.7**，Android/iOS 构建号为 **40**；正式应用标识、Android 签名和桌面更新验签公钥保持不变。
+
+| 验收项 | 结果与证据边界 |
+| --- | --- |
+| 完整 CI | [候选 PR CI](https://github.com/try2love/codex-mobile-bridge/actions/runs/41031566392) 的 10 项任务全部通过，覆盖 Windows/Ubuntu Python 3.9、3.13，macOS Python 3.13、前端、真实浏览器及移动编译/更新检查。最终文档提交仍须满足 [发布 PR #109](https://github.com/try2love/codex-mobile-bridge/pull/109) 的必需检查后才能合并 |
+| 本地回归 | 前端 1314 通过、1 跳过；Chromium/WebKit 浏览器 144 通过；更新器 32 通过、1 跳过。初次后端全量运行的两项失败来自已新增资源未列入旧测试预期；修正后相关 112 项检查通过（2 项平台跳过），完整跨平台 CI 随后通过。最终文档提交的 macOS CI 暴露两项依赖 200ms 线程调度的计时/快照等待夹具，改为可控时钟和等待模拟后相关 20 项通过，保留远端超时后检查本地忙碌会话的原断言；未改产品逻辑。Windows 的真实范围下载测试另沿用 250ms 超时夹具，350ms 人工传输延迟可复现 503；该文件语义测试改用相邻流式集成测试的 5s 预算，超时专项测试不变 |
+| 五种桌面架构 | [候选构建](https://github.com/try2love/codex-mobile-bridge/actions/runs/41031509847) 的 macOS arm64/x64、Windows x64、Linux x64/arm64 全部通过。包括冻结运行时、安装启动、登录与扫码配对、通知、HTTPS、更新交接及适用平台的故障回滚；Windows 包含独立 ConPTY 组件，未替换系统组件 |
+| 跨版本数据兼容 | 在真实 Mac arm64、Windows x64、Ubuntu x64 上，用已校验的正式 v2.1.6 与候选 v2.1.7 包执行隔离运行时 `2.1.6 → 2.1.7 → 2.1.6`，原 QR 手机认证仍有效，配置字节保持。此项是包内网关跨版本数据验证；GUI 安装与更新器验收由上述平台工作流单独覆盖，不将其称为三台日常正式 App 已被覆盖升级 |
+| Android | 正式 APK 的应用标识及签名与 v2.1.6 一致。专用 Android 35 模拟器完成同包名覆盖升级/回退，偏好、电脑列表、原生加密绑定、WebView 认证及真实存储格式的草稿与引用均保留，无卸载或数据重置 |
+| iOS | 正式标识与两个扩展均为 2.1.7/build40，unsigned IPA 与源码包构建通过。专用 iOS 18.2 模拟器完成覆盖升级/回退，偏好、WebView 认证/草稿和原生 Keychain 绑定记录保持。模拟器使用 Xcode 正常签名；验收脚本修正了将 Keychain 加密字段当作明文查询的误判。本轮不声明 iPhone 真机签名安装验收；用户仍须使用原签名身份覆盖安装 |
+| 数据与资源边界 | 测试仅使用隔离配置和合成绑定，不发送聊天消息、不调用模型，不替换日常账号、配置、手机绑定或草稿。Windows 设备上的临时文件、安装包及日志均在 F 盘。Ubuntu 只清理已核实不在运行的旧 Test 重复产物，保留源码、验收记录和最近回退副本 |
+
+PR #85/#86/#92/#95（@heiqiu47）、#88（@mc373906408 / waken）和 #96（@littltstream）的原始提交均保留于发布分支历史，整合修改独立提交。发布使用 merge 保留贡献者身份，不 squash。相关功能与 Issue 对应关系见 [发布说明](RELEASE_NOTES.md#v217)。[#77](https://github.com/try2love/codex-mobile-bridge/issues/77) 的原生归档限制和 [#103](https://github.com/try2love/codex-mobile-bridge/issues/103) 的原生路由限制继续跟踪，WSL 账号管理仍为实验性功能。
+
+标签构建须再次通过；Release 保持草稿，直到全部 15 个桌面/移动/更新资产齐备、更新清单签名以及重新下载后的 SHA-256 校验通过才公开。最终标签工作流与资产见 [v2.1.7 发布页](https://github.com/try2love/codex-mobile-bridge/releases/tag/v2.1.7)。本轮本地证据在忽略目录 `.tmp/release-v217-20261030/`，不提交本机配置或凭据。
+
+**English:** v2.1.7/build40 retains production identifiers, Android signing and the desktop update-verification key. The linked 10-job candidate CI and all five desktop architecture builds passed, including package installation/startup and applicable updater/rollback checks. Actual Mac, Windows and Ubuntu packaged runtimes passed isolated 2.1.6 → 2.1.7 → 2.1.6 data compatibility with the original QR binding and configuration bytes preserved; this is separate from GUI updater testing. Dedicated Android 35 and iOS 18.2 simulators retained preferences, native bindings, WebView authentication and drafts across overlay upgrades and rollback. This does not claim a new physical-iPhone installation. Daily apps/data were not replaced; Windows temporary files stayed on F:. Original PR author commits are retained. The final tag build, signed manifest and all 15 downloaded assets must pass verification before publication. Native archive/routing limits remain documented; WSL account management remains experimental.
+
+---
+
+<a id="v216"></a>
+
+# v2.1.6 发布前验收（2026-10-27）
+
+范围固定为相对 v2.1.5 的本轮会话整理、复制、文件阅读、账号展示、列表更新和 PR #73/#82；没有追加功能。产品与构建输入固定于 `8d0880b`，后续 `c3c404b` / `3e5f658` 仅修正跨平台测试夹具并合入原作者历史，`bridge/desktop/web/mobile/scripts`、依赖及构建配置逐项无差异。版本为 2.1.6，Android/iOS build 39。正式发布须等待维护者审查 Release 描述；本次不创建标签或 Release。
+
+| 验收项 | 结果与证据边界 |
+| --- | --- |
+| 源码回归 | 本地后端 2671 项：2624 通过、47 平台/原生夹具跳过；前端 1207 项：1206 通过、1 跳过；更新器 33 项：32 通过、1 跳过。后续归档夹具 76 项和 CLI 合约 48 项通过；Windows 原生文件归档禁用的负向用例纳入最终 2672 项 CI |
+| CI 与官方桌面包 | [最终产品候选五架构构建](https://github.com/try2love/codex-mobile-bridge/actions/runs/40383008443)覆盖 macOS arm64/x64、Windows x64、Linux x64/arm64。包含完整测试、打包、实际安装/启动、登录/扫码绑定、通知、HTTPS、更新交接及故障回滚；具体结论以任务结果为准。PR 的必需检查在合并前必须全部通过 |
+| Windows 测试修订 | 真实 POSIX 文件归档不在 Windows 运行；未假装提供 Windows 原生 Claude 文件归档。Windows 上继续执行进程释放、协议、路由和明确不支持的负向检查。独立远端 worker 用临时脚本运行原始完整载荷，避免 Windows 命令行长度限制。未改产品逻辑或放宽归档安全条件 |
+| 三端 Test | 同一 `c3c404b` 产品源分别编译并覆盖安装。Mac 包内 370 个 Web 文件一致，Windows 727、Ubuntu 734 个安装文件与 manifest 一致；三端网关健康与实例匹配，配置、账号、有效绑定及已有原生客户端进程保持。只正常退出已核验的 Test；Windows 的两条历史未确认记录按原字节保留，不清除、不重放，也不声称其原生结果已确认 |
+| 界面验收 | Mac Test 窗口实际打开，全部访问地址可见，WSL 与冗余客户端分组不出现；具体额度及“添加账号或 API”保留，原 Claude 禁用状态不变。Windows/Ubuntu 已在原用户图形会话启动并验证渲染/实例与资源；本轮未取得远程窗口截图，不将进程证据称为视觉验收 |
+| 原生 Codex 归档 | Mac 0.164.0-alpha.11.1、Windows 0.164.0-alpha.11.1、Ubuntu 0.160.0、WSL 0.164.0 均使用新建隔离会话与本地假模型验证：只停止目标、原运行时归档/恢复且 ID 保持、旁路会话仍活跃、第二写入者被拒绝。没有向真实模型发送请求或停止真实用户会话 |
+| Claude 原生边界 | 原生 CLI 2.1.292 隔离验证已证明 interrupt → 结果收束 → EOF → 退出。后续真实写入进程检查正确拦截另一 CLI 存活时的文件归档，因此不声称这次完成真实 Claude 全流程归档。POSIX 文件归档/恢复与远端/WSL 路由有合成回归，原生历史列表隐藏/恢复已有指定版本隔离验证 |
+| DSH 升级 | 实际 v2.1.5 旧连接器 LF/CRLF 源码均通过识别、只读发现及显式升级夹具；凭据与其他文件字节/时间戳保持，正常启动网关不重启原生 DSH。原生 stop/archive 顺序和失败拒绝有合约测试；本轮未新增真实 DSH/Claude Code Desktop 活跃会话完整归档验收 |
+| Android | 正式标识 APK 2.1.6/build39，签名与 v2.1.5 一致。专用 API35 模拟器执行 v2.1.5 → v2.1.6 → v2.1.5 覆盖安装，首次安装时间、偏好、电脑绑定、原生与 WebView 认证保持；无卸载/数据重置 |
+| iOS | [官方 unsigned 构建](https://github.com/try2love/codex-mobile-bridge/actions/runs/40378266701)通过；三个 bundle 的版本/标识及 49 个源码文件、共享 JS 均匹配。专用 iOS18.2 模拟器覆盖升级/回退保持原偏好和原生/WebView 认证。此次为模拟器兼容验证，不能替代 iPhone 真机签名安装证明 |
+
+**归档限制是公开的功能边界，而非已解决的缺陷。** Codex App 仍持有写入权的部分会话无法由 Bridge 释放；不会退出整个 App 或改写原生数据库。Claude 文件归档仅对已验证的平台、版本、原配置和无写入者条件开放，Windows 原生 CLI 与未验证版本不开放，Cowork 暂不支持。DSH 旧连接器需在任务停止后显式重启升级；共用同一原生连接器的正式版与 Test 需同步升级兼容版本。[Issue #77](https://github.com/try2love/codex-mobile-bridge/issues/77)继续打开。
+
+PR #73（原始提交 `2ecf0aab`，@lanchengjiu）和 PR #82（原始提交 `491a6f52`，@mc373906408 / waken）均使用 merge 保留作者提交及 GitHub 账号关联。发布说明见 [v2.1.6](RELEASE_NOTES.md#v216)。本轮详细日志、哈希和仅本地的安装/数据保护记录保存在忽略目录 `.tmp/release-v216-20261027/`，不提交凭据、会话或本地配置。
+
+---
+
+<a id="v215"></a>
+
+# v2.1.5 发布验证
+
+发布标签 `v2.1.5` 指向 `3e90c8d`，基于已验收候选 `1006a4e`。桌面与手机统一为 **2.1.5**，Android/iOS 构建号 **38**。PR #64 的 8 个原始提交与 PR #70 的 `d62002b` 均保留在历史中。版本整理后的修订仅修正测试夹具：真实 registry 路径、UTF-8 重读、SQLite 连接关闭及超时时钟隔离，未改变产品行为或放宽断言。
+
+| 检查 | 结果与范围 |
+| --- | --- |
+| 标签完整 CI | [40205704693](https://github.com/try2love/codex-mobile-bridge/actions/runs/40205704693) 的 7 项检查全部通过：Windows / Ubuntu Python 3.9、3.13，macOS Python 3.13，前端及移动更新检查。后端共 2556 项，按平台保留已有原生夹具跳过；跳过不计为原生验收通过 |
+| 本地前端与更新器 | 前端 1146 项：1145 通过、1 跳过；更新器 33 项：32 通过、1 跳过。原生移动发布及下载、恢复检查通过 |
+| Android | 正式包 2.1.5/build38，应用标识和签名与 v2.1.4 一致。专用 Android 35 模拟器完成 2.1.4 → 2.1.5 → 2.1.4 覆盖与回退，未卸载或重置；电脑列表、设置、绑定凭据与原生/WebView 可信认证保留 |
+| iOS | 正式主 App 与两个扩展标识均为 2.1.5/build38；官方 CI 未签名 IPA 的共享脚本与标签一致，源码 ZIP 的 49 个文件与 Git 跟踪内容逐一一致。专用 iOS 18.2 模拟器完成 2.1.4 → 2.1.5 → 2.1.4，电脑列表、设置及原生/WebView 可信认证保留。首轮夹具 cookie 基线变化已在旧版上复现，修正基线后复验；不将模拟器声明为本轮手机真机安装验收 |
+| 更新与安装身份 | 桌面、Android、iOS 正式标识和桌面更新验签公钥保持。Windows 包含独立 ConPTY 组件，不替换系统组件；Android 沿用正式签名，iOS 仍需用户以原标识和签名自行覆盖安装 |
+| 布局与 WSL 边界 | 最新 WSL 弹窗已在真实 macOS WKWebView 与 Chromium 的窄宽屏检查中通过，并核验 Windows Test 实际样式；不将 WKWebView 等同于 iPhone 真机。WSL 账号管理仍为实验性，隔离假 API 与配置恢复不代表真实备用账号全流程通过 |
+
+正式包的五种桌面架构构建、安装启动、认证配对及更新恢复检查记录在[官方产物工作流](https://github.com/try2love/codex-mobile-bridge/actions/runs/40205704812)。正式产物的跨版本升级、回滚、原手机绑定复用以及最终资产核验结果见 [v2.1.5 发布页](https://github.com/try2love/codex-mobile-bridge/releases/tag/v2.1.5)；工作流和隔离验收全部通过后才公开 Release。
+
+升级验证使用正式包的隔离副本，不覆盖日常正式版或 Test 的账号、配置、绑定和草稿。Windows 本机临时文件与验收副本限定 F 盘；运行中被系统锁定的草稿存储不强行读取或关闭程序，不将未能读取的文件声明为已做字节比较。没有为了验收发送真实聊天消息或调用模型。
+
+**English:** v2.1.5 targets `3e90c8d`, retaining the original PR64/70 commits, official application identifiers and update-signing key. All seven tag CI checks passed; frontend/updater regressions retain their documented skips. Official Android signing is unchanged. Dedicated Android 35 and iOS 18.2 simulators passed 2.1.4 → 2.1.5 → 2.1.4 with settings and native/WebView trusted authentication retained. The official unsigned iOS artifact uses all three production identifiers; shared scripts and the 49-file source archive match the tag. This is not a new real-phone installation claim. See the linked build workflow and release page for official desktop artifacts, isolated cross-version upgrade/rollback and final asset verification; publication requires those gates to pass. Daily apps and data are not replaced, and Windows local temporary data stays on F:. Experimental WSL account tests do not establish real multi-account compatibility.
+
+---
+
+<a id="v215-pr70-integration"></a>
+
+# v2.1.5 PR #70 与文件变更摘要整合（2026-10-25，本地 Test）
+
+分支 `fix/v2.1.5-pr70-integration`，最终产品提交 `e0e087a`。通过 merge 保留 PR #70 作者 lanchengjiu 的原始提交 `d62002b`，UNC、发送竞态与混版网页修订分别提交；未推送 GitHub。内部版本仍为 2.1.4，不代表正式发布。
+
+- PR #70 的发送修复恢复持久化草稿保护引入回归之前的体验：网关明确确认未提交后，保留输入并允许切换为排队或补充。断网、其他错误和结果未知继续保留提交 ID，不自动重放。逐次登记同一提交的发送尝试，迟到拒绝不会移除其他标签页仍在途或结果未知的尝试；仍开着的旧版网页后来写入的未确认记录也不能被忽略。协调不可用时保守保留已有记录，新的私有请求仍可在明确拒绝后改方式。
+- Windows 项目比较补齐盘符、UNC 和扩展路径的分隔符与大小写处理；纯 `//` 路径由执行目标的平台消除歧义，单斜杠 POSIX 路径仍区分大小写。SSH 不依据网关操作系统猜测目标，保留原始 cwd、host 与原生项目成员关系。
+- “已编辑文件”卡片仅展示文件路径及新增/删除行数，展开不请求补丁正文；125 个文件完整列出，旧缓存卡片也不重新拉取补丁。原工具过程正文仍可按需查看；累计修改与原生净差异继续区分。
+
+| 检查 | 结果与边界 |
+| --- | --- |
+| 最终前端回归 | 1026 项：1025 通过、1 跳过。46 项发送/草稿定向检查覆盖明确拒绝、双标签页迟到回包、混版网页、存储不可用、账号/会话隔离、引用及后续草稿保护 |
+| 后端与编译模块 | 最终后端代码 155 项：153 通过、2 Windows 专属跳过，使用 Mac 打包编译模块和隔离本地 IPC/HTTP 夹具。末次仅修订网页脚本，154 个 Bridge 编译模块与已验收候选逐一相同，无需重复编译 |
+| 真实 Chromium | 文件摘要在 390/1440px 共 24 项；草稿真实 handler 与合成请求 24 项；最终脚本的双同源文档 10 项、两个真实顶层标签页 4 项、混版页面 7 项通过。没有发送真实聊天消息或调用模型；不将浏览器夹具计为手机真机或真实忙碌任务验收 |
+| Mac Test | 最终候选覆盖安装并自动启动 8788；366 个包内网页文件与归档一致，8 个实际 HTTP 资源匹配、7 个条件缓存 304。复用固定开发证书，本轮覆盖后无人工钥匙串授权。正式版文件/进程、原生客户端进程、原配置、网络凭据及原手机绑定保护检查通过 |
+| Windows Test | 最终安装 713 项文件逐一匹配；实际安装编译模块 138 项：137 通过、1 跳过，发送相关 Node 46 项与 WSL/Claude 包内检查通过。GUI 可见且无横向溢出，原用户会话启动 8788，实例归属正确；8 个实际版本化资源及 304 通过。正式版/WSL Test、配置与有效绑定、7 个原生 DSH 进程身份保持 |
+| Ubuntu Test | 用户安装后，723 项安装文件逐一匹配 DEB，dpkg 状态正常；59 项包内编译模块回归、Node 草稿/发送/引用、smoke/项目检查通过。原普通图形会话启动 GUI 与 8788 网关，健康实例归属正确；8 个实际版本化资源哈希及 304 通过，最终草稿模块包含在实际资源中。正式版、自启动、账号配置、原手机绑定和 1 个原生 Codex 进程保持，Cloudflare 启用数仍为 0；未做远程 GUI 截图视觉验收 |
+
+三台 Test 使用相同最终已提交源码归档；Mac/Windows 的最后一次网页修订在核对原生输入不变后复用已验收编译组件。Windows 临时文件与构建产物限定 F 盘，Windows/Ubuntu 重型构建串行。Mac 清理约 1.71 GiB、Windows 清理约 2.15 GiB 逻辑大小的本轮重复产物；Ubuntu 清理本轮重复源码、解包与临时目录。三端均保留最终安装或安装包、最终源码归档、本轮之前的一个 `c0cc4a2` 回滚副本及必要记录；清理后再次核验运行与保留状态。附加的原固定 HTTPS 地址只读静态请求返回 Cloudflare HTTP 403，尚未确认原因，因此不声称此次公网入口验收通过；没有修改该入口或放宽访问控制。记录位于忽略目录 `.tmp/v215-pr70-integration/` 与 `.tmp/v215-pr70-20261025/`。
+
+**English:** PR #70 retains its author's original commit. The send-mode change restores behavior regressed by durable draft protection: only a definitive pre-submission rejection releases the corresponding attempts. Unknown delivery, concurrent tabs, older open pages and later draft edits stay protected. UNC comparisons preserve target-host semantics and original paths. Edited-file cards now expose paths and line counts without downloading patches. Final frontend and real-browser synthetic checks passed. Mac, Windows and Ubuntu Test are installed and running; installed files, live assets, configuration and bindings were verified. Ubuntu GUI process startup is not screenshot-based visual acceptance. Redundant build outputs were removed while retaining final artifacts and one pre-round rollback per platform. A supplemental public HTTPS probe returned Cloudflare 403; LAN acceptance passed and the existing network configuration was preserved. No GitHub publication or real model request occurred.
+
+---
+
+# v2.1.5 文件变更摘要（2026-10-25，本地源码）
+
+按用户验收反馈，文件变更卡片收敛为文件路径和新增/删除行数。展开只显示已有清单，不再读取或展示补丁正文；超过 50 个文件也保留完整清单。分页卡片、详情以及旧状态响应中的文件变更 metadata 均不再携带补丁；原工具过程正文、原生会话与源文件保持原样。原生净差异与“累计修改”的统计来源区分保留。
+
+定向验证：后端时间线 22 项与公共投影 25 项通过；前端分页、消息详情与资源 9 项通过。真实 Chromium 使用生产资源及合成数据执行窄屏/宽屏文件卡片各 12 项，原时间线、可见性和缓存 43 项通过。展开、收起、再次展开及统计更新没有发起补丁详情请求；125 文件全列、巨大补丁不进入卡片、普通正文详情继续可读。单个异常大的路径清单沿用原有单行可达规则，未增加新的文件列表分页协议。
+
+本次仅修改本地源码，未重新编译或覆盖三台 Test；先前 c0cc4a2 的安装验收不能算本次摘要改动的实机验收。正式版、配置、账号与绑定未改。验收记录：`.tmp/v215-file-summary-pr70/`；未推送 GitHub。
+
+**English:** Edited-file cards now show paths and added/removed line counts only. Expanding a card never downloads a patch, including cards restored from older cache metadata. Timeline cards and public file-change metadata exclude patch bodies; original tool output and native state remain intact. Focused backend and frontend regressions plus 390/1440 px Chromium checks passed using synthetic data. This source-only revision has not been rebuilt or installed on the Test gateways.
+
+---
+
+<a id="v215-lifecycle-output"></a>
+
+# v2.1.5 生命周期、文件卡片与手机重连修订（2026-10-25，本地候选）
+
+**修订与复验：** 用户在 iPhone 实测否定了 `4927458` 的引用位置和文件卡片结果，首版简化夹具的通过不算这两项实机通过。后续提交 `c0cc4a2` 修复实际输入区换行和 native/saved 分页合并中的遗漏；安装后已在真实 Mac 8788 会话页面复验引用布局和原回复的 9 文件卡片，Windows/Ubuntu 更新恢复推进。手机真机仍待用户复测。
+
+分支 `fix/v2.1.5-lifecycle-output-regressions`，产品提交由 `4927458` 修订至 `c0cc4a2`，基于上一轮已验收的项目、WSL 与会话交互候选；没有推送 GitHub。内部版本仍为 2.1.4，不代表发布。
+
+- 宽屏引用按钮跟随上下文用量；窄屏使用工具栏后的紧凑独立行，不再让原有按钮折行。按输入区域实际宽度切换，分屏和窗口缩放时保留选区与草稿。折叠引用只显示一行省略预览，展开和原草稿保留。
+- Codex 原生 `FileChange` 历史生成完成回合的文件变更卡片，隐藏执行过程时仍可见。原生净差异优先；只有逐次补丁记录时明确标注“累计修改”，不冒充 Desktop 的最终净增删数。分页边界没有完整回合时不生成局部总计；详情继续按需分段读取。只读核对用户截图对应回合的 9 个文件，没有发送消息或调用模型。
+- DSH 迁移补齐上一版已验证接入脚本的 LF/CRLF 指纹，保留归属及配置核验。Mac 强制退出后不再为已空进程集合调用 `ps`。Linux 单独处理 SSH 父进程不可读取可执行路径的情况，保留祖先进程保护和目标 UID、可执行文件、出生时间、pidfd 的严格核验。
+- Android 已匹配的现有登录绑定直接进入网页，不再等待后台串行网络队列；身份不匹配的恢复仍经服务器核验。Android/iOS 初始文档加载设有有限等待与重试入口，提交文档后让网页接管加载状态；不重放聊天写入。
+
+| 检查 | 证据与边界 |
+| --- | --- |
+| 完整本地回归 | 后端 2370 项：2288 通过、82 平台/显式原生跳过；前端 988 项：987 通过、1 跳过；最后的分页完整性和资源检查 31 项：30 通过、1 Windows 跳过 |
+| 真实浏览器 | 1440px 时间线、缓存、可见性、文件卡片及引用 69 项；最新文件卡片另补宽度断言，宽/390px 均通过。使用合成内容，截图检查无溢出；首版简化 DOM 未覆盖用户问题。修订后复制完整生产输入区，320/390/844/1440px、区域缩放与草稿共 102 项通过，旧实现由同一夹具检出失败 |
+| 实际会话页面 | `c0cc4a2` 安装后，真实 B 会话在 1440px 下引用按钮紧邻上下文环，390px 下位于工具栏之后的紧凑独立行，草稿未改。通过页面原有上翻入口读取历史，原回复的“已编辑 9 个文件”卡片出现且能展开 9 条文件路径，手机宽度无横向溢出；不是合成卡片或手机真机验收 |
+| 实际文件卡片 API | 真实 B 会话原回合经 7 页读取返回完整 9 文件元数据，连接持续有效。保存的补丁累计为 +206/−15，标注“累计修改”；不将其声称为 Desktop 截图中的最终净差异 +199/−8 |
+| Windows 原生 | 在现有 Windows 设备执行 Python/Node 及自建进程退出夹具；独立进程与观察器存活。真实旧脚本 LF/CRLF 迁移通过。正式/Test/WSL Test 安装与 30 项配置保护记录一致；构建安装结果另记 |
+| Windows Test 安装 | 修订 `c0cc4a2` 在 F 盘串行构建并覆盖安装，713 个安装文件匹配。实际安装包编译模块 125 项、WSL/Claude 83 项通过；GUI、8788 健康归属及 8 个实际版本化资源/304 通过。原 Test 配置、账号、绑定及正式版/WSL Test 保留，原 Codex daemon 进程身份不变；只通过正常停网关结束已核对空闲的网关自有 Claude 执行。健康复验后清理本轮重复构建产物约 1.65 GiB，保留安装器和验收记录 |
+| Ubuntu 原生 | 271 项：270 通过、1 Windows 跳过；修复前真实退出夹具失败，修复后目标退出而旁路进程存活。正式/Test 配置、绑定、自启动和进程身份保留；构建安装结果另记 |
+| Ubuntu 修订包 | 用户安装 `c0cc4a2` 后，723 项文件逐一匹配（720 应用文件及 3 个 DEB 桌面/图标文件）；实际安装包编译回归 44 项：43 通过、1 Windows 跳过。8788 实例、局域网页面两次 200 及不同 nonce、1 项版本化 CSS 哈希/304 检查通过，正式版、账号绑定、自启动及原禁用 Cloudflare 状态保持。验收启动器首次使用的临时目录过长导致 Electron 单实例套接字失败，改短本次 GUI 进程的临时路径后桌面程序及渲染进程持续运行超过 3 分钟，网关没有重启；未改系统设置。远程 Wayland 窗口画面尚未完成视觉核验，不将进程运行算作截图验收 |
+| Mac Test | 完整离线构建、签名和覆盖安装通过，8788 健康实例归属正确；366 个包内网页资源与源码一致，8 个实际 HTTP 资源匹配、7 项条件缓存 304；包内编译模块 106 项检查，105 通过、1 平台跳过；正式版、配置、网络设置及原绑定摘要一致 |
+| Mac 后续修订 | `c0cc4a2` 编译模块 107 项：106 通过、1 平台跳过；安装启动、8 个实际资源和 7 项 304 检查通过。相同代码的本地 Test 改用已有固定开发证书，跨版本 designated requirement 一致，81 个 Mach-O 权限无变化。用户完成首次签名切换授权后，实际正常重启并自动读取钥匙串、启动新网关；启动命令约 0.10 秒返回，随后健康检查通过，无需再次人工授权。13 个原生客户端进程、正式版、原配置与绑定保持。后续本地构建复用同一签名，签名失败中止；未改变正式包签名或钥匙串权限规则 |
+| 手机构建 | Android 已签名 APK 完成；实际抽取 Android 导航方法的 Java 夹具验证匹配绑定不等待占用队列，陈旧身份不恢复。iOS 独立 Test 已签名覆盖安装并启动，6 个已存电脑和 16 项偏好前后逐字节一致；不声称导出或直接核验了钥匙串令牌 |
+
+手机真实后台停留后的体感等待仍需用户复测；原生进程检查使用自建夹具，没有强制退出用户正在使用的客户端。原生分页当前没有返回截图回合的净差异，因此其累计补丁数字与 Desktop 净差异可能不同，界面已明确区分。新 Test 启动通过后清理本轮旧 Test 副本与重复构建目录约 0.99 GiB，保留源码归档、手机包和验收记录。验收记录位于忽略目录 `.tmp/v215-lifecycle-output/`。
+
+后续 `c0cc4a2` 验收通过后另外清理 Mac 约 1.05 GB、Windows 约 1.77 GB、Ubuntu 本轮合计约 1.62 GB 的明确重复载荷（逻辑大小）；当前安装、远端当前/回滚安装包、源码归档及必要日志保留。Mac 固定签名工具保存在本机 `.local/test-apps/build-tools/`，不随临时构建目录清理，不纳入正式包或 GitHub。
+
+**English:** Initial phone acceptance reopened quote layout and the missing edited-file card despite simplified fixture passes. Follow-up c0cc4a2 separates compact quote actions from the complete toolbar and retains saved file metadata when native paging exposes a partial completed turn. The installed Mac gateway now exposes the actual nine-file card through its paging API and real session page; quote placement was visually checked at 390 and 1440 pixels with the draft unchanged. Recorded patch totals remain distinct from authoritative net diffs. This candidate also covers owned DSH connector migration, macOS/Linux shutdown regressions, and mobile connection-entry scheduling. After the user authorized the local-only transition to the existing development signing identity, an actual Test restart retrieved its Keychain credential and started automatically without another manual authorization. Original client processes, permissions, configuration and bindings remain intact. Physical-device layout and resume latency still require user acceptance. No GitHub publication occurred.
+
+---
+
+<a id="v215-chat-feedback"></a>
+
+# v2.1.5 项目与会话交互修订（2026-10-24，本地候选）
+
+分支 `fix/v2.1.5-chat-feedback`，基于已安装的 `5e6dd00` Test。没有推送、合并 main 或发布。
+
+- Codex 新本机项目通过 App 自身登记目录，再创建并核对聊天的原生项目归属；DSH 通过原生工作区 ID 创建聊天。仅选择目录不会触发登记。Claude 的明确工作区信任拒绝改为可操作提示，保留首条消息；其他未知写入结果仍禁止重放。
+- Codex 补齐消息引用；当前会话的授权图片可从预览添加回原草稿。DSH 隐藏无效引用入口。文件引用标记按既有文件权限显示文件名，不扩展路径访问权限。
+- Claude Desktop Code、DSH 仅在原生能力可用时显示“从这里分支”，使用原生消息边界并保留原草稿和写操作回执。Claude 当前上下文只使用原生摘要；最近一次请求用量单独标注，不再充当当前占用百分比。
+- 上翻历史处理触顶手势、隐藏工具记录和并发实时重置，单次请求意图最多补三页，保持阅读锚点。真实“筛选国考可报考岗位”会话的只读索引和原生跟随检查均可取得 355 条记录；没有激活、发送或调用模型。
+
+| 检查 | 结果与边界 |
+| --- | --- |
+| Node 前端回归 | 984 项，983 通过、1 平台跳过，无失败 |
+| Python 定向回归 | 160 项，159 通过、1 Windows URL 启动器跳过；覆盖项目登记回执、信任拒绝、分支、上下文、文件边界、历史和资源清单 |
+| 真实 Chromium 浏览器 | 既有时间线/缓存/可见性 43 项；新增窄/宽屏历史与引用 20 项；输出交互 130 项；使用合成内容，不访问真实聊天写接口 |
+| 真实 Electron 图片交互 | 预览布局 55 项；生产 Workbench、草稿、附件集成 54 项，390/1280px；没有发送或 HTTP 写请求 |
+| Mac Test 安装启动 | 产品提交 `8ec4603` 完整离线构建、签名校验和覆盖安装；366 个包内网页资源与源码一致。用户完成钥匙串系统确认后，GUI 显示运行中、8788 实例归属正确，现有局域网入口的首页及 7 个脚本匹配、7 项条件缓存返回 304。正式版进程和文件、原配置及手机绑定摘要一致。本轮未更新 Windows/Ubuntu 安装包 |
+| 原生接口证据 | 只读核对本机 Codex、Claude、DSH 安装包中的登记、分支及上下文接口。隔离 Codex 运行时创建空聊天验证存储关联；该检查不等同于桌面侧栏的完整实测 |
+
+真实桌面新项目分组、Claude/DSH 原生分支以及用户指定会话的上下文数值仍需 Test 实测；不把合成接口检查记为原生端到端通过。新 SSH Desktop 目录尚无已验证的原生项目登记入口，需先在电脑 App 添加项目；已有 SSH 项目和 CLI 创建保留。Claude Cowork 没有已确认的原生分支接口，不显示该操作。手机触摸和系统输入法结果以真机复测为准。
+
+本机诊断、浏览器结果与构建记录保存在忽略目录 `.tmp/v215-chat-feedback/`。不改正式版、账号、原会话连接、配置和手机绑定，不自动确认工作区信任。
+
+**English:** This local candidate fixes native project association, known Claude workspace-trust refusals, message/image reuse, native Code/Harness branching, context measurement semantics, and in-place history pagination. Frontend and targeted backend regressions pass, with real-browser synthetic coverage at narrow and wide widths. Installed native sources establish the interface contracts; native sidebar/branch behavior and the reported live context count still require user acceptance. No messages or model requests were sent, and no GitHub publication occurred.
+
+---
+
+<a id="v214"></a>
+
+# v2.1.4 正式发布验收（2026-10-24）
+
+发布产品提交 `0f1934a`（标签 `v2.1.4`），承接已验收的历史读取与控制分离改动；桌面与手机版本统一为 2.1.4，Android/iOS 构建号 37。PR #63 作者的全部 8 个原提交保留。正式应用标识、安装身份、Android 签名与桌面更新验证公钥沿用原版本。
+
+| 范围 | 结果与边界 |
+| --- | --- |
+| 完整 CI | Windows、Ubuntu 的 Python 3.9/3.13，macOS Python 3.13，以及桌面、更新器、手机发布与下载检查通过。源码与 PR 工作流均通过；构建工作流在各原生平台再次执行测试。修复 Windows Claude 历史元数据中 path stat/fstat 差异，并隔离 DSH 退出测试的时间模拟，补齐回归 |
+| 正式桌面包 | Mac arm64/x64 DMG、ZIP；Windows x64 NSIS、ZIP；Linux x64/arm64 DEB、AppImage 完成原生构建、包内运行时与安装启动检查。Windows 带齐六项 ConPTY 文件；Mac 验证嵌套签名。五种桌面架构的关键启动资源与已验收源码一致 |
+| Mac 正式升级 | 在本机隔离目录以正式 2.1.3 签名包执行真实更新助手、Electron 重启及原网关重启，升级到 2.1.4 通过；注入暂存可执行文件缺失后自动恢复 2.1.3。原配置值、通知配置和旧 QR 手机 cookie 均保留；日常正式版进程、包文件与 Test 配置绑定摘要前后一致 |
+| Windows 正式升级 | 在真实 Windows 设备的 F 盘隔离目录，用已发布 2.1.3 ZIP 和本次 2.1.4 ZIP 执行真实更新助手与 Electron 重启。正常升级通过；移除仅属于测试事务的暂存可执行文件后，失败更新自动恢复 2.1.3。原 QR 配对 cookie 持续通过 trusted 认证，配置和通知设置保留 |
+| Linux 升级与回退 | 真实 Ubuntu 虚拟机中，正式 DEB 解包载荷 2.1.3 → 2.1.4 → 2.1.3 切换、启动和原 QR 绑定认证通过。此项为隔离载荷切换，不是对用户正式安装执行 sudo 包管理回滚；两种架构的 DEB 安装与 GUI/AppImage 启动另由原生 CI 验证 |
+| 配置迁移 | 新版仅为旧局域网 IP 选择补充对应网卡 `lanInterfaces`；验收逐字段确认全部旧值不变，新增选择与系统实际网卡一致。回退保留旧 IP 字段并正常启动；通知配置字节不变，原绑定命名空间与有效会话保留。现有正式版与 Test 包及持久配置的前后摘要一致 |
+| Android / iOS | Android 正式签名 APK 在独立 API 35 模拟器完成 2.1.3/build35 → 2.1.4/build37 → 2.1.3，首次安装身份、电脑列表、设置及原生/WebView 认证保留。iOS 用正式应用及扩展标识完成设备构建，并在独立 iOS 18.2 模拟器完成同样升级/回退，电脑列表、设置与原生/WebView cookie 认证保留；不是重新签名安装用户真机的验收 |
+| 手机长会话 | 用户在 Mac 8788 Test 原固定 HTTPS 入口，确认 A/B 两个长会话进入先显示最近内容、上翻读取旧记录且位置稳定、返回列表再进入复用均通过；无需发送消息或审批 |
+| 下载与更新身份 | 14 个分发资产（含已签名更新清单）与 SHA256SUMS 核对通过，共 15 个 Release 文件。桌面更新清单签名及三种自动更新 ZIP 的大小和 SHA-256 通过原公钥验证；GitHub 草稿资产摘要与本地对应。iOS 三个正式标识和 Android 原签名核对通过 |
+
+三平台 Test 安装、启动、原生分页与配置绑定保留证据见[历史与控制拆分](docs/architecture/history-control-separation.md#test-安装验收2026-10-24)。真实 A/B 会话位于 Mac，Windows/Ubuntu 的原生合成回归不冒充这两条会话的实际运行环境。历史首屏不等待完整控制快照，但 Desktop → 网关首次控制订阅仍可能传输全量；网络恢复默认关闭，受控换址测试不等同于真实 DHCP 租约切换。
+
+本机记录位于 `.tmp/release-v214-20261024/`。Windows 临时文件与验收产物仅放 F 盘，Windows/Ubuntu 重型操作串行；测试只使用隔离配置与本地认证夹具，不发送聊天消息或调用模型。保留现有正式版、原会话、账号、配置和手机绑定；结束后移除本轮重复 App 载荷，保留结果、哈希和日志。
+
+**English:** The product tag is fixed at `0f1934a`. Native CI covers macOS arm64/x64, Windows x64 and Linux x64/arm64, with official mobile identities and the existing Android/update signing keys. Isolated desktop upgrade/recovery and mobile simulator upgrade/downgrade checks verify original configuration values and trusted cookies. Linux rollback coverage is an extracted-DEB payload switch, not a system package-manager rollback. A/B long-chat reading was accepted by the user on the existing Mac Test HTTPS entry. Original desktop ownership and bindings remain intact; initial control subscription can still carry a full snapshot.
+
+---
+
+<a id="long-session-progressive-loading"></a>
+
+# 长会话渐进式加载验收（2026-10-23，未发布）
+
+独立分支 `perf/long-session-progressive-loading`，产品候选 `898549c4054a48db8ce685df98f9fca1502e594c`，承接已验收的 PR #63、Web 复制与 Issue #65 修复；版本仍为 `2.1.4-preview.1`，不推送、不合并 main、不发布。
+
+- 首屏仍取最近 20 条展示记录；移除打开后自动补足 100 条的请求。上翻接近已加载记录顶部或点击“查看更早内容”才补页，保留阅读位置；展开长正文、工具详情仍单独读取。
+- 网关最初读取最近 2 个保存回合，必要时按 5 个回合补读；展示投影初始窗口为最近 40 条，随上翻扩展。未变化的状态复用归一化与投影，写操作依旧读取实时授权状态。
+- Web 页面存活期间保留最近 8 个会话、每个最近 20 条的内存缓存，按网关登录身份、主机和会话隔离。重新进入先显示已有文本；未完成的后台加载不会清空缓存，真实结果随后替换。退出登录、账号切换或网关身份变化时清理。缓存不恢复审批、编辑权限或草稿，也不是离线数据库。
+
+| 验收范围 | 结果与证据 |
+| --- | --- |
+| 后端源码 | `scripts/test-backend.py --source-only`：2,147 项，2,065 通过、82 跳过。包含近期投影不处理旧正文、稳定游标、增量失效、重复读取复用、原始权威状态不裁剪及并发会话的大快照回归 |
+| 前端源码 | Node 884 项，883 通过、1 跳过；浏览器合成测试 43 项通过，覆盖首屏 20 条、按需补页、稳定位置、流式替换、过期响应丢弃和缓存身份边界 |
+| Mac 原生与安装包 | arm64 Test 完整构建、包内编译模块 18 项原生检查通过，覆盖安装及启动通过。原 14 个有效绑定、网络配置和正式版进程保持；固定 HTTPS 实际资源完成 390px 窄屏 30 项合成浏览器检查 |
+| Windows 原生与安装包 | x64 Test 在 F 盘低并发离线构建；完整安装 706 文件哈希、二维码依赖、GUI、包内编译模块 18 项及 8788 HTTP 缓存检查通过。原 4 个 Test 绑定和 1 个正式版绑定保留。通过现有普通 Explorer 会话安装，无新增计划任务 |
+| Linux / Ubuntu | x64 DEB 713 个应用文件与独立自启动标识核对、模拟仅更新 Test；包内编译模块 18 项在真实 Ubuntu 执行通过。安装后 716 个包文件（含桌面入口）与 DEB 逐项一致；真实图形窗口、8788 启动、静态资源缓存和绑定保留检查通过，原禁用本机访问与 Cloudflare 配置保持 |
+| 弱网 | Windows Test 实际加载的页面脚本，800 ms 网络延迟、约 1 Mbps 下载条件；合成消息缓存约 0.4 ms 展示，实际只读 `/api/auth` 请求约 815 ms 返回后更新。不是聊天内容的端到端耗时基准 |
+
+真实 Mac A/B 验收均为被动读取，没有调用模型、发送、恢复或切换会话。源码基线中 B 的 27,810 条展示投影约 2.92 秒；同机修订样本的初始 40 条约 0.03 秒，未变化时不再次归一化。安装包再次读取 B 时先得到已保存的最近 20 条，再接收原生状态；实际运行的 8788 HTTP 并行读取中 A 约 0.07–0.19 秒、B 约 0.39–0.81 秒，B 上翻 100 条约 0.13 秒，旧页与首屏无重叠且游标保持。此会话持续产生新内容，记录是当次测量，不代表固定网络延迟或所有用户的首屏承诺。临时 HTTP 验收登录已退出，原手机绑定保留。
+
+**Desktop 分页能力边界：**核验本机已安装 Desktop 代码，内部 `thread/turns/list` 与 `thread/items/list` 有游标分页；目前网关跟随通道暴露的是完整历史请求与快照广播，未发现可用的分页参数。本次没有猜测调用、触发完整历史请求或改用 CLI 接管原会话。原生传输仍可能接收完整快照；本次减少首屏等待、展示投影及重复处理开销，并不声称已将 Desktop 原生传输改成分页。共享连接仍保留 Issue #65 的有界接收保护。
+
+额外的 Python 公共 HTTPS 探针被 Cloudflare 以 403/1010 拒绝；该项未计为通过。固定域名的浏览器加载及窄屏回归已通过，访问安全设置未放宽。
+
+原始证据保留于忽略目录 `.tmp/long-session-20261023/`：协议核验、性能样本、浏览器结果、各平台构建清单及配置绑定哈希。仅保留当前 Test 安装包和必要记录，替代旧包与重复构建产物完成验收后清理。手机共享页面由网关更新，未改原生壳或重新安装手机 App；真实手机体验留给用户复测。
+
+---
+
+<a id="issue65-large-desktop-snapshot"></a>
+
+# Issue #65 与跨平台 Web 复制验收（2026-10-23，未发布）
+
+分支 `fix/issue-65-desktop-ipc-session` 保留已验收的 PR #63 与 Web 一键复制改动，产品提交 `16d6ef51ca42f3fe1da966db23c1f01833a1c35a`。桌面与手机版本仍为 `2.1.4-preview.1`，未推送 GitHub、未合并 main、未发布更新。
+
+根因由只读原生 IPC 探针确认：用户指定的 B 会话快照约 89 MB，超过旧客户端 64 MiB 接收上限，触发共享连接断开，连带影响同一连接上的 A 会话。没有发现“会话链接导致 A 占用 B 连接”的证据。接收上限改为有界的 256 MiB，并以最多 1 MiB 分块读取；出站请求仍维持 64 MiB 限制。不会因此发送、恢复或切换原会话，也不会把完整原始快照传给手机。
+
+| 范围 | 本轮证据 |
+| --- | --- |
+| 回归 | 新增 4 项：超过 64 MiB 的快照、Unicode、两个会话后续增量、分页体积、分片读取、非法长度拒绝及出站限制。定向 Bridge 85 项中 83 通过、2 跳过；CLI 41/41；平台 14 项中 11 通过、3 跳过；Web/原生复制 8/8 |
+| 真实 A/B | 源码和已安装 Mac 包中的编译 IPC/服务模块均完成原生只读连接。后者 A 1.57 秒、B 6.47 秒，两者保持连接，B 最近 20 行约 12 KB；原会话 id/owner 匹配。随后通过实际运行的 Mac 8788 HTTP 接口复验：B 首次分页约 7.05 秒，后续 A/B 均为 connected、原 id 匹配、无恢复动作，分别返回 20 行约 12/94 KB。分页体积随最新聊天内容变化；没有把约 89 MB 原始快照传给浏览器，也没有发送消息、改变草稿或调用模型。耗时仅为当前机器和会话测量 |
+| Mac arm64 Test | 完整构建及签名检查通过，360 个 Web 文件匹配。已安装编译模块 4/4；本机钥匙串确认后，经正常 App 入口启动 8788，通过实际服务 A/B 与 HTTP/HTTPS 一键复制验收。正式版进程和文件、认证及全部 14 条原有效绑定保留。人工操作阶段界面语言由前序基线变为英文，保留当前选择；其余受保护设置不变 |
+| Windows x64 Test | F 盘完整原生构建、NSIS 覆盖安装，706 个安装文件匹配；二维码、完整 ConPTY、独立 Test 数据与自启动检查通过。已安装编译模块 4/4；普通桌面 GUI、8788 启动和版本资源 304 通过。正式版、原配置、有效手机绑定和用户已启用的网络变化检测选项保留；GUI 旧夹具的“必须关闭”前提已修正，仅续验、未重复安装 |
+| Windows 网关 Web | 实际安装服务提供脚本，macOS 上真实 Chromium 访问 Windows 的局域网 HTTP 地址，点击 → 系统粘贴逐字验证中文、emoji、多行文本、延迟 600ms 的 30,010 字符正文及弹窗内源码；无原生手机桥接，`isSecureContext=false`、现代 Clipboard API 不存在，未出现手动复制窗口，草稿不变。此项明确为浏览器客户端访问 Windows 网关，不冒充 Windows 本机 Edge 或手机真机验收 |
+| Ubuntu x64 Test | 原生 DEB 已由用户 sudo 覆盖安装，713 项应用文件及 3 项包管理文件逐项匹配。已安装编译 IPC 4/4、实际桌面 GUI、8788 启动、资源 immutable/304 及原配置绑定保留通过。保留原 `localAccess=false`，以虚拟机局域网入口验收；未为测试开放本机网页访问 |
+| Ubuntu 网关 Web | Ubuntu 真实桌面中使用既有 Electron Chromium，保持沙箱和网页安全设置、关闭 Node 集成，无原生剪贴板桥接及权限自动批准。访问已安装服务的 HTTP 入口，原生鼠标点击 → 系统粘贴验证中文、多行、延迟长正文和弹窗源码逐字一致；草稿不变，无手动复制框。验收用浏览器已退出，Test App 与网关保持运行 |
+
+三端各完成原生接收大快照回归；真实 A/B 原会话位于 Mac，因此 Windows/Ubuntu 的原生 IPC 合成大快照验收不冒充原会话实测。手机原生包未更新，手机真机点击复制仍由用户继续实测。
+
+收尾发现 Mac 和 Ubuntu Test 均启用同一个 Cloudflare 域名，实际 HTTPS 请求曾返回 Ubuntu 实例，导致 Mac 的短期配对授权不匹配。用户明确选择域名保留给 Mac：仅通过正常控制接口关闭 Ubuntu Test 的该入口并重启该 Test 网关，保留局域网、凭据、其他配置和原绑定；正常保存将缺省网卡选择显式记为 `null`，仍为自动选择。固定域名随后连续核对为 Mac 实例，HTTPS 一键复制复验通过。没有修改 DNS、正式版或 Mac 入口配置。
+
+安装后验收通过再清理旧 Test 与重复产物：Windows 1,271,041,272 字节、Ubuntu 1,485,982,308 字节、Mac 660,562,967 字节（均为文件逻辑大小，不是磁盘实际释放量）。保留当前已安装 Test、Windows/Ubuntu 最新安装包、源码归档、配置绑定及必要验收记录。Windows 产物始终在 F 盘，构建与 Ubuntu 串行进行；清理后再次核对正式版和原绑定。
+
+本地构建和验收证据保存在 `.tmp/issue65-20261023/`，Windows 对应文件全部位于 F 盘。本轮没有更新手机原生包；Web 复制沿用上一轮已验证的共享实现与原生 App 适配。操作系统或浏览器明确拒绝剪贴板写入时仍保留手动兜底，不宣称绕过权限。
+
+**English:** Issue #65 was reproduced as an oversized Desktop snapshot closing the shared IPC stream. The bounded receive budget is now 256 MiB with 1 MiB reads; outbound limits remain unchanged. All three Test installations passed native IPC, startup and preservation checks. Actual A/B sessions were verified through the running Mac gateway without sending or activating turns; Windows/Linux used native synthetic large-snapshot regressions. Browser copy/paste passed against Mac HTTP/HTTPS, Windows HTTP from macOS Chromium, and Ubuntu HTTP in a sandboxed native Electron browser. The user's shared Cloudflare hostname was isolated to Mac by disabling only the Ubuntu Test entry as explicitly authorized. Original bindings remain valid, redundant Test artifacts were removed, and no code was pushed or released.
+
+---
+
+<a id="web-clipboard-one-click"></a>
+
+# Web 一键复制本地验收（2026-10-23，未发布）
+
+分支 `fix/web-clipboard-one-click` 从已验收的 PR #63 集成提交 `f0bbdad` 新建，保留该轮网络恢复功能。产品提交 `76ef57e`、`4680695`；本机最终 Test 包源码为 `46806959d8940470ebfff5051cb507d7542a7c8e`，版本仍为 `2.1.4-preview.1`。未推送 GitHub、未合并 main、未发布更新。
+
+- 复现并修复普通 Web 只尝试 Clipboard API、局域网 HTTP 直接进入手动复制窗口的问题；已读取文本在点击内立即复制，完整正文通过 Promise ClipboardItem 保留原始手势，兼容路径恢复原焦点和选择。读取失败或浏览器拒绝不能显示成功；兜底窗口提供新点击重试。
+- Node 定向回归 **158 项全部通过**，包括 8 项复制用例、分页正文与版本校验、Claude/DSH 的原生可信点击桥接、资源白名单及启动恢复。原生剪贴板脚本没有变更。
+- 真实 Chromium 的安全 loopback、普通局域网 HTTP、固定 HTTPS 入口完成按钮点击 → 系统粘贴检查。消息、延迟完整正文、代码、全屏 Mermaid 源码保留中文、emoji 和换行；HTTP 明确验证 `isSecureContext=false`、`navigator.clipboard` 不存在时仍能复制。草稿内容保持不变。
+- 390px 窄屏完成普通消息、延迟正文、代码复制；1280×800 浏览器完成 Markdown 15 项、Mermaid 全屏 22 项检查。初次超大窗口下，全屏夹具未满足缩放后必须可平移的前提；限定标准窗口后通过，未因此改动缩放或拖动逻辑。
+- Mac arm64 独立 Test 已构建、覆盖并启动 8788。360 个打包 Web 文件与源码归档匹配，签名和包内二维码验证通过；固定 HTTPS 刷新后确实加载最终脚本。正式版进程/文件、网络设置、原 Test 配置及 **12 个有效登录绑定记录**保持不变。
+- Mac、Windows、Linux 网关共用此次 Web 源码；本轮只更新 Mac Test。Windows/Ubuntu 安装包、Android/iPhone 原生 App 未重装；Chromium 窄屏不等同于 iPhone Safari 或 Android 浏览器真机验收。浏览器或系统明确禁止自动复制时仍需使用兜底操作。
+
+本地日志与构建清单位于 `.tmp/web-clipboard-20261023/`、`.tmp/web-clipboard-final-20261023/`，不提交临时文件或任何配置、凭据和绑定数据。
+
+**English:** local one-click Web clipboard support covers direct and delayed text, LAN HTTP compatibility, modal source copying and a fresh-click retry. All 158 targeted tests passed, with real Chromium copy/paste checks over loopback, LAN HTTP and the fixed HTTPS entry. The Mac 8788 Test was rebuilt and started with configuration, binding records and the formal app preserved. Other native packages were not rebuilt, and physical Safari/Android-browser acceptance remains separate.
+
+---
+
+<a id="pr63-network-adaptation"></a>
+
+# PR #63 可选网络恢复本地验收（2026-10-23，未发布）
+
+分支 `feature/pr63-network-adaptation-opt-in` 基于 `v2.1.4-preview.1`（`4c251de`），通过合并保留 [@qybgh](https://github.com/qybgh) 的 [PR #63](https://github.com/try2love/codex-mobile-bridge/pull/63) 全部 8 个原始提交；修订另行提交。Test 包源码固定为 `11bbba74b81d88c6b6a46a29f3eaf60da953d4ca`，版本仍为 `2.1.4-preview.1`，未推送 GitHub、未合并 main、未发布更新。
+
+- 默认关闭「网络变化自动恢复」。桌面网关的「网络访问」和登录后的 Web/手机「应用管理 → 网关连接」共享即时保存的开关；关闭时不启动后台网卡/路由变化监视器。开关单独保存，普通配置表单不会覆盖手机端刚保存的值。保存结果不明时只读回查，不重放写入。
+- 开启后使用平台原生事件与 30 秒低频兜底，合并短时事件并等待地址稳定。同 IP 续期不重绑，绑定失败使用有上限的退避，仅发布实际成功监听的地址。
+- 修正 Windows 网卡结构及 IPv4 地址偏移；旧 IP 选择逐项迁移为唯一网卡身份，保留多网卡和旧字段。迁移只在明确启动时保存，不由状态读取写盘。歧义匹配不扩大访问范围。
+- Quick Tunnel 的局域网地址变化不直接触发重建；路由变化先留恢复时间，再检查当前自有进程的本机就绪端点。连续明确失败后才有限重建，且有冷却时间；未知健康结果不当成失败。固定域名隧道、Tailscale 等仍使用原有恢复机制。
+
+| 范围 | 当前证据 |
+| --- | --- |
+| 完整源码回归 | Python discovery 2,127 项：2,046 通过、81 跳过。前端 876 项：875 通过、1 跳过。最终迁移、控制与网络修订另做定向复验；首次沙箱禁止本机监听的检查在获准监听后通过，没有修改产品代码绕过测试 |
+| 原生平台 | Mac 原生路由监视器创建/关闭通过；Windows、Ubuntu 各 80 项定向测试通过，涵盖平台枚举、运行时、真实回环监听地址变化和断开恢复、鉴权控制、旧配置迁移及 Quick Tunnel 策略 |
+| 浏览器 | 真实 Chromium 中英界面，宽屏与 390px 手机视口：默认关闭、打开不写入、单次切换单次写入、设置复用、CSRF、丢响应后只读确认、未知状态冻结和无横向溢出通过 |
+| Mac arm64 Test | 新冻结后端通过 25 项回环与本机控制检查，含启停/重启持久化和合成可信手机会话保留。已覆盖并启动 8788；实际 App 确认开关未启用，固定 HTTPS 入口在真实浏览器中显示登录页。正式版进程/文件不变，原登录会话保留；仅为 Test 的旧局域网选择新增 `lanInterfaces`，原字段保留 |
+| Windows x64 Test | 新冻结后端与完整 NSIS 包已覆盖安装，706 项载荷、二维码、完整 ConPTY、F 盘数据指针和独立 Test 自启动检查通过。普通桌面会话的实际 GUI、新开关默认关闭、8788 启动及版本资源 immutable/304 通过；正式版、原配置和有效手机登录记录保留。GUI 续验仅修订窗口可见性检查脚本，未重装或修改产品源码 |
+| Ubuntu x64 Test | 新冻结后端和独立 DEB 已覆盖安装，713 项应用载荷及 3 项包管理文件匹配。实际 GUI、新开关默认关闭、8788 启动与静态资源缓存通过；保留原 `localAccess=false`，网页验收使用实际监听的局域网入口，未为测试修改配置。正式版、原配置与有效手机登录记录保留 |
+| 手机 | 使用现有 Android/iOS App 加载网关共享 Web 控件，无原生代码或应用标识变化。本轮手机布局为 Chromium 视口验收，未冒充 Android/iPhone 真机触控验收 |
+
+测试以隔离配置、回环监听和受控网卡/路由/隧道事件验证 DHCP 地址替换、同 IP 续期、断网恢复及失败退避，没有修改用户真实网卡、释放 DHCP 租约或中断正式网络。手机中保存的旧 IP 不会因网关恢复自动变为新 IP；使用新地址、重新扫码或稳定域名连接，原认证与绑定继续保留。真实物理切网和手机跨 IP 重连由本轮 Test 继续实测。
+
+Windows 构建与临时产物均在 F 盘，与 Ubuntu 虚拟机构建串行进行；复用既有依赖，未安装新软件。验收后清理 Mac 旧 Test 和重复中间产物约 841 MiB、Windows 本轮重复构建文件约 1.10 GiB（按文件逻辑大小），Ubuntu 本轮重复产物约 1.34 GiB（按已分配空间）。保留当前已安装 Test、唯一 NSIS/DEB 安装器、源码归档、清单与日志；上述口径不同，不作为三端实际释放空间的精确总和。详细本地证据位于 `.tmp/pr63-integration-20261023/`，不提交配置、凭据或编译产物。
+
+**English:** this local, unpublished integration preserves all eight original PR #63 commits and adds default-off network recovery controls shared by desktop and authenticated Web/mobile clients. Native event monitoring, bounded fallback/retries, adapter migration and conservative Quick Tunnel recovery have targeted regression coverage on Mac, Windows and Linux. All three installed Test gateways passed startup, visible GUI and preservation checks; Windows and Ubuntu also verified versioned asset caching. No real DHCP lease or physical network was changed. Mobile viewport tests are distinguished from physical-device acceptance, and saved old-IP client addresses still require an updated address or stable hostname.
+
+---
+
+<a id="v214-preview1"></a>
+
+# v2.1.4-preview.1 启动恢复验收（2026-10-22）
+
+预发布分支 `release/v2.1.4-preview.1` 基于 main `de7b840`，整合 `fix/issue-62-startup-recovery` 已验收修订。桌面/手机发布版本 `2.1.4-preview.1`，手机构建号 36；iOS 系统版本 2.1.4。应用标识、签名身份、数据目录与绑定格式不变。本轮不合并 main，v2.1.3 保持稳定通道。
+
+| 范围 | 已验收结果 |
+| --- | --- |
+| 启动与资源 | Node 回归覆盖资源有限重试、严格执行顺序、提前下载、不支持 preload 的回退、CSS 读取异常、超时取消及晚到结果。真实 Chromium 生产资源夹具覆盖窄/宽屏、减少动态效果、资源连续失败、外部统计脚本被 CSP 拦截、原生剪贴板时序、运行时异常和配对未知结果 |
+| Mac / Cloudflare | 独立 8788 Test 实装后通过固定 Cloudflare HTTPS 入口；该次冷加载 6.87 秒、重复打开 1.43 秒，55 个资源复用缓存。此为该次网络测量，不是蜂窝网络速度承诺 |
+| Windows x64 | 独立 Test 完整安装的 707 个文件逐项匹配（含 ConPTY），真实 GUI 和网关启动通过。旧缓存覆盖升级后 0.50 秒可用、48/54 个资源复用；再次打开 0.34 秒、54/54 复用 |
+| Ubuntu x64 | 独立 Test DEB 的 745 个应用文件及 3 个包管理文件匹配，GUI/网关启动通过。旧缓存覆盖升级后 0.79 秒、48/54 复用；重复打开 0.42 秒、54/54 复用 |
+| 缓存与保留 | Windows/Ubuntu 的 gzip、ETag 304、内容版本 immutable、旧哈希 no-cache、HTML no-store 通过，无运行时异常。正式版文件与配置不变，每端原 3 条 Test 登录记录保留；Mac Test 的原配置与绑定也保留。用户随后确认测试通过 |
+
+上述实装验收使用源码指纹 `0c1d7b6e1ca79269c02eef0b7ad36c688f40a5527fe07eb4de3121cae542fe46`，Test 内部版本当时为 2.1.3；后端/原生源码与 v2.1.3 相同，使用已核验的正式原生运行时并重新打包全部候选 Web 资源。本预发布在此基础上仅统一版本与文档，公开包另由原生 CI 完整构建，不能把此前 Test 包称为公开预览安装包。测试只重试初始只读认证，不重放未知配对或消息写入；CSP 未放宽。
+
+**English:** accepted macOS, Windows and Ubuntu Test installations verified startup, resource caching and settings/binding preservation before the preview version bump. Windows/Ubuntu old-cache upgrades reused 48/54 resources, followed by 54/54 on repeat visits. Timings describe the measured connections, not a universal mobile-network guarantee. Test artifacts and public preview artifacts are distinct; the public packages are built separately by native CI. No main merge or stable-channel replacement is part of this preview.
+
+---
+
+## v2.1.3 发布验收（2026-10-22）
+
+本版整合已验收的缓存与 Windows 包体优化、Mermaid、PR #51/#52、PR #40 查询生命周期和多目标 Webhook，以及手机弹窗、焦点与回答卡片定位修复。桌面与手机版本统一为 2.1.3，Android/iOS build 35；沿用更新公钥、Android 签名和 iOS 正式应用标识。
+
+- 本机完整 Python discovery：2,057 项，2,018 通过、39 项按平台跳过；包含已有原生 macOS 夹具。前端：849 项，848 通过、1 跳过；更新器：33 项，32 通过、1 跳过。首次前端运行的两项 loopback 监听被沙箱拒绝，以相同代码在允许本机监听后重跑通过。
+- 手机更新选择：Java/Swift 均通过；下载与安装恢复专项分别通过 14、47、38、26、23 项。发布资源与清单检查 8 项通过。
+- Windows CI 原失败是两终端隔离测试在输出文件创建后立即读取；受控 Windows 夹具证实文件存在时内容可仍为空。修订等待后续完成标记，保留原内容和第二终端仍存活的断言，不延长超时、不修改产品终端实现。已有 Windows Python 3.11 定向修订复验 20/20 通过；原失败未在基线 20 次中自然重现。本轮完整 GitHub CI 的 7 项任务全部通过，包括 Windows Python 3.9/3.13、macOS Python 3.13、Ubuntu Python 3.9/3.13，以及桌面和手机检查（运行 39656034549）。
+- Android API 35 模拟器与 iOS 18.2 模拟器均完成正式应用标识下 2.1.2 → 2.1.3 覆盖安装；电脑列表、当前电脑和 Cookie 命名空间保留，实际 WebView/原生认证沿用升级前的合成可信会话，无需重新登录。Android 沿用原签名，构建号 34 → 35；iOS 同样为 build 35。此项是隔离模拟器升级证据，不等同于新正式包真机验收。
+- 正式构建固定在标签 `v2.1.3`（`fa483c4545d773b5d0e6002d2d20842f75ac1e0f`）。[发布构建 39658137984](https://github.com/try2love/codex-mobile-bridge/actions/runs/39658137984) 的 8 个任务全部通过，覆盖 macOS arm64/x64、Windows x64、Linux x64/arm64 和 iOS。桌面包在对应原生架构构建；Mac/Windows 包完成真实窗口、登录配对、更新与回滚检查，Windows NSIS 安装逐项核对载荷并运行包内原生终端检查，Linux DEB 安装及 AppImage 解包启动均通过。
+- Windows 正式 ZIP 包含锁定版本 `1.25.260930003` 的 6 项 ConPTY 组件；语言资源仅保留 en-GB、en-US、zh-CN、zh-TW。各桌面包更新公钥与源码一致；Windows PEM 的 CRLF 差异已通过规范化及 DER 公钥比较确认不改变密钥。Android 正式 APK 重新执行 aapt/apksigner，原签名、包名、2.1.3/build 35 均通过；iOS IPA 的主 App 与两个扩展使用正式标识，包内手机脚本与源码一致。
+
+| 补充隔离验收 | 结果与边界 |
+| --- | --- |
+| Mac arm64 | 使用已发布 2.1.2 ZIP 和本次正式 ZIP，完成旧版更新工作进程的真实替换、重启及故障注入回滚；四份配置逐字节不变，升级前建立的可信手机 Cookie 在升级和回滚后继续有效。新包冻结网关通过 115 项 Webhook 回环检查 |
+| Windows x64 | CI 的 NSIS 安装、窗口启动、终端、更新与回滚通过；用户设备 F 盘上的真实 2.1.2 → 2.1.3 隔离更新事务亦通过，故障注入后恢复旧包，四份配置原字节和原可信手机绑定保留。SSH Session 0 事务结果不冒充普通桌面的交互 GUI 验收，后者由原生 CI 覆盖 |
+| Ubuntu x64 | 在用户既有虚拟机中以独立目录解包运行 2.1.2 → 2.1.3 → 2.1.2；四份配置原字节和旧 QR 可信绑定均保留，新冻结网关通过 115 项 Webhook 回环检查。此项是版本切换兼容检查，不冒充系统级 dpkg 升降级；真实 DEB 安装由上述原生 CI 覆盖 |
+| Android / iOS | 模拟器正式标识覆盖升级及旧可信会话认证通过，范围如上。此前用户已在独立 iPhone Test 确认本版手机弹窗、焦点和回答框定位修复；没有将该反馈称为本次正式 IPA 真机签署验收 |
+
+上述 115 项为相同协议夹具在各平台复验，不累计成不同功能项；所有新一轮通知验收均使用回环接收器，没有向真实机器人发送消息。日常正式版、Test、账号配置与手机绑定不作为破坏性测试目标。运行记录保存在本地 `.tmp/release-v213-20261022/`，临时数据、凭据和安装包不提交源码。
+
+正式候选的[完整源码 CI 39658147614](https://github.com/try2love/codex-mobile-bridge/actions/runs/39658147614) 7 项全部通过。Mac 任务首轮因 GitHub 执行器容量不足、未获得 runner 而取消，单独补跑后通过，没有修改产品代码绕过测试。15 个草稿附件已从 GitHub 重新下载，GitHub 资产摘要、14 项文件校验和及三种桌面更新载荷的签名清单均核对通过；下载的校验和文件与本地独立整理结果一致。版本号、应用标识、移动构建号及贡献者记录已统一；发布仅在全部验收结果通过后公开。
+
+**English:** v2.1.3 uses native CI builds for both macOS and Linux architectures, Windows x64, and official iOS identifiers. All seven source CI jobs and eight release workflow jobs passed. Additional isolated checks exercise the actual 2.1.2 → 2.1.3 update and injected-failure rollback on Mac/Windows with retained configuration and trusted sessions; Linux bundle switching is distinguished from CI DEB installation, and mobile simulator upgrades are distinguished from physical-device acceptance. Fifteen draft attachments were downloaded again and verified against asset digests, all fourteen file checksums and the signed desktop update manifest. Everyday formal/Test profiles are preserved.
+
+<a id="webhook-multi-target-acceptance"></a>
+
+# 多目标 Webhook 与手机弹窗本地验收（2026-10-22，未发布）
+
+桌面网关候选为 `70ed6efdf71cc642dd2627c9da9cc046eea1b50e`。手机焦点修订 `d2020b18e45d` 安装后收到严重交互回归反馈，已在独立分支 `bugfix/issue60-ios-input-recovery` 的 `6acebf9556e9` 中撤回；恢复候选的整个 `mobile/` 源码与 `70ed6ef` 相同。网关资源未改变。版本仍为 `2.1.2`、手机构建号 `34`；未推送 GitHub，也未发布新版。
+
+本轮补齐多个同类或不同服务的 Webhook、独立目标编辑与发送、跨进程保存保护、已保存启用状态、紧凑操作布局，以及手机原生菜单对弹窗的让位。旧单目标配置与凭据保留；普通读取脱敏，主动查看与测试均限定已选目标。
+
+| 范围 | 当前证据 |
+| --- | --- |
+| 源码 | Python 201 项中 199 通过、2 跳过；桌面/Web Node 840 通过、1 跳过。首次 Node 运行的两项回环服务测试受沙箱端口限制，允许回环后定向重跑通过。恢复候选手机脚本 33/33 通过 |
+| 打包后端 | macOS、Windows、Ubuntu 的冻结网关各通过相同的 115 项真实回环 HTTP/桌面工作进程检查，包含五种服务协议、签名、认证与 CSRF、脱敏、多目标增删改查、失效目标拒绝及跨进程可见性；没有向真实机器人发送本轮验收消息 |
+| 界面 | 实际浏览器核验桌面 900px、手机 390px 的中英文布局，无横向溢出；配置选择与添加同行、地址查看同行、底部操作分组。多目标交互及弹窗菜单信号检查通过 |
+| macOS arm64 | 独立 Test 已替换并启动 8788，实际窗口布局已核对；正式版、配置及手机绑定保护检查通过 |
+| Windows x64 | 构建、临时文件与验收均在 F 盘；独立 Test 已覆盖安装，705 个安装文件与候选一致，真实 GUI 和 8788 启动检查通过；正式版、配置及绑定保留 |
+| Ubuntu x64 | 用户完成覆盖安装后，715 个文件与冻结包一致，真实 GUI、8788 启动、静态资源缓存与正式版/配置/绑定保护检查通过 |
+| iOS | 用户确认 `70ed6ef` 的弹窗“更多”入口与紧凑布局通过。`d2020b1` 覆盖安装保留了 5 个电脑连接及偏好，但用户反馈蓝框消失后会话无法唤起输入法且点击无响应；该修订不通过，已撤回。恢复包覆盖安装后，5 个电脑连接及偏好再次核对不变；用户确认会话按钮与普通输入框已恢复，补充回答框的键盘后定位以及列表返回高亮单独修订 |
+| Android | 新 APK 已构建，原包名、版本与签名保持一致；包内共用脚本与源码字节一致。本轮未连接 Android 真机 |
+
+已撤回的焦点修订曾在实际 Chromium 中通过按钮轮廓与输入方式切换检查，但该检查遗漏真实 WKWebView 的会话触摸、键盘弹出与点击链路，不能支撑完整可用性。当前 Chromium 触摸对照仍能聚焦并触发点击，尚未复现用户的 iPhone 故障；全页触摸监听导致根节点样式变更属于待验证原因，而非已确认根因。用户已确认回退后普通输入与按钮恢复。
+
+随后按三个独立分支修订：`8665e05` 只在紧凑布局返回列表后清除会话选中背景，并限制无悬停设备的列表悬停背景；宽屏当前会话标识保留。`6964f48` 在原生手机键盘改变视口时，只校正当前回答卡片所属滚动区；不转移焦点、不修改草稿、不截获触摸或输入事件。`22a9744` 给账号管理、第三方通知与应用管理的标题设置初始焦点，保留按钮 Tab 导航，不修改通用弹窗或输入处理。
+
+新修订通过移动脚本 36/36、账号/导航/弹窗/资源与布局 Node 132/132、Web 资源 Python 8/8。真实 Chromium 的三个客户端紧凑触摸进入/返回与宽屏选中态共 6 个场景通过；回答框在 844→500px 视口变化后无需输入即进入可见区，保持原焦点，重复事件、失焦、普通输入框与部分可见长回答框不被滚动。弹窗合成页核验初始焦点从按钮改为标题；补充提交 `3173754` 仅去掉这些非交互标题自身的浏览器默认轮廓。最终生产 CSS 独立复核：三个标题均无轮廓，Tab 后按钮仍显示键盘焦点框，触摸输入可键入中文。以上是浏览器与源码证据，不能替代 iPhone 真机的键盘动画和按钮颜色验收。
+
+后续候选 `2e4d7f87e4f013ddce9f613ecf4421ff3212951a` 已编译 Mac Test、签名 iOS Test 和 Android APK。Mac 独立 Test 已覆盖并启动 8788，正式版进程、配置与绑定核对不变；5 个修改后的已安装 Web 文件与源码一致，实际首页除运行时安全 nonce 外一致并保持 no-store，三个脚本/样式的内容与 304 重新校验通过。本机网页入口按原配置保持关闭，资产验收使用原局域网入口。iPhone Test 覆盖安装并启动，5 个电脑连接及全部偏好逐项相同。用户随后确认列表返回、弹窗按钮与回答卡片等操作基本正常，剩余返回按钮、Webhook 地址框及刚进入聊天的输入框仍出现蓝色边框，未把颜色验收记为全部通过。Windows/Ubuntu 仍是已通过验收的 `70ed6ef`，未将这次仅在 Mac/手机安装的焦点后续修订记作远端已更新。
+
+针对剩余蓝框，独立分支 `bugfix/issue60-mobile-control-focus` 只调整两个通知子弹窗的标题初始焦点，并添加原生手机宿主的控件样式：关闭默认蓝色触摸高亮，保留中性贴边焦点提示，主按钮使用高对比内圈；普通 Web、终端辅助输入及勾选控件不受该规则影响。没有修改 `mobile/`、触摸监听、键盘处理或草稿逻辑。Node 50/50 和资源 Python 5/5 通过；完整生产 CSS 的浅/深色 × 原生手机宿主/普通 Web 共四个实际 Chromium 场景通过，包含子弹窗初始标题、Tab 导航、触摸点击和中文文本插入。浏览器验收发现主按钮样式优先级不足并在编译前修正。该证据未确认 iOS 初入聊天时的实际焦点来源，也不等同于真实手机 IME 组合输入验收。候选 `95153e59f7d8` 只编译 Mac Test；iOS/Android 原生包沿用 `2e4d7f8`。 Mac Test 已覆盖安装并启动 8788，3 个变更资源与源码一致，首页及时刷新及样式 304 重新校验通过；正式版文件与进程、原配置及手机绑定核验不变。iPhone 无需重装，退出到电脑列表再进入原 Mac 连接即可复测，颜色结果等待用户确认。 安装验收后又清理 14 项本轮重复产物及旧 Mac Test 包，逻辑文件大小约 1.30 GiB（不等于 APFS 实际释放空间）；当前 DMG、已安装 App、原手机测试包和记录保留。
+
+用户对 `95153e5` 的反馈进一步区分了剩余问题：Webhook 当前配置仍有蓝色选中框，新建会话关闭按钮及普通聊天输入框有灰色外框，补充回答框在输入中仍会主动移位。独立分支 `bugfix/issue60-mobile-focus-residual` 的 `84a5849` 将 Webhook 持久选中样式改为中性填充和字重，为 Codex/Claude/DSH 新建弹窗指定标题初始焦点，并仅取消原生手机普通聊天输入框的附加轮廓；输入框边框与光标保留。`bugfix/issue60-answer-focus-once` 的 `4847b4d` 将回答卡片校正限制为每次聚焦最多一次：首个 1 秒内等待 120ms 视口稳定，输入、中文组合输入、手动触摸/滚轮滚动或失焦即取消待执行校正；没有强制失焦、拦截输入、修改草稿或全页触摸样式切换。
+
+集成候选 `0af8fb61cabc` 的 Node 163/163、资源 Python 5/5 通过。旧实现的连续键盘尺寸变化用例先复现二次移位，新实现及真实 Chromium 隔离夹具确认首次必要校正仅写一次滚动位置，随后输入及视口变化不再由该辅助逻辑滚动；浏览器自身的焦点滚动未被禁用。生产 CSS 检查确认选中 Webhook 无外框、创建弹窗标题初始聚焦、普通手机输入框无附加轮廓，其他控件与普通 Web 的焦点样式保留。Mac Test、iOS Test 和 Android APK 均已构建，签名及变更资源与冻结源码核验一致。Mac 8788 已覆盖启动，正式版文件/进程、配置与绑定保护核验通过；4 个已安装 Web 文件、实际首页及三项静态资源内容和 304 重新校验通过。iPhone 独立 Test 已覆盖安装并启动，5 个电脑连接及持久偏好相同，仅当前 Mac 连接的最近打开时间更新。用户随后完成本候选 iPhone 复测，反馈“现在似乎是没有了这些问题了”；据此将本次反馈范围内的选中/焦点外框、回答卡片移位及基本输入点击记为实测未再复现，不外推为所有设备或场景均已验证。Android 无真机连接，Windows/Ubuntu 未重装该焦点候选。安装验收后清理 18 项重复中间产物和旧 Mac Test 包，逻辑文件大小约 1.43 GiB；当前已安装 App、DMG、iOS App、APK 与验收记录保留。
+
+本地记录位于 `.tmp/issue60-feedback-20261022/`，包括归档和安装包哈希、配置保护摘要、截图及清理清单，不提交凭据或完整配置。Mac 和 Windows 的被替代 Test 包与重复构建产物已按精确路径清理；当前安装包、已安装 Test、签名资源及必要验收记录保留。Ubuntu 安装验收后已清理旧 DEB/AppImage 与重复中间产物，回收约 1.16 GiB，保留当前安装包、解包核验副本和共享缓存。焦点后续修订安装检查通过后，删除故障手机包、废弃候选、旧 Mac 安装包和重复中间产物，额外回收约 2.35 GiB；保留当前 DMG/iOS App/APK，以及用户已确认恢复基本输入的上一份手机包，等待新修订真机验收。
+
+**English:** packaged gateways on macOS, Windows and Ubuntu passed the same 115-check loopback suite, followed by Test installation, GUI, startup and preservation checks. The user accepted iOS modal-menu and layout behavior, but reported that the subsequent touch-focus change prevented conversation input and interaction. That change failed acceptance and was reverted; all five saved computers and preferences remained intact, and the user confirmed normal input and buttons recovered. Three separate follow-ups address compact-list selection, focused answer-card visibility after keyboard resizing, and initial focus for selected management dialogs. The `2e4d7f8` candidate passed source and Chromium checks and was built for Mac, iOS and Android. Mac 8788 and the independent iPhone Test were upgraded and launched with preservation checks passed; the user accepted the interaction follow-ups while reporting remaining blue control outlines. A CSS-only mobile-host follow-up plus initial headings for notification subdialogs passed four light/dark browser scenarios and preserves keyboard focus visibility; native iPhone color acceptance remains pending. Windows/Ubuntu remain on the previously accepted gateway candidate. No GitHub push or release occurred.
+
+The latest local candidate, `0af8fb61cabc`, removes the persistent Webhook selection outline and extra native-composer ring, starts new-chat dialogs on their heading, and bounds answer-card positioning to one initial correction. Typing, IME composition and manual scrolling cancel pending repositioning. Targeted Node checks (163), resource checks (5), and isolated Chromium scenarios passed. Mac 8788 and the existing iPhone Test were upgraded and launched; five saved computers and persistent preferences were preserved, with only the current connection's last-opened timestamp advancing. Android was built and signed. The user subsequently reported that the previously observed problems seemed absent on the iPhone retest. The reported outline, answer-card positioning and basic interaction cases are therefore recorded as no longer reproduced in that test, without extending the result to all devices or scenarios. Windows and Ubuntu were not upgraded to this focus-only candidate.
+
+---
+
+<a id="webhook-local-acceptance"></a>
+
+# Webhook 服务预设本地验收（2026-10-22，未发布）
+
+上一轮安装候选源码为 `e766d406cea87d9e2f0a962a765e675564ec2239`，分支为 `feature/issue60-webhook-notifications`，基于 main `d900c02`。Issue #60 的通用 Webhook 通道在本轮补齐通用自定义、飞书、钉钉、Discord、Telegram 的可编辑模板、可用字段说明、可选飞书/钉钉签名、服务业务响应检查及已保存地址的隐藏/查看；沿用既有通知策略、去重和重试。版本仍为 `2.1.2`、手机构建号 `34`；未推送 GitHub，未创建 Release。
+
+首轮 `76867ec` 通过通用回环接收器检查，但用户真实飞书测试未收到消息。本轮授权对照确认：原通用 JSON 得到 HTTP 200 / 业务码 19002，正确飞书文本格式得到业务码 0，用户确认收到消息。因此本轮按服务协议检查响应，不再把飞书 HTTP 200 直接视为接受通知；首轮的通用接收器结果不作为飞书兼容证据。
+
+| 范围 | 本轮证据 |
+| --- | --- |
+| 后端与界面 | 本次修订通过通知/桌面 Python 70 项、桌面/Web JS 118 项、鉴权与 CSRF HTTP 3 项；覆盖默认模板迁移、自定义正文保留、两种签名算法、密钥保留/更换/清除、业务失败判定及主动查看地址 |
+| Web / 手机共享界面 | 390px 实际 Chromium 中通过 24 项检查；1200px 桌面生产页面配合合成 IPC 通过 22 项检查。覆盖五种预设、签名字段、地址隐藏/查看、非法输入、保存失败草稿保留及仅测试已保存配置；没有横向溢出 |
+| 三平台打包网关 | macOS arm64、Windows x64、Ubuntu x64 各通过同一组 76 项真实回环 HTTP 检查：认证、CSRF、脱敏与主动读取地址、中文 JSON、各服务默认格式与业务失败、独立计算的飞书/钉钉签名、Discord 确认及 Telegram chat_id；隔离网关运行后均停止 |
+| macOS arm64 | 新 Test DMG/ZIP、网关和签名核验通过；旧 Test 已替换，原配置与绑定保留，8788 启动正常。真实窗口中的服务选择与保存状态已检查；安装后的网关通过已保存配置向授权飞书机器人发送测试，飞书返回接受成功。正式 8787 进程和配置保持不变 |
+| Windows x64 | 全部构建、临时与验收文件位于 F 盘，低优先级单任务构建；安装后 705 个载荷文件与候选逐项一致，二维码、真实 GUI、五种服务配置、8788 启动及静态资源检查通过。安装目录约 450 MB，包含 ConPTY；正式版、配置、可信手机会话、自启动项及已运行 DSH 均保留 |
+| Ubuntu x64 | DEB/AppImage 构建通过；用户覆盖安装独立 Test DEB，715 个安装文件与候选逐项一致；真实 GUI、Webhook 控件及 8788 网关启动通过。正式版文件与进程、配置、可信绑定及独立 Test 自启动身份保留 |
+| Android / iOS | 本次服务预设与地址查看只修改网关共享界面，可沿用原独立手机 Test，重新打开连接即可加载。首轮已生成签名 Android APK，并覆盖安装、启动独立 iPhone Test，12 项已保存偏好保持一致；本次未重新编译原生手机壳，也未把 Chromium 手机尺寸检查等同于真实手机验收 |
+
+76 项检查是三种平台各自运行的相同功能检查，不累加为不同功能的测试数量。飞书有授权真实机器人接收确认及新版已安装网关的服务响应；钉钉、Discord、Telegram 本轮使用本机协议接收器验证，没有声称取得其真实账号的送达确认。服务接受与用户实际看到通知分别记录。未运行新的 GitHub 发布 CI，也不借用此前正式版结果作为本轮证据。
+
+源码归档摘要、安装包哈希、配置/绑定摘要、运行结果和截图保留在本地 `.tmp/issue60-webhook-20261021/` 与 `.tmp/issue60-feishu-20261021/`；凭据及完整配置不提交。已安装 Test、当前安装包、共享构建依赖与验收记录保留；被替代的首轮 Test 包和本轮重复构建目录仅在安装验收通过后按精确路径清理。
+
+**English:** the revised, unreleased candidate supplies five editable presets, Feishu/DingTalk signing, service-specific success checks and explicit saved-endpoint visibility. All three packaged gateways passed the same 76-check loopback suite, followed by Test installation, visible GUI, startup and preservation checks. Windows compared 705 installed files; Ubuntu compared 715. Formal apps, settings and trusted phone bindings remain intact. The user confirmed receipt from the authorized Feishu bot, and the newly installed macOS gateway also obtained a successful Feishu response; other providers have protocol-fixture evidence only. Existing mobile Test apps load the shared UI without a native rebuild. No GitHub push, release CI or new release occurred.
+
+---
+
+<a id="mermaid-preview-acceptance"></a>
+
+# Mermaid 预览本地验收（2026-10-21，未发布）
+
+本轮候选为 `31cc463434a01c83f51abcf805cfee2350d6e1f4`，开发分支为 `integration/mermaid-preview-test`。范围为聊天与 Markdown 文件中的图表预览、源码切换及复制、全屏缩放、流式与缓存复用，以及 iOS 子页面导航修复。用户已反馈测试通过；本节记录本地 Test 验收结果，版本号仍为 `2.1.2`、手机构建号 `34`。后续仅合并源码与文档，不构建 App 或创建新 Release。
+
+| 范围 | 本轮证据 |
+| --- | --- |
+| macOS arm64 / Web | 实际打包网关加载生产资源，通过 19 项浏览器检查；包含中文 SVG 实际解码、源码、全屏缩放、流式状态、缓存复用、无效内容回退及 CSP。用户已确认宽屏 Web 图表正常 |
+| Windows x64 | 独立 Test 安装后 705 个文件与候选载荷一致；GUI、二维码及网关启动通过。已安装网关配合 Chrome 通过相同的 19 项实际图表检查，JS 错误及 CSP 违规均为 0，中文截图已核对 |
+| Ubuntu x64 | DEB/AppImage 构建通过；DEB 覆盖安装后 715 个文件与包内一致，Test 安装与自启动身份独立，GUI 与网关启动通过。已安装网关配合可见 Electron 窗口通过 19 项实际图表检查，JS 错误及 CSP 违规均为 0，中文截图已核对 |
+| Android | 独立 Test 已提供给用户；用户确认 App 能正常加载图表。共享渲染功能与 Web 使用同一实现 |
+| iOS | 完整 App 在 iOS 18.2 模拟器中复现原导航拦截；仅加入精确 Mermaid 子页面许可后，19 项真实图像、源码、全屏、流式与缓存检查通过。独立 iPhone Test 已覆盖安装并启动，用户确认图表与全屏缩放正常 |
+| 原生导航与移动资源 | 真实 Swift URL 判断检查通过，覆盖直连/中继路径、外域及额外路径/query/fragment 拒绝；移动源码测试 30/30 通过。保留预览壳主框架导航拒绝 |
+| 配置与绑定 | Windows、Ubuntu 覆盖安装及启动前后，正式版与 Test 的配置、可信绑定、自启动隔离检查通过；iPhone Test 的 10 项保存设置逐项一致。独立 Test 未替换正式 App |
+
+19 项浏览器检查分别验证每个平台，不累加为不同功能的测试总数。覆盖流程图、时序图、状态图、类图、饼图和 ER 图；确认图表图片实际解码，而非仅存在 SVG 字符串。检查还包括引擎按需加载、未变化内容复用缓存、源码原文保留、后续流式文字不关闭全屏或重置缩放、未闭合代码块保留源码，以及图表不撑宽页面。
+
+iOS 根因为完整 App 的导航代理只允许 HTML 预览壳，取消了 Mermaid 子页面导航；简化 WKWebView 检查未包含该限制。本轮只增加当前网关下精确子页面地址的许可，未放宽外部导航、主页面导航、认证或 CSP。Web 更新不能替代这项原生 App 修复。
+
+以上为本地 Test 构建、安装和实测记录，不借用 v2.1.2 的历史 CI 结果作为本轮证据。macOS Intel、Linux ARM64 及正式标识 iOS 的新发行构建不在本轮记录范围内；尚未执行新的全平台发布 CI。原始日志、截图、包哈希和清理清单保留在本地 `.tmp/mermaid-platform-20261021/`，不提交配置、账号或聊天数据。
+
+新版 Test 验收后已清理旧测试 App、安装包和重复构建产物：Mac 约 2.23 GiB、Windows 约 2.41 GiB、Ubuntu 约 3.82 GiB。当前 Test、必要记录和复用缓存保留，清理后复核正式版、配置、绑定及 Test 网关正常。
+
+**English:** the local Mermaid candidate passed real packaged rendering checks on macOS arm64, installed Windows x64 and Ubuntu x64 gateways, plus full-App iOS simulator checks. Each 19-check run covers actual image decoding, source, fullscreen, streaming, cache reuse and CSP; these are not additive counts of distinct features. Users confirmed Android/Web rendering and iPhone diagram/fullscreen behavior, then accepted the round. Independent Test upgrades retained configuration and trusted bindings. The iOS fix narrowly permits the expected diagram subframe; it does not weaken top-level navigation or authentication. This is local acceptance, not a new release or cross-platform release CI result.
+
+---
+
+<a id="v212-platform-status"></a>
+
+# v2.1.2 正式发布验收（2026-10-20）
+
+桌面与手机版本统一为 `2.1.2`，Android/iOS 构建号为 `34`。本轮以终端交互为主，改善 OpenCode 类终端 CLI 的触摸滚动。桌面 appId、数据目录、更新公钥、手机包名与绑定存储方式保持不变；Android 沿用原发布证书，iOS 沿用正式应用标识及扩展标识，不采用临时 Test 标识。
+
+| 范围 | 本轮证据 |
+| --- | --- |
+| 产品实测 | 用户已实测 Mac、Windows、Ubuntu、Android 和独立 iPhone Test；覆盖终端直接输入、中文输入法、Enter/Tab、触摸滚动、OpenCode 交互、字号及退出布局。Windows 10 的鼠标信号使用包内 ConPTY 验证；Test 安装目录逐文件与打包目录核对 |
+| 本地完整检查 | Python 源码检查 1,997 项中 1,918 通过、79 条件跳过；前端 800 通过、1 条件跳过；更新器 32 通过、1 条件跳过；移动共享资源 29 通过、iOS 资源/源码包边界 6 通过。不同分组存在重叠，不累加为独立总数 |
+| 跨平台 CI | [完整 CI](https://github.com/try2love/codex-mobile-bridge/actions/runs/39307261300)全部通过：Windows / Ubuntu 的 Python 3.9、3.13，macOS Python 3.13，以及前端、更新器和移动端更新检查 |
+| macOS arm64 / Intel x64 | [原生打包工作流](https://github.com/try2love/codex-mobile-bridge/actions/runs/39307265826)通过 DMG/ZIP、嵌套签名、已打包 App 启动、鉴权、通知、HTTPS、配对及更新控制器检查；更新成功与失败回滚均保持配置和原可信手机会话 |
+| Windows x64 | [同一原生构建](https://github.com/try2love/codex-mobile-bridge/actions/runs/39307265826)完成 NSIS/ZIP；实际安装器安装后 741 个载荷文件逐项 SHA-256 核对，安装后 GUI、二维码与冻结终端检查通过。另验证登录、HTTPS、配对、通知和更新成功/失败恢复，保留配置及原可信手机会话 |
+| Linux x64 / ARM64 | [原生构建](https://github.com/try2love/codex-mobile-bridge/actions/runs/39307265826)完成两种架构的 deb/AppImage；deb 安装、AppImage 解包启动及网关检查通过。Linux 保持实验性支持，使用安装包手动升级 |
+| 真实旧版桌面覆盖升级 | 官方 v2.1.1 macOS arm64 App 与本轮原生 CI 的 2.1.2 ZIP 在隔离目录完成实际替换；另注入替换失败并恢复旧 App。两轮均逐字节保留网关、桌面、通知和订阅配置，原扫码可信手机 Cookie 仍通过认证。没有替换日常正式 App 或数据 |
+| Android 覆盖安装 | 已发布 v2.1.1/build33 APK 在隔离 Android 35 模拟器中直接覆盖为 2.1.2/build34。签名证书和首次安装时间不变，保存的电脑与设置保留，重开后仍使用同一可信持久会话；最近访问时间及绑定密文正常刷新 |
+| iOS 构建与覆盖安装 | [原生 iOS 构建](https://github.com/try2love/codex-mobile-bridge/actions/runs/39306057821)通过未签名 IPA 与源码包检查。在 iOS 18.2 模拟器中，正式标识的 v2.1.1/build33 覆盖为 2.1.2/build34 后，电脑列表、当前电脑、Cookie 命名空间和原可信持久会话保留，重开无需登录 |
+
+本轮发布检查修正了测试夹具误用 CI 登录 Shell 配置、Windows 路径分隔符写死的假设，保留原行为断言。Windows 发布流水线新增实际 NSIS 安装后的全文件 SHA-256 对比，并从安装目录运行 GUI 和冻结终端检查；用于验证 ConPTY DLL、三种 OpenConsole 宿主及其他资源全部安装，无需手动补文件。
+
+覆盖升级使用隔离配置与合成网关登录，不替换日常正式版、账号或手机绑定。手机覆盖测试验证登录和保存状态，不运行真实模型聊天。iPhone Test 实机验收与正式标识的模拟器覆盖升级分别记录；发布 IPA 仍需自行签名，并以相同 Bundle ID 和签名身份覆盖安装。候选后的纯文档修改不改变构建输入；正式标签重新运行完整测试与全平台构建，发布前核验完整资产集、更新清单签名、包大小/哈希及上传后下载结果。
+
+**English:** v2.1.2/build34 retains desktop/mobile application identities, data locations, Android signing identity and trusted-device storage. Acceptance separates real-device terminal testing, native release-package checks, and isolated overwrite upgrades. Windows installer validation compares every installed file with the built payload, including bundled ConPTY, then runs GUI and terminal checks from the installed directory. Android and official-ID iOS simulator upgrades retain saved computers and the same trusted sessions. iOS distribution remains unsigned and requires the user's signing identity; Linux remains experimental with manual package upgrades.
+
+---
+
+<a id="v211-platform-status"></a>
+
+# v2.1.1 正式发布验收（2026-10-18）
+
+桌面与手机版本统一为 `2.1.1`，Android/iOS 构建号为 `33`。保留桌面 appId、数据目录、更新公钥、手机包名和绑定存储格式；Android 沿用原发布签名。下述记录区分本轮产品实测、发行构建与覆盖升级，旧节按原版本保留。
+
+| 范围 | 当前证据 |
+| --- | --- |
+| 界面与业务 | 用户已实测账号/模型界面、草稿恢复及文件定位相关功能；源码规范与功能合同分别复核。完整前端 745 通过、1 条件跳过；更新器 32 通过、1 条件跳过；移动共享资源 29 通过，iOS 资源/源码包边界 6 通过 |
+| macOS 本机 | arm64 Test 实际安装并提供 8788 页面；账号/模型、草稿、文件定位及标题返回通过定向检查。正式 8787 网关、原配置及绑定保持不变 |
+| Windows 本机 | `4f3793d` Test 安装与启动、账户/模型界面及冻结网关验证通过；模型目录隔离回环验收确认首次 1 次上游读取、缓存 0 次、手动刷新及失败保留目录。17 个保护文件、3 个绑定会话与原 DSH 进程保持不变；未调用付费模型 |
+| SSH CLI | 本轮在实际 Linux SSH 执行端及 Mac/Windows 原生 CLI 上，以隔离配置和回环上游验证模型查询、原执行环境、缓存及身份隔离。服务器自身网络仍决定真实上游可达性；未为 88server 添加代理 |
+| v2.1.0 旧数据 | 使用标签 v2.1.0 的认证和配对实现生成隔离数据；新实现读取后，配置与桌面偏好字节、Cookie 命名空间、可信手机会话、中继身份及绑定证明均保留 |
+| 真实旧版桌面覆盖升级 | 使用官方 v2.1.0 macOS arm64 App 与原生 CI 生成的 2.1.1 ZIP，在隔离目录完成实际替换；注入替换失败后恢复旧 App。两轮均逐字节保留网关、桌面、通知和订阅配置，原扫码可信手机 Cookie 仍通过认证。未替换日常 App 或数据 |
+| 跨平台完整 CI | [候选精确提交测试](https://github.com/try2love/codex-mobile-bridge/actions/runs/39105761941)全部通过：Windows / Ubuntu Python 3.9、3.13，macOS Python 3.13，以及前端、更新器与移动端检查 |
+| macOS arm64 / Intel x64 | [原生打包工作流](https://github.com/try2love/codex-mobile-bridge/actions/runs/39105759061)通过 DMG/ZIP、签名完整性、App 启动、鉴权、通知、配对及真实更新控制器检查；更新成功与失败回滚均保留配置和原可信手机会话 |
+| Windows x64 | 同一原生工作流通过 NSIS/ZIP、安装后 GUI、二维码、连续终端、网关鉴权、HTTPS、配对、通知和更新控制器检查；更新与失败恢复保留配置和原可信手机会话 |
+| Linux x64 / ARM64 | 同一原生工作流完成 deb/AppImage；两种架构的 deb 安装及 AppImage 解包启动检查通过。Linux 仍为实验性支持，使用安装包手动升级 |
+| Android 覆盖安装 | 官方 v2.1.0/build32 APK 在隔离 Android 35 模拟器登录后，直接覆盖为 2.1.1/build33；签名证书、首次安装时间、保存的电脑及同一可信持久会话均保留，重开无需重新登录 |
+| iOS 构建与覆盖安装 | [原生 iOS 构建](https://github.com/try2love/codex-mobile-bridge/actions/runs/39104303887)通过未签名 IPA 与 Xcode 源码包检查。在 iOS 18.2 模拟器中，从 v2.1.0 标签编译 build32 并登录隔离网关，直接覆盖 build33 后，电脑列表、当前电脑、Cookie 命名空间和同一持久登录会话保留；首次启动无需重新登录 |
+
+原生构建候选为 `7155ff1`；其后桌面产品补入下述 Windows 账号文件替换重试，并修正验收夹具和文档。iOS/Android 构建输入仍与 `792b048` 一致。正式标签工作流重新构建桌面与 iOS 资产，发布以最终完整 CI、完整资产集、更新清单签名、大小/哈希及上传后下载复核为门槛。
+
+本轮修复了验收夹具中的 Windows 默认编码、命令行长度、PID/路径假设，以及全局时钟模拟对后台线程的干扰；保留原行为断言，没有通过关闭产品检查获得通过。 正式标签初次构建进一步捕获 Windows 恢复配置时的 `os.replace` / WinError 5；隔离实机以不允许删除的打开句柄复现后，补充仅针对 Windows 5/32/33 错误的最长 2 秒重试。临时占用解除后恢复成功；持续占用仍抛错，原文件完整且临时文件清理。原恢复断言和异常诊断均保留，修订标签重新执行完整 CI。覆盖升级使用隔离目录、测试账号和绑定，未替换日常 App 或配置。以上证据不等于所有操作系统版本、真实付费接入或任意 iPhone 签名方式的验证。iOS IPA 仍需自行签名，并使用相同签名身份和 Bundle ID 覆盖安装。
+
+---
+
+<a id="v210-platform-status"></a>
+
+# v2.1.0 正式发布验收（2026-10-16）
+
+发行标签固定在 `582beb52b46c0c584da468197083dd2cafa30361`，版本统一为 `2.1.0`，Android/iOS 构建号为 32。桌面 appId、安装名称、数据目录定位、手机包名、绑定存储键及更新公钥保持原样；Android 沿用原发布签名。下表为本次正式发行检查，后续旧节按历史提交保留。
+
+| 范围 | 本次发布证据 |
+| --- | --- |
+| 源码与移动端检查 | [精确标签测试](https://github.com/try2love/codex-mobile-bridge/actions/runs/38888357130)：Windows / Ubuntu 的 Python 3.9、3.13，macOS Python 3.13，以及前端、更新器和移动端资源/更新检查通过。此前本地后端 1760 项中 1715 通过、45 条件跳过；前端 664 项中 663 通过、1 平台跳过，分组不重复累计 |
+| macOS arm64 / Intel x64 | [正式发布构建](https://github.com/try2love/codex-mobile-bridge/actions/runs/38888357147)在对应原生运行器完成 DMG/ZIP、签名完整性、已打包 App 启动、网关鉴权、通知、HTTPS、配对及界面控制检查；更新成功与失败回滚后，配置字节和原可信手机会话认证均保持 |
+| Windows x64 | 同一发布工作流完成 NSIS/ZIP、安装后 GUI、二维码、原生/HTTP 终端、网关鉴权、通知、HTTPS 和配对检查；更新成功、失败回滚及旧工作目录恢复检查均保持配置与原可信手机会话 |
+| Linux x64 / ARM64 | 同一发布工作流完成各架构 deb/AppImage；原生运行器上的 deb 安装、AppImage 解包启动及打包网关检查通过。Linux 仍为实验性支持，使用安装包手动升级 |
+| 真实旧版桌面覆盖升级 | 在隔离 macOS arm64 环境中，使用从官方 v2.0.3 Release 下载并核验的旧 App，完成 2.0.3 → 2.1.0 实际替换；另一次注入替换失败后回滚到 2.0.3。两次均逐字节保留网关、桌面、通知及通知订阅配置，原扫码生成的可信手机 Cookie 仍通过认证。未替换日常 App 或数据 |
+| 旧数据兼容 | v2.0.3 和 v2.1.0-preview.1 的旧认证/配对实现分别生成隔离配置和可信手机会话；当前实现读取后，配置、Cookie 命名空间、可信会话、中继设备身份及绑定证明核验通过 |
+| Android | 正式 APK 为 2.1.0/build32，v2/v3 签名和资源校验通过，签名证书与 v2.0.3 相同；在隔离 Android 35 模拟器内从已发布 preview.1/build31 覆盖安装，已保存电脑、首次安装时间和同一可信网关会话保留，无需重新扫码登录 |
+| iOS | 同一正式发布工作流完成 2.1.0/build32 的未签名 IPA 与 Xcode 源码包构建、资源及版本检查；在 iOS 18.2 模拟器中，以官方 preview.1 源码编译 build31 并登录隔离网关，直接覆盖为 build32 后，电脑列表、当前电脑和原可信持久会话保留，首次打开无需重新登录。IPA 仍需用户自行签名 |
+| 发布资产 | 15 个附件均从 GitHub Release 读取并校验：13 个平台安装/源码包、签名更新清单及 SHA256SUMS；14 项载荷校验和匹配，桌面更新清单 Ed25519 签名、包大小和哈希核验通过 |
+
+本轮修正了 Windows 测试夹具读写中文源文件及桥接响应时依赖默认编码的问题，显式使用 UTF-8，没有因此改动产品行为。最终提交的独立 macOS 测试首轮在旧 DSH 夹具的全局 `time.monotonic` 模拟值用尽处失败；保留首次记录，同一提交、相同断言在新的运行器复验通过，对应 macOS 打包完整检查及本地定向检查也通过。不将复验结果描述为已修复该夹具的所有时序干扰。
+
+CI 与覆盖升级检查使用隔离配置、合成会话和测试绑定；前序 Windows/Linux 原生 CLI 以及用户手机实测证据按当时版本记录在下方。模拟器安装不代表任意 iPhone 签名工具或全部上游 CLI 版本。Android 应覆盖安装而非先卸载；iOS 需要使用相同签名身份及 Bundle ID 覆盖安装，才能保留应用数据。
+
+---
+
+## v2.1.0-preview.1 发布验收（2026-10-15）
+
+预览标签固定在 `195d0a3949068009300e7cf8dce13a52568750b7`，版本为 `2.1.0-preview.1`，Android/iOS 构建号为 31。发布使用独立预览分支；GitHub `main` 与 v2.0.3 稳定版保持原状。
+
+| 范围 | 本次发布证据 |
+| --- | --- |
+| 源码与移动端检查 | [精确标签测试](https://github.com/try2love/codex-mobile-bridge/actions/runs/38602320392)：Windows / Ubuntu 的 Python 3.9、3.13，macOS Python 3.13，以及桌面前端、更新器和移动端资源/更新检查通过 |
+| 桌面安装包 | [发布构建](https://github.com/try2love/codex-mobile-bridge/actions/runs/38602320477)：macOS arm64/x64、Windows x64、Linux x64/ARM64 的构建与各自工作流中的打包运行检查通过；Linux 检查包含 deb 安装和 AppImage 解包启动 |
+| iOS | 同一发布工作流完成 iPhone 未签名 IPA 与 Xcode 源码包构建、资源及版本检查；IPA 需用户自行签名 |
+| Android | APK 的版本、构建号、v2/v3 签名及 SHA-256 核验通过；证书与 v2.0.3 相同，保留覆盖安装身份。后续提交只改文档和验收脚本，Android 构建输入未变 |
+| 发布资产 | 完整下载并复核 15 个资产：13 个平台安装/源码包、签名更新清单和 SHA256SUMS；14 项载荷校验和匹配，桌面更新清单 Ed25519 签名及包大小/哈希匹配 |
+| 发布通道 | GitHub 标记为 prerelease，未设为 Latest；v2.0.3 的元数据、资产和 Latest 状态保持不变，远端 main 仍为 `25867f7` |
+
+CI 使用隔离数据及合成网关内容；Windows/Linux 原生 CLI 完整回复、权限、Goal、审批与冷恢复的实机证据见下方前序安装包验收。两类证据分别记录，不将 CI 夹具扩大为所有真实账号、上游版本或用户网络的兼容承诺。
+
+本次发布检查还修正了跨平台测试夹具中的路径、UTF-8 和错误信息契约，并替换 Windows GUI 验收脚本的回环 HTTP 读取方式，以避开 Node 24.21 内置 Undici 的连接结束断言。大响应完整读取与截断拒绝通过定向复现检查，最终 Windows 打包流程保留原有 GUI、鉴权、通知、HTTPS、配对和更新回滚检查。
+
+Windows Python 3.13 首轮在非法 Origin 上传拒绝检查中遇到一次 WinError 10053；仅在新的运行器复验同一提交与原断言后通过。保留首次失败记录，不将复验通过描述为已定位或修复该瞬时连接中断的根因。
+
+以下为按当时提交记录的历史准备与实机验收，不覆盖本节的最终发布结果。
+
+---
+
+## v2.1.0 集成基线与前序实机验收（2026-10-14，历史记录）
+
+本节记录产品代码合并至 `b5d1e57` 时的实机验收，以及此前 Windows/Linux Test 安装包与 CLI 矩阵。v2.0.4 阶段的文件阅读与 CLI 工作一并纳入 v2.1.0；下表和后续旧节保留当时的提交、结果与边界，最终发布状态以上方 `v2.1.0 正式发布验收` 为准。原 v2.0.3 发布 CI 不作为本轮通过证据。
+
+| 平台 / 通路 | 当时已实测范围 | 当时的边界记录 |
+| --- | --- | --- |
+| macOS Apple Silicon | 前序 arm64 Test 包构建、签名完整性、原生启动及 CLI/Web 联调；Codex 0.162.1、Claude Code 2.1.287 | 最终 `b5d1e57` 尚未重编 Mac 包；本地签名、未公证；不把原生 CLI 夹具当作全部日常账号/配置兼容证据 |
+| Intel Mac | 保留已有 x64 构建目标与共享实现 | 本轮未新增 Intel 原生运行或最终候选构建验收 |
+| Windows 10 x64 | `b895720` NSIS Test 安装/更新；已验收 GUI 的 APP/asar 字节保持一致；已安装 worker 的 16 项 CLI HTTP 检查全通过，包含恢复、模型/权限、Goal、审批及重启历史 | Windows 11 未实测；无 Windows ARM 包；ZIP 未独立启动；Test 未签名；未验收正式版升级/卸载 |
+| Ubuntu 22.04.5 x64（实验性） | `9f34ee0` deb Test 安装、GNOME GUI 和 16 项 CLI HTTP 检查全通过；保留正式版 | AppImage 只构建/静态校验；其他发行版与 Linux ARM64 未实测；Claude Desktop 自动连接不支持 |
+| 真实 Linux SSH | Codex 接入、冷恢复、新建、发送、权限与 Goal；Claude Code 恢复、新建、模型/权限、Skill、上传、审批拒绝、中断及写入者保护 | 仅列明的原生版本、服务器和隔离配置；不代表所有 SSH 环境；App 接管的 SSH 聊天仍不支持 Goal；另一用户不可达的 A/B/C 原故障未复现 |
+| Android | 前序测试 APK 构建/签名与模拟器文件阅读、诊断下载等指定流程通过；新 CLI 使用共享 Web | 最终合并后未重新构建/安装手机包；本轮安装包验收不含物理手机；原生双指手势未完成可靠注入验证 |
+| iOS | 前序 iOS 18.2 Simulator 完整构建/安装/启动及文件阅读检查；未签名 IPA 构建记录 | 最终合并后未重编；不等于物理 iPhone 或最终 WebView 诊断导出通过；原生快速滑动/双指手势需实机复验，IPA 需自行签名 |
+| Web 与已有 HTTPS 入口 | 前序中英文窄宽屏与隔离 HTTP/TLS、绑定恢复、安全拒绝检查；macOS 实际固定入口检测通过，检测成功会覆盖旧错误 | 不等于 Windows/Linux 真实公网代理或手机蜂窝聊天/文件全链路；任意代理的限流、缓冲和超时需实际确认 |
+
+macOS 前序 Claude 原生进程曾对已选认证和项目 `CLAUDE.md` 继承做隔离验证；合成请求与回环模型证据不等于真实付费上游或 OAuth 登录验收。
+
+Windows/Linux 原生 CLI 和 API 配置切换、失败回滚使用本机模拟服务，验证端点、模型、权限、历史和工具效果；未使用真实付费模型，也未完成桌面账号退出/重启与“同时应用到本机 CLI”的整条跨平台实测。SSH 始终保留服务器自身配置。测试版本为 Windows Codex `0.162.0-alpha.17.2` / Claude Code `2.1.168`，Linux Codex `0.160.0` / Claude Code `2.1.287`；不能推广到所有上游版本。
+
+Windows 最终包包含 `9f34ee0` 的状态读取修复及两项 Windows 专属修复；Ubuntu 已验证包为 `9f34ee0`，没有因仅作用于 Windows 的后续修复重复构建。合并后的产品源码与 Windows 候选源码一致，验收夹具与 `4c4b7cc` 一致；合并后定向检查 24 项通过、1 项 Windows 专属检查在 Mac 跳过，该路径检查已在真实 Windows 通过。分组测试存在重叠，不累加成独立总数。
+
+**预览版准备：**发行版本已统一为 `2.1.0-preview.1`，Android/iOS 构建号为 31；Android 沿用原签名。各平台发布构建、签名清单与完整资产检查由预览标签工作流完成。上表的 `2.0.3` Test 元数据属于前序实机验收产物，稳定版下载仍保留 v2.0.3。
+
+---
+
+## v2.1.0 Windows/Linux Test 安装包验收（2026-10-14，本地候选）
+
+先以本地源码 `104d11c` 构建 Windows x64 NSIS/ZIP 和 Linux x64 deb/AppImage，再以 `9f34ee0` 修订客户端状态读取；Windows 最终候选为包含后续原生记录与历史路径修复的 `b895720`，Ubuntu 已验收候选为 `9f34ee0`。构建元数据仍为 `2.0.3`。Test 使用独立包名、安装路径和应用标识；仅在构建副本中调整 Windows AUMID/登录启动项名称、Linux 自启动文件名，避免与正式版冲突。不是正式 v2.1.0 发布，未推送 GitHub。
+
+| 范围 | 已验证 | 尚未验证或限制 |
+| --- | --- | --- |
+| Windows 10 x64 安装与 GUI | 普通桌面用户完成首次 NSIS 安装及 `9f34ee0` Test 包 GUI 验收；原生启停、鉴权、静态资源、中文数据路径、语言记忆及关窗重开通过，英文 1100px/820px 无横向溢出。最终 `b895720` NSIS 更新通过，已安装 APP、asar、worker 哈希匹配候选；APP 与 asar 沿用已验收的相同字节，仅 worker 更新；正式版 2.0.2 的文件、注册信息及当时的七个进程保持不变 | 最终更新只复验历史与 CLI HTTP，不重复 GUI 操作。Test 包未签名；ZIP 已构建并校验，未独立启动；不代替 Windows 11、ARM64、正式版升级/卸载或物理手机验收 |
+| Ubuntu 22.04.5 x64 安装与 GUI | `9f34ee0` 独立 deb 重装成功，已安装 worker/asar 与候选包一致；正式版与 Test 文件路径无交集；真实 GNOME 桌面完成内置 worker 启停、鉴权、静态资源、语言记忆与关窗重开，客户端页正常加载；英文 1100px/820px 无横向溢出 | AppImage 完成构建与静态校验，未独立启动；未验证其他发行版或 ARM64 |
+| Ubuntu 已安装网关的 CLI HTTP 链路 | 原生 Codex 0.160.0、Claude Code 2.1.287：关闭后的会话列表/历史、显式恢复、模型与权限切换、下一回合实际模型、完整回复、Codex Goal 设置/清除、Claude 工具拒绝/允许及其文件效果、网关重启后的历史均通过；鉴权与 CSRF 拒绝、测试运行时退出通过 | `9f34ee0` 的 `d3104d` 运行：回环模拟 API；3 次 Codex、6 次 Claude 模型请求，13 次无关外部 CONNECT 被拦截；59 次 HTTP 请求，三次客户端状态 GET 为 7/2/2 ms。不代表真实付费接入、物理手机或任意上游版本 |
+| Windows 已安装网关的 CLI HTTP 链路 | `b895720` 的 `3bd284` 运行通过全部 16 项检查：鉴权/CSRF、两种 CLI 的关闭历史、显式恢复、模型与权限、完整回复、Codex Goal 设置/清除、Claude 工具拒绝/允许、重启后历史及自有运行时退出。原生 Codex 0.162.0-alpha.17.2、Claude Code 2.1.168；93 次 HTTP 请求，客户端状态 GET 最大 16 ms；正式版七个进程、文件和注册信息保持不变，Test 进程退出 | 普通桌面用户环境、回环模拟 API；3 次 Codex、6 次 Claude 模型请求，12 次无关外部 CONNECT 被拦截，无夹具拒绝。不代表真实付费接入、物理手机或任意上游版本 |
+
+后续源码候选 `9f34ee0` 将客户端状态 GET 改为展示快照加后台刷新，Web 在 `pending` 期间保留已有列表和操作结果未知标记；写操作继续实时核验。根复核通过 119 项 Python、35 项 Web 定向测试；修订 Ubuntu 安装包已完成上述验收，Windows 原有状态读取超时已在安装包中消除。Windows 后续候选 `2c15108` 仅在已确认 PID 不存在时允许缺少启动标识的已知 Claude 记录；活跃进程、查询不确定和非法记录仍阻断，记录不删除。该修复的 57 项 Claude 定向回归通过，随后安装包原问题回归及运行时退出均通过。候选 `b895720` 再修正 Windows 普通路径与扩展路径的等价目录核验；实际 Windows 四项回归通过，原失败会话已只读恢复且 SQLite、WAL、JSONL 哈希不变。最终安装包也通过原记录回归与完整重启历史复验。验收脚本按 Web 的 10 秒单次读取期限记录请求耗时，历史后台加载使用有界只读等待，HTTP 错误立即失败，不重发写操作。
+
+本轮 CLI 测试使用原生程序、隔离配置和回环模拟 API，不调用付费模型或修改日常账号。Linux 复验修正了测试脚本对最新用户消息、原生 CLI 来源标识及模型别名展开的处理，未因此改动已安装产品代码。安装包、截图和日志仅保存在本地及获准的设备测试目录，不提交仓库。下一节记录中的“未验证 GUI 安装包”是该阶段的历史边界；本节仅补充以上已完成项目。
+
+## v2.1.0 Windows/Linux CLI 适配（2026-10-14，本地候选）
+
+本轮从本地 main `33d1bbc` 建立独立分支，使用真实 Windows 10 x64、Linux x64 服务器和 Ubuntu 22.04.5 VMware 来宾机验收。以下结果只覆盖列明的原生版本与路径，不等同于所有平台正式发布通过；未推送 GitHub。
+
+| 范围 | 已验证 | 尚未验证或限制 |
+| --- | --- | --- |
+| Linux Codex CLI | 原生 0.160.0 经真实 SSH 完成被动历史、显式接入、新建、发送、权限确认、Goal 设置/清除与停止 daemon 后冷恢复；保留原 ID/provider/cwd | 使用隔离 CODEX_HOME 和回环假模型，不是所有版本、ARM64 或真实付费认证 |
+| Linux Claude Code | Ubuntu x64 原生 2.1.287 经真实 SSH 完成冷恢复、新建、发送、模型/权限、Skill、文件上传、审批拒绝、中断和再次恢复；本机/SSH 进程核验拒绝活跃写入者，退出与 PID 复用可区分 | 原生 CLI 配置与假 Key，未验证真实付费账号、完整 Linux 桌面安装包；Claude Desktop Linux 自动连接仍不支持 |
+| Windows Claude Code | 原生 2.1.168 经已安装的 npm `.cmd` 入口完成创建、两轮完整回复、关闭后恢复并回复、权限/模型/中断控制；工具拒绝无写入、允许仅写指定文件，精确匹配本次 tool_result 与最终回复；重复审批被拒，原生历史、配置、cwd、模型及进程退出通过；CP936 下中文历史正常 | 使用回环模拟 API；未验证真实付费账号、物理手机、完整 Windows GUI 安装包或其他版本登记格式；未知格式继续拒绝恢复 |
+| 两平台 API 账号切换 | Codex 与 Claude 分别验证 A/B 端点、假凭据和模型；注入 B 核验失败后恢复 A 文件，并通过后续原生请求确认 A 生效；成功切换 B 和任务/未知状态阻止切换通过 | 不改变日常账号；未测真实 OAuth 登录、付费模型或桌面 App 退出/重启整条同步链路。Windows Codex 使用已安装 MSIX 内同字节原生程序的隔离副本 |
+| Windows Codex daemon | 原生 0.162.0-alpha.17.2 在普通用户终端完成原会话接续、发送回合、权限生效、新建 CLI 聊天、Goal 设置/清除与停止 daemon 后冷恢复；原 ID/provider/cwd 保持一致；3 次模型请求均到回环接口，测试 daemon 已停止 | 使用已安装 MSIX 程序同字节副本和隔离托管目录，不证明仅安装 MSIX 就具备日常 CLI 托管目录；10 次无关外部连接被拦截。未验证真实付费账号、Windows GUI 安装包或全部上游版本 |
+| 固定入口反馈 | 先失败后成功、再次失败、轮询/语言切换、编辑地址、实例变化、并发结果丢弃的 65 项桌面定向测试通过；成功结果保留在入口卡片 | 不代替用户穿透节点和蜂窝网络的端到端测试 |
+| macOS Test 包交付 | 源码 `0f3af7f` 构建 arm64 Test App；深层严格签名、真实隔离界面与内置 worker 通过；替换 8788 后局域网登录、会话列表、CLI 配置和 5 项共享资源摘要一致；实际固定 HTTPS 入口检测通过 | 保留原配置、密码和绑定数据目录；正式 8787 的进程及实例不变；旧测试包已关闭清理。本地签名、未公证，仍沿用 2.0.3 构建元数据；手机蜂窝网络整条聊天链路待用户实测 |
+
+源码定向回归中，账号/Codex/资源检查 128 项通过；最终 Claude/资源/账号检查 83 项、Codex app-server 检查 5 项通过。桌面入口 65 项通过。分组有交叉，不合计为独立测试总数。补充 Windows 冷恢复修复后，CLI/app-server 定向 55 项通过。原生 Windows Claude 的 21 项结果检查通过，包括精确审批请求、原生历史、配置与目录，以及测试进程和监听端口关闭。
+
+原生测试均使用专用临时目录、合成会话和本机模拟 API。Ubuntu Claude 二进制来自官方 2.1.287 Linux x64 下载，按官方清单核验 SHA-256 后仅在获准目录执行。测试没有安装到系统 PATH、调用付费模型或修改日常认证。测试日志与运行环境信息保存在本地 `.tmp/cross-platform-cli-20261014/`，不提交；源码夹具位于 `tests/acceptance/`。正式 Windows/Linux 安装包、原生 GUI、ARM64 和手机设备仍需对应验收。
+
+## v2.1.0 网络入口与绑定安全（2026-10-14，本地候选）
+
+本轮从本地 main `bbfe6d4` 分支实现并集成。原 v2.0.4 候选内容并入 v2.1.0 待发布范围；下方历史记录保留当时版本名称与验证条件。公开版本仍是 v2.0.3，本轮未推送、打标签或发布；正式多平台构建未执行。
+
+| 范围 | 已验证 | 边界 |
+| --- | --- | --- |
+| 连接界面 | 真实 Electron 渲染器默认展开连接方式；已有穿透主表单只要求 HTTPS 地址，裸域名直接回车保存也补全协议；实际端口目标可复制，刷新和切换语言保留折叠状态；旧 NAS 的高级位置和上游保留 | 独立数据目录，无真实隧道启动；中英文 820/1100 像素均无横向溢出 |
+| 外部 HTTPS | external 只登记 publicUrl，允许关闭 LAN 与本机网页访问；固定地址、配对、通知、入口检测共用现有路径 | 用户管理穿透、DNS、证书，不安装或代管 frpc；不支持任意子路径 |
+| 访问安全 | 可信证书、错误上游、证书拒绝、重定向拒绝、精确 Host/Origin、CSRF、Secure/HttpOnly/SameSite Cookie 均验证；两条配置入口不能交叉 Origin | 公开 instanceId 仅核对路由，不授权凭据迁移；没有修改系统信任存储 |
+| HTTP 连接复用 | 打包验收发现拒绝响应关闭套接字但未发送关闭头；现已在关闭时发送 Connection: close，保留原错误状态；同一 HTTP 客户端在 403 后可正常请求公开入口，认证相关 41 项回归通过 | 不重试未知写入、不放宽入口限制 |
+| 绑定恢复 | 隔离 TLS 代理上的扫码可信绑定在真实网关服务重启后恢复，Cookie 名称稳定；退出和撤销后失效；原生源码检查保留按地址恢复和 HMAC 跨地址证明 | 未操作实体 Android/iPhone 的系统存储；并未新增跨入口恢复协议 |
+| 代理数据流 | 19 项本机 TLS 代理检查通过；已登录 SSE 状态事件通过；358400 字节合成文件长度和 SHA-256 一致 | 代理夹具只读取一个 SSE 事件；未验证长时间流、重连、真实终端或公网节点 |
+| 源码回归 | 后端 source-only 共 1674 项：1645 通过、29 条件跳过；首轮全量前端 633 项中 632 通过、1 跳过，套接字受限的 2 套夹具获准重跑通过；后续受影响前端 75 项通过 | 不能替代 Windows、Linux 或其他架构原生验收 |
+| 说明页 | 新增中英双语 external 指南，7 个连接选择项与面板匹配；中文 1100px、英文 390px 浏览器无横向溢出 | 在线网站尚未更新；本地指南与代码同批整理 |
+| macOS 测试包 | main `4cc839b` 编译 arm64 Test App，深层严格签名、隔离真实 UI 与内置 worker 通过；打包运行时关闭 LAN 和本机网页后，已登记公开 Host 的登录、Secure Cookie、Origin/CSRF 与拒绝后的连接复用均通过 | 本地签名、未公证；沿用 2.0.3 构建元数据，正式 v2.1.0 版本切换和多平台构建尚未执行 |
+| 8788 交付 | 新 Test App 使用保留的测试数据开启 LAN；局域网登录、CLI 被动历史、来源筛选、CLI 配置读取与 11 项共享资源摘要通过；正式 8787 的 PID 与实例保持不变 | 没有给用户原会话发送消息；公开穿透地址与手机蜂窝网络仍需用户实测 |
+
+本轮日志、TLS 夹具和截图保存于本地 `.tmp/network-entry-20261014/`，不提交 Git。手机蜂窝网络与具体穿透服务仍由后续实际测试确认，入口检测成功不等于聊天、终端和大文件的整条公网链路已验收。
+
+已只读核对 [issue #35](https://github.com/try2love/codex-mobile-bridge/issues/35)：所述提示由 Host 允许列表检查产生，与仅做端口映射而未登记公开入口的场景一致。该用户的实际请求头不可见，因此不能排除代理改写 Host 或丢失端口；配置指南同时覆盖这两种原因，未关闭安全校验，也未在 GitHub 评论或关闭 issue。
+
+## v2.1.0 前序 CLI 与界面反馈补录（2026-10-14）
+
+`bbfe6d4` 已整合按提供商归属的 CLI 账号面板、模型列表端点探测、Claude 本机/SSH 新建 CLI 会话、按实际库存出现的类型筛选和日期上方类型标签、Codex/Claude 列表对齐、Claude 上下文圆环，以及重置卡入口与下载阈值位置调整。记录补齐本轮网络改动之前的事实，不将旧测试计作本轮新证据。
+
+前序验证覆盖 320px 中英文、390px 手机壳布局与 1440px Web；已知和未知容量的上下文圆环、32px 操作栏对齐及详情通过。隔离原生 Claude Code 本机与回环 SSH 验证配置/目录/合成认证继承、新原生 session id、首次消息一次发送、JSONL 历史和上下文用量；使用本机假模型接口，不是远端 Linux 或付费调用验收。原生 SSH 操作、Skill、权限、上传、审批与中断的验证边界详见相应实现笔记。
+
+---
+
+## SSH CLI Goal、权限与 Claude Code 可行性（2026-10-14，v2.0.4 待发布）
+
+本节更新下节关于 CLI 权限与 SSH Goal 的限制。Goal 开放给已显式连接且原生协议支持的 SSH CLI；由远端 Codex App 持有的会话仍保持原 owner，不另开运行时。CLI 权限按当前执行连接处理，聊天按钮简写为“完全访问”，确认提示保留完整含义。
+
+| 范围 | 已验证 | 边界 |
+| --- | --- | --- |
+| 源码回归 | 后端 1574 项：1545 通过、29 跳过；前端 615 项：614 通过、1 跳过。最后权限窗口防串接修正后，后端定向 90 项、前端定向 32 项通过 | 首次受限运行无法绑定隔离 socket，随后在允许本地通信的环境重跑通过；跳过项不计通过 |
+| 原生 CLI 与 SSH | Codex CLI 0.162.1 经临时 OpenSSH 通道完成原生 Goal 创建、暂停、修改、恢复、清除与断线恢复；权限状态和后续模型请求均反映所选权限，Goal 创建及重连后恢复也遵循新权限 | SSH 目标为本机隔离环境，未代替 Linux 远程实机；模型服务仅返回本地预设响应，无外部推理费用 |
+| 权限边界 | 本机及 SSH CLI 读取同一 daemon 的策略；不以乐观 UI 冒充保存成功；旧权限窗口在会话、连接方式或连接状态变化后关闭，服务端拒绝不匹配的运行时 | 保留原 provider、认证、cwd 和 owner；未知写入结果不重发；不修改用户原聊天 |
+| 网页 | 真实页面完成请求批准与完全访问切换和确认；中文、英文 390 px 无横向溢出，Goal 入口可用，中文按钮显示“完全访问” | 本轮共享 Web 与后端更新，未重编手机原生壳；手机设备手测留给用户 |
+| Claude Code 研究 | 2.1.287 在独立 HOME、假 Key 与回环假服务下完成冷恢复、流式多轮、模型切换、权限切换、中断和工具审批拒绝；被拒绝命令未执行 | 未接入生产界面；真实认证、正常项目配置继承及任意活跃终端接管未验证。详见 [可行性核查](docs/claude-code-feasibility.md) |
+| macOS 测试包与交付 | 本地 main `5c15d2b` 编译 arm64 Test App，嵌套签名、隔离真实启动和内置 worker 验收通过；8788 LAN 登录、原 CLI 保存历史与现有 Desktop owner、权限等能力及 6 项资源摘要通过 | 本地签名、未公证，构建版本仍为 2.0.3；保留测试绑定数据，正式 8787 的 PID 与实例均未改变 |
+
+本轮各项独立分支已合并到本地 main，没有推送 GitHub。浏览器验收空间、合成会话进程及临时 SSH 服务/密钥已关闭或清理。Windows/Linux 原生实机和外部 SSH 服务器尚未新增实测。
+
+## CLI 模型、Skill、计划与 Goal（2026-10-14，v2.0.4 待发布）
+
+上一轮仅开放 CLI 的基础聊天操作，模型、Skill 和模式仍被来源限制拦住。本轮按实际执行进程开放所需能力，保留原 owner、提供商、认证与工作目录。
+
+| 范围 | 已验证 | 边界 |
+| --- | --- | --- |
+| 路由与能力 | App 接续的 CLI 使用已有 owner；原生 CLI 的目录、设置、Skill、计划及本机 Goal 使用同一 daemon；未接入时不激活目录读取，断线保留 Skill 草稿 | 不开放 CLI 权限设置、编辑/分支、重命名和侧边聊天；SSH Goal 仍禁用 |
+| 原生协议 | 隔离 macOS CLI 0.162.1 真实验证模型/effort 设置、Skill 输入、plan/default 回合，以及 Goal 创建、暂停、修改、恢复、清除；计划转 Goal 使用 default，修改后的目标到达原生执行请求 | 模型 Responses 服务仅在本机模拟，无外部推理费用；不据此宣称外部模型输出质量或其他平台已验证 |
+| 实际网页 | 浏览器点击修改模型、选择 Skill、计划发送及完整 Goal 操作通过；模型/effort/Skill 参数到达模拟服务；390 px 英文页面无横向溢出，权限仍禁用 | 手机原生壳未因本轮共享界面与后端修改重编，设备手测留给用户 |
+| 回归 | 后端 source-only 1565 项：1503 通过、62 跳过；前端 613 项：612 通过、1 跳过；最后 Goal 激活修复后，相关后端 116 项与前端 24 项通过 | 首次后端运行复现两项 Desktop catalog 回归并修复；系统 Python 缺少 Paramiko，最终使用既有完整依赖环境，未新增安装 |
+| 本地测试包 | macOS arm64 冻结构建、独立 Test App 打包、深层严格签名校验和隔离真实启动通过 | 未进行 Windows/Linux/SSH 原生平台验收；无 GitHub 上传 |
+| 8788 交付 | LAN 登录、原 CLI 来源会话的保存历史与现有 Desktop owner、四项控制能力、诊断及 6 项共享资源摘要通过；正式 8787 的进程和实例保持不变 | 仅只读检查用户原会话；沿用测试绑定数据，旧测试 App 退出并清理 |
+
+Goal 暂停不会中断当前回复；原生恢复可能立即继续执行，验收不把“回到空闲”误作 Goal 成功条件。发现并修复了模型设置空成功响应误报、重连状态丢失、断线 Goal 按钮重新启用及计划模式被 Goal 继承的问题。用户原会话未发送测试消息或修改设置。Windows、Linux 与不同 SSH 环境的原生交互尚未新增实测。仅本地修改，不推送 GitHub。
+
+## CLI 已有执行连接修复（2026-10-14，v2.0.4 待发布）
+
+上一轮原生 warm/cold 测试未覆盖“CLI 创建后由 Codex App 接续”的会话，不足以证明这类会话可操作。本轮修正来源与执行归属混淆：优先跟随经核验的现有 App owner，无 owner 时保留显式 CLI 恢复。
+
+| 范围 | 已验证 | 边界 |
+| --- | --- | --- |
+| 报错会话 | 真实本机只读 owner 查询成功；原生 daemon 对同一 ID 返回 notLoaded。修复后约 0.11 秒连接原 App owner，CLI 来源标记、可发送状态及保存历史保留，native attach 为零 | 没有向用户原会话发送测试消息或修改原数据库 |
+| 原生 writer | 隔离 CLI 0.162.1 的第二运行时恢复复现 active-writer 拒绝；原持有者可正常重新接入 | 没有模型调用，没有复制 auth/config；测试进程均已清理 |
+| CLI-only | 在真实 Desktop IPC 可用但无该测试会话 owner 的情况下，查询超时后显式原生冷恢复通过 | 使用项目 .tmp 测试历史；没有模型调用；测试 daemon 已关闭 |
+| 路由与回归 | 既有 App owner 发送目标、cwd/provider/host 核验、双向迟到事件、并发连接、断线及分页历史回归通过；后端 source-only 1549 项：1487 通过、62 跳过；前端 611 项最终 610 通过、1 跳过 | 前端首次有两项受 loopback 沙箱限制，单独放行重跑通过；不把跳过计为通过 |
+| 本地构建 | macOS arm64 Test App 冻结构建、打包、深层严格签名校验、隔离真实启动及内置 worker 加载通过 | 手机原生壳无需因本次后端修复重编；Windows/Linux/SSH 原生平台未新增实机验收 |
+| 8788 打包验收 | 新测试包实际 LAN 登录、用户原 CLI 聊天历史与 Desktop owner 连接、连接诊断和 5 项共享资源摘要通过；8787 PID 与实例保持不变 | 保留测试绑定数据；旧测试包退出并清理，没有向用户原会话发送测试消息 |
+
+仅本地修改与合并，不推送 GitHub。CLI 来源的模型/权限、目标与编辑等操作仍维持此前限制。协议 writer 锁由原生运行时管理；本轮不清锁、不关闭现有持有者。详见 [CLI 接入说明](docs/codex-cli.md) 和 [路由决定](.agents/notes/implemented/bug-fix/2026-10-14-cli-existing-owner.md)。
+
+---
+
+## CLI 关闭终端后继续（2026-10-14，v2.0.4 待发布）
+
+本节更新下节“已有运行环境接入”的限制：显式“继续会话”现在允许恢复未加载聊天，并在需要时启动同一 CODEX_HOME 中已安装的原生托管 daemon。不会自动安装 CLI 或改动日常项目的信任设置。
+
+| 范围 | 已验证 | 边界 |
+| --- | --- | --- |
+| 真实 CLI | macOS CLI 0.162.1，真实 TUI 创建隔离聊天；原终端退出且聊天卸载后恢复成功；daemon 停止后冷启动恢复成功；同一 ID 发送、流式回复、防重复提交和 provider/model/cwd 保持通过；完成事件后用户消息保留的修正也经真实 CLI 复验；重新打开 TUI 可见两次网关回复且 daemon PID 不变 | 用户原有聊天只读核验，没有发送测试消息；信任和凭据副本只用于项目 .tmp 隔离配置 |
+| Web | 真实 HTTP 页面点击“继续会话”冷启动成功、发送后收到 CLI_WEB_RESUME_OK；设置中可读诊断摘要、复制和触发导出 | 一次原生请求响应较慢，随后自行完成，没有自动重发；不把验收作为延迟保证 |
+| 回归 | 后端 source-only 1537 项：1475 通过、62 跳过；终审补充后 CLI/服务/SSH/协议定向 43 项通过；完整前端 611 项：610 通过、1 跳过 | 跳过不计通过；平台边界不因夹具通过而消失 |
+| 原生诊断下载 | Android Java 与 iOS Swift Foundation 实际 HTTP 下载测试通过，包括精确来源/路径校验及动态部分报告禁止续传；中继双电脑隔离与鉴权通过；Android 模拟器真实 App 登录、查看诊断、点击导出并完成 346 B JSON 下载通过 | iOS 本轮只完成模拟器安装启动及 Foundation 下载联调，未复验 WebView 导出点击；未验收系统分享/保存面板 |
+| 构建 | macOS arm64 Test App 编译、嵌套签名、真实启动和内置 worker 通过；Android APK 构建/签名、iOS 模拟器完整构建/安装/启动、iOS 未签名 IPA 构建通过 | Test 本地签名、未公证；IPA 需自行签名安装。仍沿用 2.0.3 构建元数据，未发布 v2.0.4 |
+| 8788 实测入口 | 保留原测试绑定数据，重启后 LAN 登录、用户原 CLI 聊天被动历史、诊断目标状态和 5 个共享资源摘要核对通过 | 正式 8787 PID 与实例保持不变；Windows/Linux 及任意 SSH 主机的冷恢复尚未实机验收 |
+
+SSH proxy 在 PATH 无 CLI 时使用已选托管程序的 shell 夹具测试通过；这不代替远端实机测试。详细行为与限制见 [CLI 接入说明](docs/codex-cli.md)。本轮仅本地合并，没有推送 GitHub。
+
+---
+
+## Codex CLI 接入本地验收（2026-10-14，v2.0.4 待发布）
+
+| 范围 | 已验证 | 边界 |
+| --- | --- | --- |
+| 已有 CLI 历史 | 用户提供的本机会话可被 SessionStore 发现并只读读取；CLI 标记、旧 schema 与子任务排除回归通过 | 没有向该用户会话发送测试消息 |
+| 原生运行环境 | macOS Codex CLI 0.162.1 的隔离 TUI 会话：被动阅读不建原生连接，显式接入、发送、流式回复、重复提交保护通过；提供商、模型、cwd 保持一致 | 测试目录信任经用户明确授权，仅保存于隔离 CODEX_HOME；未改日常信任设置 |
+| 浏览器 | 真实 HTTP 网关中文/英文界面；390px 无横向溢出；只读/已连接能力区分、发送、停止、诊断下载通过；官方原生 thread/read 确认最后任务为 interrupted | 审批与问题卡的数字 ID、未知结果和并发防重发由协议/服务夹具验证，未据此宣称所有真实 MCP 审批都已联调 |
+| SSH | 当前可达的已配置服务器可读会话来源计数，并可只读连接已有 daemon、列出已加载会话 | 未发送远端任务；另一用户 A/B/C 不可达，不能声称复现或确认修复其特定故障 |
+| 回归 | Python 完整 1528 项，26 跳过、无失败；Desktop/Web 完整 609 项，608 通过、1 跳过。最终连接读取线程修复后，29 项原生协议与服务集成定向测试全部通过 | 原生平台限制仍以当前 macOS 环境为准；不替代 Windows/Linux 实机验收 |
+| macOS Test App | arm64 Test App 重新打包，嵌套签名、真实 App 启动与内置 worker 通过 | 本地测试签名、未公证；版本仍沿用候选代码的 2.0.3 元数据，未发布 v2.0.4 |
+| 最终测试入口 | 独立 Test App 在 8788 开启局域网访问；实际登录、原 CLI 会话列表与被动历史读取、诊断目标状态均通过；5 个共享界面资源与源码摘要一致 | 正式 8787 网关保留原进程和实例；只读核验未向用户原会话发消息 |
+| 手机 App | 本次 CLI 改动均在网关与共享 Web，未修改 Android/iOS 原生代码；浏览器窄屏交互已验证 | 本次 iOS Simulator UI 控制无响应，未进入 App、未完成 WebView 复验；不计为通过。Android 本轮未重新验收，需用户用现有测试 App 实测 |
+
+现有 daemon 的显式接入使用上游 `thread/resume`。该接口无原子 loaded-only 条件，核验后恰逢卸载仍可能冷恢复同一会话；不把预检查描述为绝对 owner 保证。完整功能限制见 [CLI 接入说明](docs/codex-cli.md)。本轮未推送 GitHub。
+
+---
+
+## v2.0.4 本地优化验收（2026-10-13，待发布）
+
+范围为 v2.0.3 后的文件目录返回、Claude 手动额度、源码阅读、PDF/HTML 预览及后续文件头、全屏和 PDF 绘制优化。最终代码为本地 main `077d9c2`，PDF 连续绘制修复为 `a91842a`。用户已确认本轮测试通过。当前安装包版本仍为 2.0.3；v2.0.4 为待发布文档版本，尚未统一构建版本、推送、打标签或发布。
+
+| 范围 | 已完成的验证 | 边界 |
+| --- | --- | --- |
+| 自动回归 | 最终 Node 603 项：602 通过、1 跳过、无失败；PDF 定向 20/20。四项集成的后端 source-only 回归 1495 项：1466 通过、29 跳过、无失败，此后 PDF 修复未改后端 | source-only 不执行原生平台夹具；跳过项不计通过 |
+| 目录返回 | 合成目录 `src/lib → src → 根 → 聊天`，Codex 顶部按钮、共享返回、快速返回与迟到响应保护覆盖；iOS 模拟器逐级返回通过 | 未据此宣称所有系统历史手势均已覆盖 |
+| Claude 额度 | 验证被动读取不解密或联网，显式查询才刷新，失败及不识别的响应保留成功快照和原时间；中英文状态通过 | 使用模拟数据；未实际调用用户账号额度接口，不代表全部钥匙串问题已修复 |
+| 源码与布局 | 320/390px 中英文文件头、源码高亮/行号、长行换行、未知语言及超限退化；中文、CRLF、NBSP 和复制原文一致 | 只读源码视图；本轮未改终端颜色或光标 |
+| PDF 与全屏 | Chromium 验证中文文字层、扫描页、损坏/超限、混合页宽、标签往返和全屏位置；触摸仿真双指缩放 100%→200%，页面整体比例保持 1 | 首次打开或跳到未绘制远页仍需加载；扫描件无 OCR |
+| PDF 闪屏修复 | 延迟绘制、取消旧任务、恢复原比例文字层、邻页复用、逐次提交预算回归通过。前台 Chromium 在 6 倍 CPU 限速下快速缩放：修复前短采样 4 帧中 2 帧无可见画布，修复后 7 帧未观察到空白或黑色画布；最终邻页返回复用原 canvas | 短采样验证呈现顺序，不作为帧率基准或任意文档零闪烁保证；单阅读器完成画布约 12 MP、额外绘制约 4 MP，不是全部内存上限 |
+| HTML 隔离 | 内联交互/动画、源码切换、全屏状态及标签返回重载通过；cookie、storage、父页与宿主桥访问受阻，网络、表单和跳顶层检查未到达合成目标 | 仅自包含文件；不支持外部资源与后端依赖 |
+| Android | 测试 APK 构建与签名校验通过；模拟器混合 PDF 单指滑动、全屏、标签往返位置与 HTML 重新挂载通过 | 模拟器未完成原生双指注入；非正式发布 APK 验收 |
+| iOS | Xcode 16.2 + iOS 18.2 Simulator 完整构建、安装和运行；首次连接/重连、源码换行、中文与混合尺寸 PDF、HTML 隔离、全屏、大小限额与目录返回通过。闪屏修复后复验 PDF 显示和全屏 | 本轮未新装物理 iPhone；模拟器自动化未可靠验证原生快速滑动或双指手势。用户总体确认不扩展为逐机型、逐手势矩阵 |
+| macOS 测试包 | arm64 测试 App 的架构、嵌套签名、内置运行时、HTTPS 与实际隔离启动通过；更新后的测试网关资源与最终源码一致，配置保留 | 本地测试签名、未公证；正式运行网关保持原进程和实例 |
+
+正式发布前仍需统一版本并完成 Windows x64、macOS arm64/x64、Linux x64/arm64、Android 和 iOS 的对应发布构建、签名/完整性及适用验收。不能复用下方 v2.0.3 CI 结果作为本轮正式构建通过的证据。
+
+---
+
 ## v2.0.3 正式版验证（2026-10-13）
 
 本节记录 v2.0.3 的用户验收、源码回归和原生平台构建结果。桌面、Android、iOS 版本统一为 2.0.3，Android/iOS 构建号为 30。下表为优化期间的用户验收，正式构建检查列于其后。

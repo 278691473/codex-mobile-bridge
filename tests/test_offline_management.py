@@ -31,6 +31,9 @@ class OfflineManagement(unittest.TestCase):
         discovery = patch('bridge.clients.discovery.discover_clients', return_value=self.discovered)
         self.scan = discovery.start()
         self.addCleanup(discovery.stop)
+        wsl_running = patch('bridge.platforms.windows.wsl.running_distributions', return_value=[])
+        self.wsl_running = wsl_running.start()
+        self.addCleanup(wsl_running.stop)
 
     def add_api(self):
         return self.desktop.accounts({'action': 'addApi', 'name': 'Local fixture API',
@@ -68,6 +71,7 @@ class OfflineManagement(unittest.TestCase):
             {'action': 'accounts', 'payload': {'action': 'addApi', 'name': 'Stream fixture',
                 'baseUrl': 'https://upstream.invalid/v1', 'apiKey': 'private-stream-key', 'model': 'fixture'}},
             {'action': 'accounts', 'payload': {'action': 'list'}},
+            {'action': 'cli-access', 'payload': {'action': 'list'}},
         ]
         result = subprocess.run([sys.executable, '-B', str(ROOT/'desktop.py'), 'management-stream',
                                  '--data-dir', str(self.root)],
@@ -75,9 +79,16 @@ class OfflineManagement(unittest.TestCase):
                                 capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         responses = [json.loads(line) for line in result.stdout.splitlines()]
-        self.assertEqual(len(responses), 2)
+        self.assertEqual(len(responses), 3)
         self.assertTrue(all(response['ok'] for response in responses), responses)
         self.assertEqual(responses[0]['result']['accounts'], responses[1]['result']['accounts'])
+        codex_accounts = responses[2]['result']['codex']['accounts']
+        self.assertEqual(len(codex_accounts), 1)
+        identity = codex_accounts[0]['modelCatalogIdentity']
+        self.assertEqual(len(identity), 64)
+        self.assertTrue(all(character in '0123456789abcdef' for character in identity))
+        self.assertEqual([{key: value for key, value in row.items() if key != 'modelCatalogIdentity'}
+                          for row in codex_accounts], responses[1]['result']['accounts'])
         self.assertNotIn('private-stream-key', result.stdout)
         self.assertFalse((self.root/'gateway-control.json').exists())
 

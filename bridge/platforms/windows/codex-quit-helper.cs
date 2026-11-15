@@ -12,10 +12,6 @@ class CodexQuit {
     [DllImport("user32.dll")] static extern bool IsWindow(IntPtr window);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr window);
     [DllImport("user32.dll")] static extern bool IsWindowEnabled(IntPtr window);
-    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr window,int command);
-    [StructLayout(LayoutKind.Sequential)] struct LastInput {public uint size,tick;}
-    [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LastInput value);
     [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr window,uint command);
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window,out uint pid);
     [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr window,StringBuilder value,int size);
@@ -27,6 +23,13 @@ class CodexQuit {
     [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindow callback,IntPtr data);
 
 
+    [DllImport("user32.dll")] static extern bool AllowSetForegroundWindow(uint pid);
+    [DllImport("user32.dll")] static extern IntPtr SendMessageTimeout(IntPtr window,uint message,IntPtr wparam,IntPtr lparam,uint flags,uint milliseconds,out IntPtr receipt);
+    [DllImport("user32.dll")] static extern bool PostMessage(IntPtr window,uint message,IntPtr wparam,IntPtr lparam);
+    [StructLayout(LayoutKind.Sequential)] struct IconId {public uint size;public IntPtr hwnd;public uint id;public Guid guid;}
+    [StructLayout(LayoutKind.Sequential)] struct Rect {public int left,top,right,bottom;}
+    [DllImport("shell32.dll")] static extern int Shell_NotifyIconGetRect(ref IconId id,out Rect rect);
+    static bool tray;
     static string executable,cancelFile;
     static readonly int session=Process.GetCurrentProcess().SessionId;
     static string Json(string text) {return "\""+text.Replace("\\","\\\\").Replace("\"","\\\"").Replace("\r","\\r").Replace("\n","\\n").Replace("\t","\\t")+"\"";}
@@ -67,7 +70,6 @@ class CodexQuit {
     sealed class Operation {
         readonly object gate=new object();bool cancelled;
         public volatile bool Submitted,Finished;public Exception Error;public string State,Reason;
-        public IntPtr RestoredWindow;public uint InputTick;public bool InputKnown;
         public void Cancel() {lock(gate){cancelled=true;}}
         public void Check() {lock(gate){if(cancelled||cancelFile!=null&&File.Exists(cancelFile))throw new OperationCanceledException("已取消 Codex 退出");}}
         public void Dispatch(int pid,Action invoke) {
@@ -80,7 +82,7 @@ class CodexQuit {
             invoke();
         }
         public void Start(Process process,long started) {
-            var thread=new Thread(delegate() {try {Quit(process,started,this);}catch(Exception error){Error=error;}finally{Finished=true;}});
+            var thread=new Thread(delegate() {try {if(tray)QuitTray(process,started,this);else Quit(process,started,this);}catch(Exception error){Error=error;}finally{Finished=true;}});
             thread.IsBackground=true;thread.SetApartmentState(ApartmentState.MTA);thread.Start();
         }
     }
@@ -91,21 +93,6 @@ class CodexQuit {
             uint pid;GetWindowThreadProcessId(window,out pid);
             if(!IsWindow(window)||pid!=process.Id)throw new Exception("Codex 主窗口已变化，退出请求已停止");
         }
-    }
-    static bool ReadLastInput(out uint tick) {
-        var value=new LastInput {size=(uint)Marshal.SizeOf(typeof(LastInput))};bool known=GetLastInputInfo(ref value);tick=value.tick;return known;
-    }
-    static void RestoreHidden(Process process,long started,Operation operation) {
-        if(operation.Submitted||operation.RestoredWindow==IntPtr.Zero||!operation.InputKnown)return;
-        try {
-            uint tick;if(!Owned(process,started)||!ReadLastInput(out tick)||tick!=operation.InputTick)return;
-            var windows=Windows(process.Id);if(PendingDialog(windows))return;
-            Window selected=null;foreach(var window in windows)if(window.Handle==operation.RestoredWindow)selected=window;
-            if(selected==null||!MainShape(selected)||!selected.Visible||GetForegroundWindow()==selected.Handle)return;
-            uint pid;GetWindowThreadProcessId(selected.Handle,out pid);
-            if(pid!=process.Id||!Owned(process,started)||!ReadLastInput(out tick)||tick!=operation.InputTick||GetForegroundWindow()==selected.Handle)return;
-            ShowWindow(selected.Handle,0);
-        } catch(Exception) {} // Keeping a window visible must not alter quit evidence.
     }
     static bool Available(AutomationElement item,int pid) {return item!=null&&item.Current.ProcessId==pid&&item.Current.IsEnabled&&!item.Current.IsOffscreen;}
     static AutomationElement Unique(AutomationElement root,Condition condition,int pid) {
@@ -155,47 +142,93 @@ class CodexQuit {
         }
         return result;
     }
+    static void QuitTray(Process process,long started,Operation operation) {
+        // Electron's notification icon HWND belongs to this process. Open only its
+        // registered icon menu; do not send keyboard input or click screen positions.
+        Window host=null;
+        var before=Windows(process.Id);
+        if(PendingDialog(before))throw new Exception("请先处理 ZCode 的确认窗口");
+        foreach(var window in before)if(window.ClassName=="Electron_NotifyIconHostWindow") {
+            if(host!=null)throw new Exception("ZCode 托盘窗口不唯一");host=window;
+        }
+        if(host==null)throw new Exception("找不到 ZCode 的原生托盘菜单");
+        Action check=()=>Check(process,started,operation,host.Handle);
+        check();
+        // Electron allocates increasing IDs for an app's tray entries. Explorer
+        // returns S_FALSE for a registered icon in the overflow area.
+        uint selected=0;Rect rect;
+        for(uint id=2;id<=32;id++){
+            var icon=new IconId {size=(uint)Marshal.SizeOf(typeof(IconId)),hwnd=host.Handle,id=id};
+            int code=Shell_NotifyIconGetRect(ref icon,out rect);
+            if(code!=0&&code!=1)continue;
+            if(selected!=0)throw new Exception("ZCode 的原生托盘图标不唯一");
+            selected=id;
+        }
+        if(selected==0)throw new Exception("ZCode 托盘图标未注册");
+        check();
+        // Electron's tray callback asks Windows to foreground its own menu HWND.
+        // Pass only this PID the caller's existing foreground grant, if any.
+        AllowSetForegroundWindow((uint)process.Id);
+        IntPtr receipt;
+        if(SendMessageTimeout(host.Handle,0x8001,new IntPtr(selected),new IntPtr(0x0204),0x22,1500,out receipt)==IntPtr.Zero||receipt!=new IntPtr(1))
+            throw new Exception("ZCode 未确认打开托盘菜单，尚未请求退出");
+        IntPtr popup=IntPtr.Zero;
+        Func<AutomationElement> find=()=>{
+            AutomationElement quit=null;
+            foreach(var window in Windows(process.Id)){
+                if(!window.Visible||window.Cloaked||before.Exists(previous=>previous.Handle==window.Handle&&previous.Visible))continue;
+                if(window.ClassName!="#32768"&&!window.ClassName.StartsWith("Chrome_WidgetWin_",StringComparison.Ordinal))continue;
+                var root=AutomationElement.FromHandle(window.Handle);
+                var items=root.FindAll(TreeScope.Descendants,new PropertyCondition(AutomationElement.ControlTypeProperty,ControlType.MenuItem));
+                bool zcodeMenu=false;
+                foreach(AutomationElement item in items)if(Available(item,process.Id)&&
+                    (item.Current.Name=="打开 ZCode"||item.Current.Name=="Open ZCode"))zcodeMenu=true;
+                if(!zcodeMenu)continue;
+                foreach(AutomationElement item in items){
+                    if(!Available(item,process.Id)||(item.Current.Name!="退出"&&item.Current.Name!="Quit"))continue;
+                    if(quit!=null)throw new Exception("ZCode 退出菜单项不唯一");
+                    quit=item;popup=window.Handle;
+                }
+            }
+            return quit;
+        };
+        try{
+            var item=Wait(find,check,3500);
+            var current=find();object invoke;
+            if(current==null||!Automation.Compare(item,current)||!current.TryGetCurrentPattern(InvokePattern.Pattern,out invoke))
+                throw new Exception("ZCode 退出菜单已变化，尚未请求退出");
+            check();Check(process,started,operation,popup);
+            operation.Dispatch(process.Id,()=>((InvokePattern)invoke).Invoke());
+            operation.State="submitted";operation.Reason="已请求 ZCode 正常退出，请在电脑端处理可能出现的确认";
+        }finally{
+            if(!operation.Submitted&&popup!=IntPtr.Zero&&Owned(process,started)){
+                uint owner;GetWindowThreadProcessId(popup,out owner);
+                if(owner==process.Id)PostMessage(popup,0x001f,IntPtr.Zero,IntPtr.Zero);
+            }
+        }
+    }
     static void Quit(Process process,long started,Operation operation) {
         Action check=()=>Check(process,started,operation,IntPtr.Zero);
-        var timer=Stopwatch.StartNew();bool restored=false;IntPtr main=IntPtr.Zero;
-        while(main==IntPtr.Zero) {
-            check();var windows=Windows(process.Id);
-            if(PendingDialog(windows)){operation.State="pending";operation.Reason="Codex 有待处理的原生对话框，请在电脑端确认或取消";return;}
-            foreach(var window in windows)if(MainWindow(window)) {
-                if(main!=IntPtr.Zero)throw new Exception("Codex 主窗口不唯一，请在电脑端检查后重试");main=window.Handle;
-            }
-            if(main!=IntPtr.Zero)break;
-            if(!restored) {
-                Window hidden=null;
-                foreach(var window in windows)if(!window.Visible&&MainShape(window)) {
-                    if(hidden!=null)throw new Exception("Codex 隐藏主窗口不唯一，请在电脑端打开应用后重试");hidden=window;
-                }
-                if(hidden==null)throw new Exception("找不到可信 Codex 隐藏主窗口，请在电脑端打开应用后重试");
-                Check(process,started,operation,hidden.Handle);
-                operation.InputKnown=ReadLastInput(out operation.InputTick);operation.RestoredWindow=hidden.Handle;restored=true;
-                // Restore only the existing HWND without activation. Starting
-                // the executable could accidentally create a different profile.
-                ShowWindow(hidden.Handle,4);
-                Check(process,started,operation,hidden.Handle);
-            }
-            if(timer.Elapsed.TotalSeconds>=8)throw new Exception("Codex 隐藏主窗口尚未就绪，请在电脑端打开后重试");Thread.Sleep(100);
+        var timer=Stopwatch.StartNew();IntPtr main=IntPtr.Zero;
+        check();var windows=Windows(process.Id);
+        if(PendingDialog(windows)){operation.State="pending";operation.Reason="Codex 有待处理的原生对话框，请在电脑端确认或取消";return;}
+        foreach(var window in windows)if(MainWindow(window)) {
+            if(main!=IntPtr.Zero)throw new Exception("Codex 主窗口不唯一，请在电脑端检查后重试");main=window.Handle;
         }
+        if(main==IntPtr.Zero)throw new Exception("没有可后台调用的 Codex 退出入口，尚未提交；请在电脑端正常退出");
         check=()=>Check(process,started,operation,main);
         check();var root=AutomationElement.FromHandle(main);
-        var file=Wait(()=>Unique(root,new AndCondition(new PropertyCondition(AutomationElement.ControlTypeProperty,ControlType.MenuItem),
-            new PropertyCondition(AutomationElement.AutomationIdProperty,"application-menu-trigger-file-menu")),process.Id),check,3000);
+        var condition=new PropertyCondition(AutomationElement.AutomationIdProperty,"application-menu-content");
+        var content=Unique(root,condition,process.Id);
+        var exit=content==null?null:FindQuit(content,process.Id);
+        if(exit==null)throw new Exception("没有可后台调用的 Codex 退出入口，尚未提交；请在电脑端正常退出");
         object pattern;
-        if(!file.TryGetCurrentPattern(ExpandCollapsePattern.Pattern,out pattern))throw new Exception("Codex 文件菜单不支持正常展开，尚未提交退出");
-        check();if(PendingDialog(Windows(process.Id))){operation.State="pending";operation.Reason="Codex 有待处理的原生对话框";return;}
-        ((ExpandCollapsePattern)pattern).Expand();
-        var content=Wait(()=>Unique(root,new PropertyCondition(AutomationElement.AutomationIdProperty,"application-menu-content"),process.Id),check,3000);
-        var exit=Wait(()=>FindQuit(content,process.Id),check,3000);
         if(!exit.TryGetCurrentPattern(InvokePattern.Pattern,out pattern))throw new Exception("Codex 退出菜单不支持正常调用，尚未提交退出");
         check();
         if(PendingDialog(Windows(process.Id))){operation.State="pending";operation.Reason="Codex 有待处理的原生对话框";return;}
-        var current=FindQuit(content,process.Id);
-        if(current==null||!Automation.Compare(current,exit)||!Available(file,process.Id)||
-            ((ExpandCollapsePattern)file.GetCurrentPattern(ExpandCollapsePattern.Pattern)).Current.ExpandCollapseState!=ExpandCollapseState.Expanded)
+        var currentContent=Unique(AutomationElement.FromHandle(main),condition,process.Id);
+        var current=currentContent==null?null:FindQuit(currentContent,process.Id);
+        if(!IsWindowVisible(main)||current==null||!Automation.Compare(currentContent,content)||!Automation.Compare(current,exit))
             throw new Exception("Codex 退出菜单已变化，尚未提交退出");
         check();operation.Dispatch(process.Id,()=>((InvokePattern)pattern).Invoke());
         timer.Restart();
@@ -220,12 +253,12 @@ class CodexQuit {
         Console.OutputEncoding=new UTF8Encoding(false);int pid=0;Operation operation=null;
         try {
             if(args.Length==1&&args[0]=="--self-check"){SelfCheck();return 0;}
-            if((args.Length!=4&&args.Length!=5)||args[1]!="--quit")throw new Exception("Codex 退出参数无效");
-            pid=Int32.Parse(args[0]);executable=Path.GetFullPath(args[2]);long expectedFileTime=Int64.Parse(args[3]);cancelFile=args.Length==5?args[4]:null;
+            if((args.Length!=4&&args.Length!=5)||(args[1]!="--quit"&&args[1]!="--quit-zcode"))throw new Exception("Codex 退出参数无效");
+            tray=args[1]=="--quit-zcode";pid=Int32.Parse(args[0]);executable=Path.GetFullPath(args[2]);
+            if(tray&&!String.Equals(Path.GetFileName(executable),"ZCode.exe",StringComparison.OrdinalIgnoreCase))throw new Exception("ZCode 程序身份无效");long expectedFileTime=Int64.Parse(args[3]);cancelFile=args.Length==5?args[4]:null;
             using(var process=Process.GetProcessById(pid)) {
                 if(expectedFileTime<=0||process.StartTime.ToFileTimeUtc()!=expectedFileTime)throw new Exception("Codex 启动身份已变化，退出请求已停止");
                 long started=process.StartTime.ToUniversalTime().Ticks;operation=new Operation();
-                try {
                 Check(process,started,operation,IntPtr.Zero);operation.Start(process,started);var timer=Stopwatch.StartNew();
                 while(!operation.Finished&&timer.Elapsed.TotalSeconds<20) {
                     if(cancelFile!=null&&File.Exists(cancelFile)){operation.Cancel();break;}Thread.Sleep(50);
@@ -233,7 +266,6 @@ class CodexQuit {
                 if(!operation.Finished) {operation.Cancel();throw new Exception("Codex 原生退出菜单操作已取消或超时");}
                 if(operation.Error!=null)throw operation.Error;
                 Reply(operation.State,pid,operation.Reason);return 0;
-                } finally {RestoreHidden(process,started,operation);}
             }
         } catch(Exception error) {
             bool submitted=operation!=null&&operation.Submitted;

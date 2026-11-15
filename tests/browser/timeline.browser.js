@@ -27,8 +27,11 @@ async function runTimelineTests() {
   check(timeline.nodes.get('k319').node.firstChild.textContent==='CODEX · gemini-pro high','New reply shows its own model and effort');
   check(timeline.nodes.get('k317').node.firstChild.textContent==='CODEX','Missing historical model is not guessed');
   check(meta.requests[0].id==='pending','Approval metadata arrives with first page');
+  await frame();await frame();
+  check(pending.length===0,'Opening does not prefetch older history');
+  timeline.loadOlder(80);
   await until(()=>pending.length===1);
-  check(pending[0].limit===80,'Quiet backfill requests only 80 more');
+  check(pending[0].limit===80,'Explicit history read uses the requested page size');
   timeline.loadOlder(100);timeline.loadOlder(100);
   check(pending.length===1,'Only one history request in flight');
   pending.shift().resolve(page(220,300));
@@ -81,6 +84,7 @@ async function runTimelineTests() {
   };
   const second=new ChatTimeline({url:action=>'/fixture/'+action+'?host=local',request:detailRequest,renderMeta:()=>{},renderText:(node,text)=>{const p=document.createElement('p');p.textContent=text;node.append(p);},status:()=>{}});
   second.apply({...page(1,2,4),rows:[long]},true);
+  second.loadOlder(100);
   await until(()=>second.retryCount>0);
   check(second.older.textContent===timelineText('历史加载失败，点击重试'),'Failed history exposes a retry button');
   fail=false;await second.loadOlder(100);
@@ -141,8 +145,10 @@ async function runTimelineVisibilityTests() {
   const backfill=new ChatTimeline({url:action=>'/fixture/'+action+'?host=local',request:async()=>{requested++;return page(rows);},renderMeta:()=>{},renderText:(node,text)=>node.textContent=text,status:()=>{}});
   backfill.setVisibility({showReasoning:false,showProcess:false});requested=0;
   backfill.apply(page([{...rows[2],key:'latest-command',order:20}],4,true),true);
-  for(let i=0;i<10&&(!requested||backfill.busy);i++)await frame();
-  check(requested===1&&!backfill.nodes.get('final').node.hidden,'A page of hidden activity backfills earlier replies');
+  await frame();await frame();
+  check(requested===0,'Hiding activity does not silently download old history');
+  await backfill.loadOlder(100);
+  check(requested===1&&!backfill.nodes.get('final').node.hidden,'Earlier replies remain available on demand');
   check(!backfill.hasMore,'Filtered history still stops at the end');
   backfill.dispose();
   const empty=new ChatTimeline({url:action=>'/fixture/'+action+'?host=local',request:async()=>page([{key:'empty-image',role:'activity',kind:'imageView',title:'图片预览',text:'',order:0,version:'v1',truncated:false}],1),renderMeta:()=>{},renderText:(node,text)=>node.textContent=text,status:()=>{}});
@@ -150,5 +156,73 @@ async function runTimelineVisibilityTests() {
   const emptyBody=empty.nodes.get('empty-image').node.querySelector('.activity-body');
   check(emptyBody.hidden&&getComputedStyle(emptyBody).display==='none','Empty image preview body does not reserve space');
   empty.dispose();
+  return checks;
+}
+
+async function runTimelineCacheTests() {
+  const checks=[],check=(ok,label)=>{if(!ok)throw Error(label);checks.push(label);};
+  ChatTimeline.clearCache();
+  const row={key:'cached-row',order:0,role:'assistant',kind:'agentMessage',text:'Cached reply',version:'v1',forkable:true,turnStatus:'completed'};
+  const page={rows:[row],sequence:9,epoch:'old',before:'old.cached-row',hasMore:true,meta:{requests:[{id:'old-approval'}],access:{canEditMessages:true}},files:[]};
+  let renders=0,resolve;
+  const options={url:action=>'/fixture/'+action+'?host=local',cacheKey:'gateway-a|auth-a|local|chat-a',
+    renderMeta:()=>renders++,renderText:(node,text)=>node.textContent=text,status:()=>{},
+    request:()=>new Promise(done=>resolve=done)};
+  const first=new ChatTimeline(options);first.apply(page,true);first.dispose();first.container.replaceChildren();renders=0;
+  const reopened=new ChatTimeline(options);const opening=reopened.start();
+  check(reopened.container.textContent.includes('Cached reply'),'Returning to a chat paints cached text before the network replies');
+  check(renders===0&&!reopened.canEdit()&&!reopened.pendingRequests,'Cached presentation cannot restore permissions or approvals');
+  reopened.updates=()=>{};
+  resolve({...page,rows:[],sequence:0,epoch:'new',meta:{loadingHistory:true,requests:[]}});await opening;
+  check(reopened.container.textContent.includes('Cached reply')&&reopened.cached,'Pending owner discovery does not erase cached history');
+  reopened.apply({...page,rows:[{...row,text:'Current reply',version:'v2'}],sequence:1,epoch:'new',meta:{requests:[]}},true);
+  check(reopened.container.textContent.includes('Current reply')&&!reopened.cached,'Live history replaces stale cached content');
+  reopened.dispose();reopened.container.replaceChildren();
+  const foreign=new ChatTimeline({...options,cacheKey:'gateway-b|auth-a|local|chat-a'});foreign.start();
+  check(!foreign.container.textContent.includes('Current reply'),'Another gateway cannot reuse this chat cache');foreign.dispose();
+  ChatTimeline.clearCache();
+  const loggedOut=new ChatTimeline(options);loggedOut.start();
+  check(!loggedOut.container.textContent.includes('Current reply'),'Logout/account cache clearing removes retained messages');loggedOut.dispose();
+  return checks;
+}
+
+async function runTimelineNativeFileChangesTests(){
+  const checks=[];
+  const check=(value,label)=>{if(!value)throw Error(label);checks.push(label);};
+  document.getElementById('login').hidden=true;
+  document.getElementById('welcome').hidden=true;
+  document.getElementById('app').hidden=false;
+  document.getElementById('chat').hidden=false;
+  document.getElementById('app').classList.add('chat-open');
+  document.getElementById('timeline').style.cssText='height:400px;flex:none;overflow:auto;width:100%;padding:20px';
+  const frame=()=>new Promise(resolve=>requestAnimationFrame(resolve));
+  const page=(from,to,sequence)=>({rows:[],sequence,epoch:'native-fixture',before:null,hasMore:false,meta:{requests:[]},files:[]});
+  const timeline=new ChatTimeline({url:action=>'/fixture/'+action+'?host=local',request:async()=>{},renderMeta:()=>{},renderText:(node,text)=>node.textContent=text,status:()=>{}});
+  timeline.container.replaceChildren();
+  const nativePatch='@@ -1 +1 @@\n-old\n+new\n'+'+long patch line\n'.repeat(2000);
+  const nativeFooter={key:'native-footer',order:322,role:'fileChanges',kind:'fileChanges',version:'patch-v1',text:'',truncated:true,
+    fileSummary:{count:2,added:3,removed:1,basis:'recorded',files:[{path:'/repo/space name.py',added:2,removed:1},{path:'/repo/new.py',added:1,removed:0}]}};
+  timeline.apply({...page(0,0,4),rows:[nativeFooter]});
+  timeline.setVisibility({showProcess:false});
+  const card=timeline.nodes.get('native-footer').node;
+  check(!card.hidden&&card.classList.contains('edited-files-card'),'Native edited-files card stays visible with process hidden');
+  check(card.getBoundingClientRect().width>250&&card.scrollWidth<=card.clientWidth,'Native card fits the available message width');
+  check(card.querySelector('.edited-files-basis').textContent===timelineText('累计修改'),'Recorded patch totals are labeled separately from net edits');
+  check(!card.open&&card.querySelector('.edited-files-list').textContent.includes('/repo/space name.py'),'Native card starts collapsed and contains per-file paths and counts');
+  let detailCalls=0;
+  timeline.request=async()=>{detailCalls++;return {key:'native-footer',version:'patch-v1',offset:0,text:nativePatch.slice(0,16000),next:16000};};
+  check(!card.textContent.includes('long patch line'),'Initial native card excludes patch body');
+  card.open=true;
+  await frame();await frame();
+  check(detailCalls===0,'Opening a file summary never fetches patch details, even with old cached metadata');
+  check(!card.querySelector('.activity-body')&&!card.querySelector('.detail-more'),'File summary contains no patch body or detail controls');
+  check(card.querySelectorAll('.edited-files-list li').length===2&&card.querySelector('.edited-files-list').textContent.includes('+2 −1'),'Expanded card shows file paths and line counts only');
+  card.open=false;await frame();card.open=true;await frame();
+  check(detailCalls===0,'Reopening the summary does not request any details');
+  timeline.apply({...page(0,0,5),rows:[{...nativeFooter,version:'patch-v2',fileSummary:{...nativeFooter.fileSummary,added:4,files:[{...nativeFooter.fileSummary.files[0],added:3},nativeFooter.fileSummary.files[1]]}}]});
+  check(timeline.nodes.get('native-footer').node.querySelector('.edited-files-added').textContent==='+4','Native summary refreshes totals on update');
+  check(timeline.nodes.get('native-footer').node.open,'Summary updates retain the expanded state');
+  check(detailCalls===0,'Summary updates need no patch request');
+  timeline.dispose();
   return checks;
 }

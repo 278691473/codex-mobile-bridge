@@ -6,19 +6,20 @@ from urllib.parse import urlsplit
 MAX_BODY = 20 * 1024 * 1024
 MAX_FRAME = (MAX_BODY + 2) // 3 * 4 + 16384
 UUID = r'[0-9a-f-]{36}'
+DIAGNOSTIC_UUID = r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
 THREAD = re.compile(r'/api/sessions/' + UUID + r'(?:/(.*))?')
-DESKTOP = re.compile(r'/api/desktop-sessions/(?:deepseek|claude)/(.*)')
+DESKTOP = re.compile(r'/api/desktop-sessions/(?:deepseek|claude|antigravity)/(.*)')
 READ = {'', 'catalog', 'poll', 'timeline', 'detail', 'changes', 'notifications',
         'side-chat', 'terminal', 'subagents', 'workspace', 'workspace/preview',
         'workspace/download', 'workspace/info', 'workspace/git-status', 'workspace/git-diff',
         'workspace/git-history', 'workspace/git-commit', 'workspace/git-history-diff',
         'workspace/git-branches'}
 WRITE = {'send', 'stop', 'history', 'respond', 'reconnect', 'queue', 'settings',
-         'permissions', 'uploads', 'message-action', 'rename', 'notifications',
+         'permissions', 'uploads', 'message-action', 'rename', 'pin', 'archive', 'notifications',
          'goal/cancel', 'goal/edit', 'goal/status', 'side-chat', 'terminal',
          'workspace/upload', 'workspace/git-action'}
 DESKTOP_READ = {'list', 'detail', 'catalog', 'projects', 'account', 'access', 'terminal', 'notifications'} | {action for action in READ if action.startswith('workspace')}
-DESKTOP_WRITE = {'send', 'stop', 'settings', 'respond', 'create', 'access', 'uploads', 'terminal', 'notifications', 'workspace/upload', 'workspace/git-action'}
+DESKTOP_WRITE = {'pin', 'send', 'stop', 'settings', 'respond', 'create', 'access', 'uploads', 'terminal', 'notifications', 'workspace/upload', 'workspace/git-action', 'archive'}
 
 
 def origin(value, test_http=False):
@@ -43,6 +44,10 @@ def validate(method, path, size=0):
         raise ValueError('Unsupported request or body too large')
     if method == 'GET' and size:
         raise ValueError('GET body is not allowed')
+    if p.path == '/api/sessions/diagnostics':
+        if method == 'GET' and (not p.query or re.fullmatch('thread=' + DIAGNOSTIC_UUID, p.query)):
+            return
+        raise PermissionError('This operation is not available through the shared relay')
     if ((method == 'GET' and (p.path == '/api/mobile/update' or re.fullmatch(r'/api/mobile/update/(?:status|packages)/[a-f0-9]{64}', p.path)))
             or (method == 'POST' and p.path == '/api/mobile/update/prepare')):
         return
@@ -55,8 +60,15 @@ def validate(method, path, size=0):
         return
     if p.path == '/api/clients/claude/reconnect' and method == 'POST':
         return
+    if p.path == '/api/cli-access' and not p.query:
+        return
     desktop = DESKTOP.fullmatch(p.path)
     if desktop:
+        if p.path.startswith('/api/desktop-sessions/antigravity/'):
+            allowed = ({'create-models', 'tasks'} if method == 'GET' else
+                       {'resume', 'queue-action', 'projects/browse', 'projects/register', 'projects/trust'})
+            if desktop[1] in allowed or method == 'GET' and re.fullmatch(r'images/[a-f0-9]{64}', desktop[1]):
+                return
         if desktop[1] in (DESKTOP_READ if method == 'GET' else DESKTOP_WRITE):
             return
         if re.fullmatch('uploads/' + UUID + ('/preview' if method == 'GET' else '/thumb'), desktop[1]):
@@ -66,7 +78,7 @@ def validate(method, path, size=0):
         action = match[1] or ''
         if action in (READ if method == 'GET' else WRITE):
             return
-        if method == 'GET' and re.fullmatch(r'(files|desktop-images)/[a-f0-9]{64}', action):
+        if method == 'GET' and re.fullmatch(r'(files|desktop-images|visualizations)/[a-f0-9]{64}', action):
             return
         if re.fullmatch('uploads/' + UUID + ('/preview' if method == 'GET' else '/thumb'), action):
             return

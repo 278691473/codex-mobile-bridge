@@ -48,6 +48,9 @@ class DesktopUploadHTTP(unittest.TestCase):
         self.assertEqual(json.loads(result[2])['image'], 'image/png')
         preview = route+'/'+identifier+'/preview?sessionId=code%3Anative'
         self.assertEqual(self.binary('GET', preview, headers=headers)[2], PNG)
+        status,saved_headers,saved=self.binary('GET',preview+'&download=1',headers=headers)
+        self.assertEqual(status,200);self.assertEqual(saved,PNG)
+        self.assertTrue(saved_headers['Content-Disposition'].startswith('attachment;'))
         for alternate in (preview.replace('claude', 'deepseek'), preview.replace('native', 'other')):
             self.assertEqual(self.binary('GET', alternate, headers=headers)[0], 400)
         body = {'id': str(uuid.uuid4()), 'sessionId': 'code:native', 'text': 'Inspect', 'attachments': [identifier]}
@@ -56,6 +59,26 @@ class DesktopUploadHTTP(unittest.TestCase):
         self.assertEqual(args[:3], ('claude', 'send', 'code:native'))
         self.assertEqual(args[3]['resolvedImages'], [{'url': 'data:image/png;base64,'+base64.b64encode(PNG).decode(), 'name': 'photo.png'}])
         self.assertNotIn('attachments', args[3])
+
+    def test_native_history_preview_remains_authenticated_and_read_only(self):
+        from bridge.features.workspace.history_images import HistoryImages
+        images = HistoryImages()
+        rows = [{'attachments':[{'_nativeImage':{'event':'e','part':0}}]}]
+        images.bind('claude','code:native',rows)
+        identifier = rows[0]['attachments'][0]['desktopId']
+        self.manager.image_preview.side_effect = lambda provider, sid, image: images.preview(provider,sid,image,
+            lambda _: {'mediaType':'image/png','data':base64.b64encode(PNG).decode()})
+        route = '/api/desktop-sessions/claude/images/'+identifier+'?sessionId='
+        self.assertEqual(self.binary('GET',route+'code%3Anative')[0],401)
+        headers = self.login()
+        status, _, raw = self.binary('GET',route+'code%3Anative',headers=headers)
+        self.assertEqual(status,200);self.assertEqual(raw,PNG)
+        status,saved_headers,saved=self.binary('GET',route+'code%3Anative&download=1',headers=headers)
+        self.assertEqual(status,200);self.assertEqual(saved,PNG)
+        self.assertTrue(saved_headers['Content-Disposition'].startswith('attachment;'))
+        self.assertEqual(self.binary('GET',route+'other&download=1',headers=headers)[0],400)
+        self.assertEqual(self.binary('GET',route+'other',headers=headers)[0],400)
+        self.assertEqual(self.request('POST',route+'code%3Anative',{},headers)[0],405)
 
     def test_clients_cannot_inject_local_paths_or_resolved_content(self):
         headers = self.login()
@@ -71,6 +94,33 @@ class DesktopUploadHTTP(unittest.TestCase):
         result = self.request('POST', '/api/desktop-sessions/deepseek/send', {'sessionId': 'native', 'id': str(uuid.uuid4()), 'text': 'Inspect', 'attachments': [identifier]}, headers)
         self.assertEqual(result[0], 400)
         self.assertIn('文件传输', result[2]['error'])
+
+    def test_local_claude_cli_resolves_private_file_and_image_only_from_ledger(self):
+        self.manager.call.return_value = {'session': {'id': 'native', 'backend': 'cli', 'host': 'local'}}
+        headers = self.login()
+        identifiers = [str(uuid.uuid4()), str(uuid.uuid4())]
+        route = '/api/desktop-sessions/claude/uploads?sessionId=code%3Anative&id='
+        for identifier, name, data in zip(identifiers, ('note.txt', 'photo.png'), (b'private fixture', PNG)):
+            self.assertEqual(self.binary('POST', route+identifier+'&name='+name, data, headers)[0], 200)
+        body = {'id': str(uuid.uuid4()), 'sessionId': 'code:native', 'text': '', 'attachments': identifiers}
+        self.assertEqual(self.request('POST', '/api/desktop-sessions/claude/send', body, headers)[0], 200)
+        resolved = self.manager.call.call_args.args[3]
+        self.assertEqual(len(resolved['resolvedImages']), 1)
+        self.assertEqual(resolved['resolvedFiles'][0]['name'], 'note.txt')
+        self.assertEqual(Path(resolved['resolvedFiles'][0]['path']).read_bytes(), b'private fixture')
+        self.assertNotIn('attachments', resolved)
+
+    def test_remote_claude_cli_file_is_resolved_from_ledger_before_transport(self):
+        self.manager.call.return_value = {'session': {'id': 'native', 'backend': 'cli', 'host': 'remote'}}
+        headers = self.login(); identifier = str(uuid.uuid4())
+        route = '/api/desktop-sessions/claude/uploads?sessionId=code%3Anative&id='+identifier+'&name=note.txt'
+        self.assertEqual(self.binary('POST', route, b'private fixture', headers)[0], 200)
+        result = self.request('POST', '/api/desktop-sessions/claude/send',
+                              {'id': str(uuid.uuid4()), 'sessionId': 'code:native', 'text': '', 'attachments': [identifier]}, headers)
+        self.assertEqual(result[0], 200)
+        resolved = self.manager.call.call_args.args[3]['resolvedFiles'][0]
+        self.assertEqual(resolved['id'], identifier)
+        self.assertEqual(Path(resolved['path']).read_bytes(), b'private fixture')
 
     def test_missing_conversation_does_not_write_an_attachment(self):
         self.manager.call.return_value = {'session': None}

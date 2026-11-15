@@ -7,9 +7,11 @@ import tempfile
 import unittest
 from pathlib import Path, PurePosixPath
 
-from bridge.api.assets import FONT_ROUTE, STATIC
-from bridge.clients.codex.remote import RemoteCatalog
+from bridge.api.assets import FONT_ROUTE, PDF_CMAP_ROUTE, PDF_FONT_ROUTE, STATIC
+from bridge.clients.codex.remote import RemoteCatalog, RemoteCliModels
+from bridge.clients.claude.remote import worker_source as claude_worker_source
 from bridge.features.auth import tls
+from bridge.features.accounts.wsl_account_payload import worker_source
 from bridge.resources import project_root, source_text
 
 
@@ -19,31 +21,57 @@ ROOT = Path(__file__).resolve().parents[1]
 # directories and manifest entries must not become public URLs.
 PUBLIC_URLS = set('''
 / /bootstrap.js /host.js /layout.js /permissions.js /downloads.js /downloads.css
-/client-icons/codex.png /client-icons/claude.png /client-icons/deepseek.png
+/client-icons/codex.png /client-icons/claude.png /client-icons/deepseek.png /client-icons/zcode.png /client-icons/antigravity.png
 /client-navigation.js /client-navigation.css /client-lifecycle.js /client-lifecycle.css /desktop-sessions.js
-/client-accounts.js /desktop-sessions.css /vendor/xterm/xterm.js
+/client-accounts.js /cli-access.js /wsl-accounts.js /desktop-sessions.css /vendor/xterm/xterm.js
 /vendor/xterm/addon-fit.js /vendor/xterm/xterm.css /command-terminal-panel.js
-/list-sync.js /agents-panel.js /side-chat.js /terminal-panel.js /floating-panel.js
-/git-panel.js /file-actions.js /workbench.js /image-viewer.js /workbench.css /i18n.js /app.js
+/list-sync.js /agents-panel.js /side-chat.js /terminal-panel.js /floating-panel.js /project-picker.js
+/git-panel.js /file-actions.js /code-syntax.js /workbench.js /source-view.js /pdf-preview.js /html-preview.js /vendor/pdfjs/pdf.min.mjs /vendor/pdfjs/pdf.worker.min.mjs /vendor/prism/source-view.min.js /image-viewer.js /workbench.css /i18n.js /app.js
 /modes.js /attachments.js /activity.js /fast-mode.js /accounts.js /account.js
 /account.css /presentation.js /presentation.css /markdown.js /message-actions.js
 /timeline.js /vendor/markdown-it.min.js /vendor/texmath.js
+/mermaid-renderer.js /mermaid-render-frame.js /vendor/mermaid/mermaid.min.js
+/mermaid-viewer.js /mermaid-viewer.css /mermaid-cards.js /mermaid-cards.css
 /vendor/katex/katex.min.js /vendor/katex/katex.min.css /style.css
-/manifest.webmanifest /icon.png
+/manifest.webmanifest /icon.png /icon-ui.png /icon-favicon.png /icon-touch.png /icon-192.png
 '''.split())
 
 SSH_SOURCES = {
+    'bridge/clients/claude/history.py': ['image_event'],
+    'bridge/clients/claude/remote_worker.py': ['profile', 'command', 'resume'],
+    'bridge/clients/claude/file_archive.py': ['archive_paths', 'state', 'change', 'supported'],
     'bridge/features/sessions/store.py': ['SessionStore'],
+    'bridge/features/sessions/message_management.py': ['snapshot', 'mutate'],
     'bridge/clients/codex/catalog.py': ['Catalog'],
+    'bridge/clients/codex/remote_models.py': ['remote_model_worker'],
+    'bridge/clients/codex/configuration.py': ['magpie_managed'],
     'bridge/features/sessions/create.py': ['create_empty', 'fork_copy', 'rename_thread'],
+    'bridge/features/sessions/organization.py': ['organization'],
     'bridge/features/accounts/models.py': ['model_ids'],
+    'bridge/clients/claude/creation.py': ['creation_launch_options'],
+    'bridge/features/accounts/draft_identity.py': ['draft_identity', 'codex_account_identity'],
     'bridge/features/auth/tls.py': ['client_context'],
     'bridge/features/workspace/workspace.py': ['Workspace', 'operate'],
     'bridge/features/terminals/manager.py': ['CommandJob', 'serve_remote'],
+    'bridge/features/terminals/completion.py': ['complete_path'],
     'bridge/platforms/posix/terminal.py': ['TerminalSession', 'remote_main'],
 }
+PLATFORM_SOURCES = {
+    'bridge/platforms/codex_daemon_env.py',
+    'bridge/platforms/linux/codex_daemon_env.py',
+    'bridge/platforms/linux/codex_cli_control.py',
+    'bridge/platforms/macos/codex_daemon_env.py',
+    'bridge/platforms/macos/force_exit.py',
+    'bridge/platforms/windows/codex_daemon_env.py',
+}
+WSL_ACCOUNT_SOURCES = {'bridge/features/accounts/wsl_account_worker.py',
+                       'bridge/platforms/codex_process_identity.py',
+                       *('bridge/vendor/wsl_tomli/'+name for name in
+                         ('__init__.py', '_parser.py', '_re.py', '_types.py'))}
 CONNECTORS = {'bridge/clients/claude/connector.js', 'bridge/clients/deepseek/host.mjs'}
 NATIVE_SOURCES = {'bridge/platforms/macos/claude-helper.swift',
+                  'bridge/platforms/macos/zcode-helper.swift',
+                  'bridge/platforms/macos/update-launcher.swift',
                   'bridge/platforms/windows/claude-helper.cs',
                   'bridge/platforms/windows/codex-quit-helper.cs'}
 
@@ -104,13 +132,26 @@ class ResourceLayoutTests(unittest.TestCase):
         for path in fonts.iterdir():
             if path.suffix in ('.woff', '.woff2', '.ttf'):
                 self.assertIsNotNone(FONT_ROUTE.fullmatch('/vendor/katex/fonts/'+path.name))
+        for path in (ROOT/'web/vendor/pdfjs/cmaps').iterdir():
+            if path.suffix == '.bcmap':
+                self.assertIsNotNone(PDF_CMAP_ROUTE.fullmatch('/vendor/pdfjs/cmaps/'+path.name))
+        for path in (ROOT/'web/vendor/pdfjs/standard_fonts').iterdir():
+            if path.suffix in ('.pfb', '.ttf'):
+                self.assertIsNotNone(PDF_FONT_ROUTE.fullmatch('/vendor/pdfjs/standard_fonts/'+path.name))
+        for url in ('/vendor/pdfjs/cmaps/../LICENSE', '/vendor/pdfjs/cmaps/sample.js',
+                    '/vendor/pdfjs/standard_fonts/../LICENSE', '/vendor/pdfjs/standard_fonts/sample.js'):
+            self.assertIsNone(PDF_CMAP_ROUTE.fullmatch(url))
+            self.assertIsNone(PDF_FONT_ROUTE.fullmatch(url))
 
     def test_gateway_manifest_contains_all_remote_sources_and_client_assets(self):
         manifest = json.loads((ROOT/'scripts/gateway-resources.json').read_text())
         self.assertEqual(len(manifest), len(set(manifest)))
-        self.assertEqual({name for name in manifest if name.endswith('.py')}, set(SSH_SOURCES))
+        self.assertEqual({name for name in manifest if name.endswith('.py')},
+                         set(SSH_SOURCES) | PLATFORM_SOURCES | WSL_ACCOUNT_SOURCES |
+                         {'bridge/clients/websocket.py', 'bridge/features/workspace/visualize.py'})
         self.assertTrue(CONNECTORS <= set(manifest))
         self.assertIn('bridge/clients/LICENSE.coding-mobile', manifest)
+        self.assertIn('bridge/vendor/wsl_tomli/LICENSE', manifest)
         for relative in manifest:
             with self.subTest(resource=relative):
                 path = PurePosixPath(relative)
@@ -123,6 +164,7 @@ class ResourceLayoutTests(unittest.TestCase):
         # The real catalog builder combines TLS/model/catalog definitions and
         # removes package imports. Test its output, not a duplicate assembler.
         combined = {'bridge/features/auth/tls.py', 'bridge/features/accounts/models.py',
+                    'bridge/clients/codex/configuration.py',
                     'bridge/clients/codex/catalog.py'}
         source = RemoteCatalog('fixture-host')._source()
         for node in ast.walk(ast.parse(source)):
@@ -133,9 +175,15 @@ class ResourceLayoutTests(unittest.TestCase):
                 self.assertFalse(any(name.name.startswith('bridge') for name in node.names))
         cases = [{'name': 'catalog-with-models-and-tls', 'source': source,
                   'symbols': [symbol for name in sorted(combined) for symbol in SSH_SOURCES[name]]}]
+        cases.append({'name': 'native-cli-models-with-platform-readers',
+                      'source': RemoteCliModels._source(),
+                      'symbols': ['remote_model_worker', 'read_daemon_environment']})
+        cases.append({'name': 'wsl-accounts-with-models-and-tls',
+                      'source': worker_source()+'\nassert codex_updater(Path("/unused"),"/fixture/codex",[b"codex",b"app-server",b"--managed-daemon"],{},Path.cwd()) is None\n',
+                      'symbols': ['AccountStore', 'execute', 'fetch_models', 'model_catalog', 'codex_updater']})
         for relative, symbols in SSH_SOURCES.items():
             if relative not in combined:
-                cases.append({'name': relative, 'source': source_text(relative.removeprefix('bridge/')),
+                cases.append({'name': relative, 'source': claude_worker_source() if relative == 'bridge/clients/claude/remote_worker.py' else source_text(relative.removeprefix('bridge/')),
                               'symbols': symbols})
         (ROOT/'.tmp').mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=ROOT/'.tmp') as folder:

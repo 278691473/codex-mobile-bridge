@@ -40,6 +40,7 @@ async function rewriteAsar(asarPath,mutate){
 async function makeStubUpdater(asarPath){
   await rewriteAsar(asarPath,async source=>{
     const file=path.join(source,'desktop/features/updates/updater.cjs');
+    await fs.rename(file,path.join(path.dirname(file),'updater-production.cjs'));
     // Only release discovery/download is stubbed. installUpdate, helper spawn,
     // ready polling, app.exit, gateway ownership and swap remain production.
     await fs.writeFile(file,`'use strict';
@@ -61,7 +62,7 @@ class Updater {
     catch(error){return this.set('error',{message:error.message,version:candidate.version});}
   }
 }
-module.exports={Updater,allowedMirrorUrl:value=>value};
+module.exports={...require('./updater-production.cjs'),Updater};
 `);
   });
 }
@@ -176,19 +177,24 @@ async function runScenario(gatewayRunning){
     await until(async()=>{const value=await cdp.call('Runtime.evaluate',{returnByValue:true,expression:'Boolean(window.bridgeDesktop)'});return value.result.value===true;},'preload bridge');
     await until(async()=>{const value=await cdp.call('Runtime.evaluate',{returnByValue:true,expression:"typeof document.getElementById('check-update').onclick==='function'"});return value.result.value===true;},'renderer update handlers');
     await until(async()=>{const value=await windowBridgeSnapshot(cdp);return value.runtime.running===gatewayRunning&&(!gatewayRunning||!quickTunnel||value.quickTunnel?.state==='ready');},'renderer gateway and tunnel state match fixture',180000);
-    // The first snapshot renders before automatic client discovery finishes.
-    // Wait for the actual scan (undefined is not finished) and its follow-up
-    // reads; the production controller must still reject concurrent writes.
+    // Discovery is lazy until the clients page is opened. An untouched panel
+    // is idle, not an unfinished scan; if scanning did start, await its reads.
     const management=await until(async()=>{
       const value=await rendererManagementState(cdp);
-      return value?.scanning===false&&!value.busy&&!value.clientsLoading&&!value.choosingClient&&value.statusLoaded?value:null;
+      if(value?.choosingClient==='claude'){
+        // Hosts with Claude installed offer its setup guide after discovery; defer it like a user.
+        await cdp.call('Runtime.evaluate',{expression:`document.querySelector('dialog[open][aria-labelledby="claude-setup-title"] button[data-i18n="稍后设置"]')?.click()`});
+      }
+      const discoveryIdle=value&&(value.scanning===null&&!value.statusLoaded||value.scanning===false&&value.statusLoaded);
+      return discoveryIdle&&!value.busy&&!value.clientsLoading&&!value.choosingClient?value:null;
     },'initial client discovery settled',180000);
     console.log('Initial client management',JSON.stringify(management));
+    await cdp.call('Runtime.evaluate',{expression:`document.querySelector('[data-tab="advanced"]').click();document.querySelector('[data-maintenance-tab="updates"]').click()`});
     await cdp.call('Runtime.evaluate',{expression:"document.getElementById('check-update').click()"});
     await until(async()=>{const value=await windowBridgeSnapshot(cdp);return value.update?.state==='available';},'stub update check',30000);
     await until(async()=>{
-      const value=await cdp.call('Runtime.evaluate',{returnByValue:true,expression:"(()=>{const button=document.getElementById('install-update');return {hidden:button.hidden,disabled:button.disabled,handler:typeof button.onclick==='function'}})()"}).then(value=>value.result.value);
-      return value.hidden===false&&value.disabled===false&&value.handler===true?value:null;
+      const value=await cdp.call('Runtime.evaluate',{returnByValue:true,expression:"(()=>{const button=document.getElementById('install-update');return {hidden:button.hidden,visible:button.getClientRects().length>0,disabled:button.disabled,handler:typeof button.onclick==='function'}})()"}).then(value=>value.result.value);
+      return value.hidden===false&&value.visible===true&&value.disabled===false&&value.handler===true?value:null;
     },'available install button',60000);
     await cdp.call('Runtime.evaluate',{expression:"document.getElementById('install-update').click()"});
     // The test never signals this controller. Wait for helper ready, then prove
@@ -211,6 +217,11 @@ async function runScenario(gatewayRunning){
     const launched=JSON.parse(await fs.readFile(path.join(transaction,'launched.json'),'utf8'));
     const ack=JSON.parse(await fs.readFile(path.join(transaction,'ack.json'),'utf8'));
     launchedPid=launched.pid;
+    if(mac){
+      const receipt=JSON.parse(await fs.readFile(path.join(transaction,'launch-services.json'),'utf8'));
+      assert.equal(receipt.launcherPid,launched.pid);assert.equal(receipt.token,plan.token);
+      assert.ok(Number.isSafeInteger(receipt.pid)&&receipt.pid>0);launchedPid=receipt.pid;
+    }
     assert.equal(result.state,'updated',result.message||result.state);
     assert.equal(result.version,nextVersion);
     assert.equal(ack.version,nextVersion);
@@ -227,10 +238,8 @@ async function runScenario(gatewayRunning){
     if(mac)assert.equal(await run('/usr/libexec/PlistBuddy',['-c','Print :CFBundleShortVersionString',targetPaths.plist]).then(value=>value.stdout.trim()),nextVersion);
     console.log(JSON.stringify({ok:true,scenario:gatewayRunning?(quickTunnel?'gateway-running-real-quick-tunnel':'gateway-running-local'):'gateway-stopped',oldPid:appChild.pid,oldExit:oldExitValue,newPid:launchedPid,result,ack,work},null,2));
     cdp?.close();
-    try{
-      if(mac)process.kill(-launchedPid,'SIGTERM');else process.kill(launchedPid,'SIGTERM');
-    }catch(error){}
-    await delay(500);
+    try{process.kill(launchedPid,'SIGTERM');}catch(error){if(error.code!=='ESRCH')throw error;}
+    await until(()=>processGone(launchedPid),'isolated updated GUI exit');
     if(gatewayRunning)await worker(candidatePaths.runtime,data,'stop').catch(error=>console.error('cleanup gateway stop:',error.message));
   }catch(error){
     console.error(error.stack||error);

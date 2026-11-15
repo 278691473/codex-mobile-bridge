@@ -1,5 +1,6 @@
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -68,7 +69,7 @@ class DshNativeQuitTests(unittest.TestCase):
             patcher = patch('bridge.clients.lifecycle.'+name, return_value=value)
             mocked = patcher.start(); self.addCleanup(patcher.stop)
             if name == 'inspect_client': self.inspect = mocked
-        for name, value in [('sys.platform', 'win32'), ('time.sleep', Mock())]:
+        for name, value in [('sys.platform', 'win32'), ('time', SimpleNamespace(monotonic=time.monotonic, sleep=Mock()))]:
             patcher = patch('bridge.clients.lifecycle.'+name, value)
             patcher.start(); self.addCleanup(patcher.stop)
 
@@ -77,10 +78,11 @@ class DshNativeQuitTests(unittest.TestCase):
         return stop_deepseek({'id': 'deepseek'}, self.adapter, state=self.state)
 
     def test_requests_native_shutdown_and_waits_for_observed_exit(self):
+        self.inspect.side_effect = [self.state, self.state, {**self.state, 'pids': [12]}, {**self.state, 'pids': []}]
         self.stop()
         self.adapter.call.assert_any_call('quit', body={'expectedPid': 12,
                                                       'expectedGeneration': 'fixture-generation'})
-        self.assertEqual(self.app.processes.call_count, 2)
+        self.assertEqual(self.inspect.call_count, 4)
         self.app.stop.assert_not_called()
 
     def test_old_plugin_does_not_fall_back_to_process_termination(self):
@@ -93,6 +95,7 @@ class DshNativeQuitTests(unittest.TestCase):
         self.app.stop.assert_not_called()
 
     def test_legacy_plugin_uses_supported_installer_handoff_after_idle_check(self):
+        self.inspect.side_effect = [self.state, self.state, {**self.state, 'pids': [12]}, {**self.state, 'pids': []}]
         self.status.pop('nativeQuit')
         self.adapter.call.side_effect = [self.status, {'bridgeRevision': 3, 'complete': True,
                                                      'sessions': [{'status': 'idle', 'runtimeKnown': True, 'requests': []}]}]
@@ -143,6 +146,12 @@ class DshNativeQuitTests(unittest.TestCase):
     def test_native_shutdown_timeout_does_not_terminate_processes(self):
         self.app.processes.side_effect = None
         self.app.processes.return_value = [11, 12]
+        call = self.adapter.call.side_effect
+        def other_clock_reader(*args, **kwargs):
+            # A background caller must not consume lifecycle's test clock.
+            time.monotonic()
+            return call(*args, **kwargs)
+        self.adapter.call.side_effect = other_clock_reader
         with patch('bridge.clients.lifecycle.time.monotonic', side_effect=[0, 30]):
             with self.assertRaisesRegex(ValueError, '尚未退出'):
                 self.stop()

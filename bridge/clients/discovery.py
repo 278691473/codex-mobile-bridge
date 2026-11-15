@@ -1,17 +1,43 @@
 """Discover installed desktops without launching them or reading credentials."""
 import os
 import sys
+from copy import deepcopy
 from pathlib import Path
 
 from bridge.clients.claude.setup import claude_data_home
 from bridge.platforms import discovery as native_discovery
 from bridge.platforms.windows.discovery_ext import windows_installations
+from bridge.platforms.antigravity import installation as antigravity_installation
 
-NAMES = {'codex': 'Codex', 'claude': 'Claude Desktop', 'deepseek': 'DeepSeek Harness'}
+DISCOVERY_REVISION = 1
+
+NAMES = {'codex': 'Codex', 'claude': 'Claude Desktop', 'deepseek': 'DeepSeek Harness', 'zcode': 'ZCode'}
 BUNDLE_IDS = {'codex': 'com.openai.codex', 'claude': 'com.anthropic.claudefordesktop',
-              'deepseek': 'com.deepseek.dsh'}
+              'deepseek': 'com.deepseek.dsh', 'zcode': 'dev.zcode.app'}
 APP_NAMES = {'codex': ('Codex', 'ChatGPT'), 'claude': ('Claude', 'Claude Desktop'),
-             'deepseek': ('DSH Desktop', 'DeepSeek Harness', 'DeepSeekHarness', 'deepseek-harness')}
+             'deepseek': ('DSH Desktop', 'DeepSeek Harness', 'DeepSeekHarness', 'deepseek-harness'), 'zcode': ('ZCode',)}
+
+
+def inventory_preferences(preferences):
+    """Installation inputs only; never persist credentials with the inventory."""
+    return deepcopy({key: value for key, value in preferences.items()
+                     if value and (key.endswith(('Home', 'Application', 'Applications', 'Executable')) or key == 'desktopExecutable')})
+
+
+def inventory_current(config, preferences):
+    rows = config.get('discovered')
+    if (config.get('discoveryRevision') != DISCOVERY_REVISION or not isinstance(rows, dict) or
+            not all(isinstance(rows.get(name), dict) for name in ('codex', 'claude', 'deepseek')) or
+            config.get('discoveryPreferences') != inventory_preferences(preferences)):
+        return False
+    for row in rows.values():
+        if not isinstance(row, dict):
+            return False
+        for native in [row, *row.get('installations', {}).values()]:
+            executable = native.get('executable')
+            if native.get('installed', True) and executable and not Path(executable).is_file():
+                return False
+    return True
 
 
 def _path(value, home):
@@ -28,6 +54,8 @@ def _candidate(path, provider, platform):
         return native_discovery(platform).candidate(path, BUNDLE_IDS[provider])
     if platform == 'linux':
         return native_discovery(platform).candidate(path, provider)
+    if provider == 'zcode' and (path.name.lower() != 'zcode.exe' or not (path.parent/'resources/app.asar').is_file()):
+        return None
     if path.is_file():
         return {'application': str(path), 'executable': str(path), 'version': ''}
     return None
@@ -57,9 +85,12 @@ def discover_clients(preferences=None, *, platform=None, home=None, env=None, ap
     native = native_discovery(platform)
     if platform == 'win32' and windows_inventory is None:
         windows_inventory = windows_installations() if native_windows else {}
+    homes['zcode'] = home/'.zcode/v2'
     homes['claude'] = native.claude_home(home, env)
     result = {}
     for provider, name in NAMES.items():
+        if provider == 'zcode' and platform not in ('darwin', 'win32', 'linux'):
+            continue
         override = preferences.get(provider+'Application') or preferences.get(provider+'Executable')
         if provider == 'codex':
             override = override or preferences.get('desktopExecutable')
@@ -78,6 +109,8 @@ def discover_clients(preferences=None, *, platform=None, home=None, env=None, ap
             candidates += list(native.candidates(provider, APP_NAMES[provider], home, env))
         found = next(({**row, **metadata.get(path, {})} for path in dict.fromkeys(candidates)
                       if (row := _candidate(path, provider, platform))), {})
+        if provider == 'zcode' and not found:
+            continue
         if provider == 'claude':
             explicit_home = _path(preferences.get('claudeHome'), home)
             homes['claude'] = explicit_home or (claude_data_home(found['executable'], homes['claude'], platform,
@@ -93,4 +126,31 @@ def discover_clients(preferences=None, *, platform=None, home=None, env=None, ap
         elif provider == 'claude':
             row['dataDirectoryExplicit'] = explicit_home is not None
         result[provider] = row
+    agy_home = _path(preferences.get('antigravityHome') or env.get('ANTIGRAVITY_HOME'), home) or home
+    agy_surfaces = [agy_home/'.gemini/antigravity', agy_home/'.gemini/antigravity-ide', agy_home/'.gemini/antigravity-cli']
+    agy_installations = {}
+    saved = preferences.get('antigravityApplications') or {}
+    agy_candidates = [Path(path) for path in saved.values()] if isinstance(saved, dict) else []
+    if preferences.get('antigravityApplication'):
+        agy_candidates.append(Path(preferences['antigravityApplication']))
+    if platform == 'darwin':
+        agy_candidates.extend(native.candidates(('Antigravity', 'Antigravity IDE'), roots))
+    elif platform == 'win32':
+        agy_candidates.extend(native.candidates('antigravity', ('Antigravity', 'Antigravity IDE'), home, env))
+    suffix = '.exe' if platform == 'win32' else ''
+    agy_candidates.extend((agy_home/('.gemini/bin/agy'+suffix), agy_home/('.antigravity/antigravity/bin/agy'+suffix)))
+    for path in dict.fromkeys(agy_candidates):
+        found = antigravity_installation(path, platform=platform)
+        if found:
+            agy_installations.setdefault(found['surface'], found)
+    history = any((s/'conversation_summaries.db').is_file() or (s/'brain').is_dir() for s in agy_surfaces)
+    if history or agy_installations:
+        selected = next(iter(agy_installations.values()), {})
+        result['antigravity'] = {
+            'id': 'antigravity', 'name': 'Antigravity', 'installed': True,
+            'application': '', 'executable': '', **selected,
+            'installations': agy_installations,
+            'dataDirectory': str(agy_surfaces[0]),
+            'historyAvailable': history,
+        }
     return result

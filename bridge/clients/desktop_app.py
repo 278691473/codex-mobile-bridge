@@ -86,11 +86,14 @@ class DesktopApp:
         expected = os.path.normcase(str(self.executable))
         return _native().processes(lambda path: os.path.normcase(str(Path(path).resolve())) == expected)
 
-    def stop(self, *, runtime_pids=(), gui_pids=None, provider=None):
-        if sys.platform == 'win32' and provider == 'codex':
-            from bridge.platforms.windows.codex_quit import stop_codex
-            return stop_codex(self, gui_pids=gui_pids)
+    def stop(self, *, runtime_pids=(), gui_pids=None, provider=None, selected_pids=None):
+        if sys.platform == 'win32' and provider in ('codex', 'zcode'):
+            from bridge.platforms.windows.codex_quit import stop_codex, stop_zcode
+            quit_app = stop_zcode if provider == 'zcode' else stop_codex
+            return quit_app(self, gui_pids=gui_pids)
         pids = self.processes()
+        if selected_pids is not None:
+            pids = [pid for pid in pids if pid in selected_pids]
         main = pids if gui_pids is None else [pid for pid in gui_pids if pid in pids]
         native = _native()
         if main and sys.platform == 'darwin':
@@ -108,7 +111,7 @@ class DesktopApp:
                 continue
             native.terminate(pid)
         deadline = time.monotonic() + 25
-        while self.processes():
+        while set(self.processes()) & set(pids):
             if time.monotonic() >= deadline:
                 raise ValueError('桌面程序尚未退出，请在电脑上关闭后重试；尚未强制结束进程')
             time.sleep(.25)
@@ -121,11 +124,17 @@ class DesktopApp:
 
     def start(self):
         environment = {'CODEX_HOME': str(self.home)}
+        if sys.platform in ('darwin', 'win32'):
+            from bridge.clients.codex.desktop_runtime import launch_environment, wait_stopped
+            shared = launch_environment(self.home, self.executable)
+            if shared:
+                wait_stopped(self.home)
+            environment.update(shared)
         if sys.platform == 'darwin':
             _native().start(self.executable, self.home, environment)
             return
         if sys.platform == 'win32':
-            self.child = self.launch(cwd=self.home, env={**os.environ, **environment},
+            self.child = self.launch(require_environment=bool(shared), cwd=self.home, env={**os.environ, **environment},
                                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL,
                                      creationflags=subprocess.CREATE_NEW_PROCESS_GROUP, close_fds=True)

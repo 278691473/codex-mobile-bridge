@@ -26,13 +26,13 @@ try{
   row.projections.values.contextPressure={projectedTokens:120,pressureTokens:100,contextWindow:1000};
   const session=(await(await request('detail')).json()).session;
   assert.equal(session.permissionMode,'full-access');assert.equal(session.permissionLabel,'Full access');
-  assert.deepEqual(session.contextUsage,{usedTokens:120,contextWindow:1000,estimated:true});
+  assert.deepEqual(session.contextUsage,{usedTokens:120,contextWindow:1000,pressureTokens:100,estimated:true});
   delete row.projections.values.contextPressure;delete row.projections.values.permissions;
-  const initialStatus=await(await request('status')).json();assert.equal(initialStatus.configured,false);assert.equal(initialStatus.bridgeRevision,4);
+  const initialStatus=await(await request('status')).json();assert.equal(initialStatus.configured,false);assert.equal(initialStatus.bridgeRevision,11);
   const services={settings:{describe:options=>{assert.deepEqual(options,{redactSecrets:true});return [{ns:'provider',value:{apiKeyEnv:'FIXTURE_KEY',private:'DO-NOT-EXPOSE'}}];}},credentials:{describe:async ref=>{assert.equal(ref,'FIXTURE_KEY');return {configured:true};},resolve:()=>{throw Error('Must not resolve credentials');}},llm:{listConfigurableProviders:()=>[{provider:'deepseek',settingsNs:'provider',settingsPath:[]}]}};
   ctx.get=name=>services[name];
   assert.equal((await(await request('status')).json()).configured,true);
-  const account=await(await request('account',{},'fixture-secret',null)).json();assert.equal(account.current.kind,'api');assert.equal(account.current.label,'DeepSeek API');assert.equal(account.readOnly,true);assert.equal(account.canManage,false);assert.ok(!JSON.stringify(account).includes('FIXTURE_KEY'));assert.ok(!JSON.stringify(account).includes('DO-NOT-EXPOSE'));assert.equal(calls.length,0);
+  const account=await(await request('account',{},'fixture-secret',null)).json();assert.equal(account.current.kind,'api');assert.equal(account.current.label,'DeepSeek API');assert.equal(account.readOnly,true);assert.equal(account.canManage,false);assert.equal(account.current.credentialRef,'FIXTURE_KEY');assert.equal(account.current.credentialSource,'unknown');assert.ok(!JSON.stringify(account).includes('DO-NOT-EXPOSE'));assert.equal(calls.length,0);
   assert.deepEqual(account.groups.map(g=>g.id),['deepseek']);assert.deepEqual(account.models,[{id:'deepseek/chat',name:'Chat',efforts:['high'],defaultEffort:'high'}]);
   services.deepseekAccount={getState:async()=>({status:'credential-stored',attempt:{private:'DO-NOT-EXPOSE'}})};
   const official=await(await request('account')).json();assert.equal(official.sources.find(s=>s.kind==='account').label,'DeepSeek Account');assert.ok(!JSON.stringify(official).includes('DO-NOT-EXPOSE'));
@@ -41,6 +41,21 @@ try{
   let listed=(await(await request('list')).json()).sessions[0];assert.equal(listed.runtimeKnown,true);assert.equal(listed.status,'active');
   delete row.running;listed=(await(await request('list')).json()).sessions[0];assert.equal(listed.runtimeKnown,false);assert.equal(listed.status,'unknown');row.running=true;
   const detail=await(await request('detail')).json();assert.equal(detail.session.title,'Fixture');assert.ok(!JSON.stringify(detail).includes('PRIVATE'));
+  assert.equal(detail.capabilities.fork,false);
+  const originalList=ctx.sessionController.list;
+  ctx.sessionController.list=async()=>({items:[row,{...row,sessionId:'forked',parentSessionId:row.sessionId},{...row,sessionId:'subagent',parentSessionId:row.sessionId,origin:'subagent'}]});
+  assert.deepEqual((await(await request('list')).json()).sessions.map(s=>s.id),['session-one','forked']);
+  ctx.sessionController.list=originalList;
+  const originalPage=ctx.sessionController.page,branchCalls=[];
+  ctx.sessionController.fork=async value=>{branchCalls.push(value);return {sessionId:'native-child'};};
+  assert.equal((await(await request('detail')).json()).capabilities.fork,true);
+  assert.equal((await request('fork',{messageId:'3:0'})).status,400);
+  ctx.sessionController.page=async()=>({records:[{event:{seq:3,type:'turn/end',data:{reason:{kind:'aborted'}}}}],hasMore:false});
+  assert.equal((await request('fork',{messageId:'3'})).status,400);assert.equal(branchCalls.length,0);
+  ctx.sessionController.page=async args=>{assert.equal(args.throughSeq,3);return {records:[{event:{seq:3,type:'turn/end',data:{reason:{kind:'completed'}}}}],hasMore:false};};
+  assert.deepEqual(await(await request('fork',{messageId:'3'})).json(),{status:'ready',result:{id:'native-child'}});
+  assert.deepEqual(branchCalls,[{sessionId:'session-one',atSeq:3,allowMigration:false}]);
+  ctx.sessionController.page=originalPage;delete ctx.sessionController.fork;
   const models=await(await request('catalog')).json();assert.equal(models.models[0].id,'deepseek/chat');
   assert.equal(models.capabilities.models,true);assert.equal(models.capabilities.attachments,true);assert.equal(detail.capabilities.permissions,true);assert.equal(detail.session.backend,'deepseek');
   const originalProjection=row.projections.values.modelSelection;delete row.projections.values.modelSelection;
@@ -55,6 +70,13 @@ try{
   assert.equal((await(await request('send',{id:'r',text:'follow-up',plugins:['review']})).json()).status,'queued');assert.equal(calls[0].mode,'queue');assert.ok(calls[0].content[0].text.includes('review'));
   const selected=await(await request('settings',{model:'deepseek/chat',effort:''})).json();assert.equal(selected.effort,'high');assert.equal(calls.at(-1).provider,'deepseek');assert.equal(calls.at(-1).model,'chat');assert.equal(calls.at(-1).reasoningEffort,undefined);
   assert.equal((await request('settings',{model:'deepseek/chat',effort:'unsupported'})).status,400);
+  assert.equal(models.capabilities.manualModels,true);assert.equal(models.capabilities.manualEffort,true);
+  const nativeSelect=ctx.sessionController.selectModel;
+  ctx.sessionController.selectModel=async value=>{assert.equal(value.model,'not-in-bridge-cache');assert.equal(value.reasoningEffort,'high');throw Error('session/model-unavailable');};
+  const rejected=await request('settings',{model:'deepseek/not-in-bridge-cache',effort:'high',manualEffort:true});assert.equal(rejected.status,400);assert.match(JSON.stringify(await rejected.json()),/model-unavailable/);
+  ctx.sessionController.selectModel=nativeSelect;
+  const nativeCatalog=ctx.sessionController.modelCatalog;ctx.sessionController.modelCatalog=async()=>{throw Error('catalog unavailable');};
+  const manual=await(await request('settings',{model:'deepseek/manual',effort:'high',manualModel:true,manualEffort:true})).json();assert.equal(manual.status,'accepted');assert.equal(manual.model,'deepseek/manual');ctx.sessionController.modelCatalog=nativeCatalog;
   const beforeAccess=calls.length;const permissions=await(await request('access')).json();assert.equal(permissions.options.length,2);assert.equal(calls.length,beforeAccess);
   assert.equal((await request('access',{mode:'invalid'})).status,400);assert.equal(calls.length,beforeAccess);
   assert.equal((await request('access',{mode:'full-access'})).status,200);assert.deepEqual(calls.at(-1),{permissionSession:{id:'native-session'},mode:'full-access'});
@@ -85,6 +107,35 @@ try{
   const second=handlers.get('approval/request')({...approvalReq,signal:new AbortController().signal},()=>new Promise(resolve=>{answerDesktop=resolve;}));
   await new Promise(resolve=>setTimeout(resolve,0));answerDesktop('rejected');
   assert.equal(await second,'rejected');assert.equal((await(await request('list')).json()).sessions[0].requests.length,0);
+  // Plan commands are scoped native commands, never model prompts. The plan
+  // service is isolated below the agent preset, so direct ctx.planMode is absent.
+  row.running=false;let goal=null;const nativeAgent={id:'session-one',status:'idle',session:{id:'session-one'}};
+  ctx.agents.get=()=>nativeAgent;
+  ctx.sessionController.resolveAgent=async id=>{calls.push({resumeSession:id});ctx.agents.get=()=>nativeAgent;return {agent:nativeAgent};};
+  services.commands={list:()=>[{definitionId:'@deepseek-ai/dsh-plan-mode',name:'plan'}],execute:async(agent,line,attachments)=>{
+    assert.equal(agent,nativeAgent);assert.deepEqual(attachments,[]);calls.push({nativeCommand:line});
+    row.projections.values.plan={active:line==='/plan'};return {commandId:'native-command',result:{kind:'success'}};
+  }};
+  services.goals={get:()=>goal,create:(agent,{objective})=>{goal={id:'goal',revision:1,phase:'active',activation:'armed',objective};},
+    pause:(agent,ref)=>{assert.equal(ref.revision,goal.revision);goal={...goal,revision:goal.revision+1,activation:'disarmed'};},
+    resume:()=>{goal={...goal,revision:goal.revision+1,activation:'armed'};},clear:()=>{goal=null;}};
+  assert.equal((await(await request('detail')).json()).capabilities.plan,true);
+  assert.equal((await request('work-mode',{mode:'plan'})).status,200);
+  assert.equal((await(await request('detail')).json()).session.collaborationMode,'plan');
+  assert.equal((await request('goal',{operation:'set',objective:'one'})).status,400);
+  assert.equal((await request('work-mode',{mode:'default'})).status,200);
+  assert.equal((await request('goal',{operation:'set',objective:'one'})).status,200);
+  ctx.agents.list=()=>[nativeAgent];assert.equal((await(await request('lifecycle')).json()).sessions[0].status,'active','armed native goals protect idle gaps between rounds');
+  assert.equal((await request('goal',{operation:'pause',expected:{goalId:'goal',revision:0}})).status,400);
+  assert.equal((await request('goal',{operation:'pause',expected:{goalId:'goal',revision:1}})).status,200);
+  assert.equal((await(await request('detail')).json()).session.goal.status,'paused');
+  assert.equal((await request('goal',{operation:'resume',expected:{goalId:'goal',revision:2}})).status,200);
+  assert.equal((await request('goal',{operation:'clear',expected:{goalId:'goal',revision:3}})).status,200);
+  const liveGet=ctx.agents.get;ctx.agents.get=()=>null;
+  const cold=(await(await request('detail')).json()).session;assert.equal(cold.connectionState,'detached');assert.equal(cold.capabilities.resume,true);
+  const beforeResume=calls.length;assert.equal((await request('resume')).status,200);assert.deepEqual(calls.at(-1),{resumeSession:'session-one'});assert.equal(calls.length,beforeResume+1);ctx.agents.get=liveGet;
+  delete services.commands;delete services.goals;ctx.agents.list=()=>[];
+  assert.equal((await(await request('detail')).json()).capabilities.plan,false);
   const origin=await fetch(`http://127.0.0.1:${port}/mobile`,{method:'POST',headers:{Authorization:'Bearer fixture-secret',Origin:'https://evil.invalid'},body:'{}'});
   assert.equal(origin.status,403);
   assert.equal((await request('unsupported')).status,400);

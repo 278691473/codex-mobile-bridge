@@ -3,34 +3,156 @@
   <img src="site/assets/icon.png" alt="Codex Mobile Bridge" width="112" height="112">
 </p>
 
+<p align="center">
+  <a href="https://github.com/try2love/codex-mobile-bridge/stargazers"><img alt="GitHub Stars" src="https://img.shields.io/github/stars/try2love/codex-mobile-bridge?style=flat&amp;color=gold"></a>
+  <a href="https://github.com/try2love/codex-mobile-bridge/releases/latest"><img alt="Latest Release" src="https://img.shields.io/github/v/release/try2love/codex-mobile-bridge?style=flat"></a>
+  <a href="https://github.com/try2love/codex-mobile-bridge/issues"><img alt="GitHub Issues" src="https://img.shields.io/github/issues/try2love/codex-mobile-bridge?style=flat"></a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/try2love/codex-mobile-bridge/releases"><img alt="Android downloads" src="https://img.shields.io/endpoint?url=https%3A%2F%2Ftry2love.github.io%2Fcodex-mobile-bridge%2Fdownloads%2Fandroid.json&amp;style=flat"></a>
+  <a href="https://github.com/try2love/codex-mobile-bridge/releases"><img alt="iOS downloads" src="https://img.shields.io/endpoint?url=https%3A%2F%2Ftry2love.github.io%2Fcodex-mobile-bridge%2Fdownloads%2Fios.json&amp;style=flat"></a>
+  <a href="https://github.com/try2love/codex-mobile-bridge/releases"><img alt="Linux downloads" src="https://img.shields.io/endpoint?url=https%3A%2F%2Ftry2love.github.io%2Fcodex-mobile-bridge%2Fdownloads%2Flinux.json&amp;style=flat"></a>
+  <a href="https://github.com/try2love/codex-mobile-bridge/releases"><img alt="macOS downloads" src="https://img.shields.io/endpoint?url=https%3A%2F%2Ftry2love.github.io%2Fcodex-mobile-bridge%2Fdownloads%2Fmacos.json&amp;style=flat"></a>
+  <a href="https://github.com/try2love/codex-mobile-bridge/releases"><img alt="Windows downloads" src="https://img.shields.io/endpoint?url=https%3A%2F%2Ftry2love.github.io%2Fcodex-mobile-bridge%2Fdownloads%2Fwindows.json&amp;style=flat"></a>
+</p>
+
+<p align="center"><sub>平台下载量统计所有公开正式版和预览版的安装资产（iOS 包括专用源码包与 IPA），排除更新元数据与校验文件。包含重复下载和自动更新下载，不代表用户数或安装数；每日更新。</sub></p>
+
 # Codex Mobile Bridge · 多客户端远程工作台
 
-> **v2.0.3 正式版**：[发布页](https://github.com/try2love/codex-mobile-bridge/releases/tag/v2.0.3) · [完整更新说明](RELEASE_NOTES.md) · [手机安装说明](mobile/README.md)。本版新增 Android 应用内更新与下载方式选择，支持手机和 Web 配置第三方通知，改善搜索筛选、横屏布局和连接恢复。
+> **v2.2.1：** [正式版下载](https://github.com/try2love/codex-mobile-bridge/releases/tag/v2.2.1) · [更新说明](RELEASE_NOTES.md)。建议更新以适配最新版 Codex APP 原生连接；新增 Antigravity、聊天内交互图表并改善长会话与模型缓存。
+
+**Android 安装说明：** 新版 **Bridge** 与旧版 v2.2.0 App 独立安装，不能直接覆盖旧版。请先安装新版、重新添加电脑并确认连接正常，保留好旧版中需要的草稿后，再卸载旧版。旧版绑定和草稿不会自动迁移。已安装 v2.2.1-preview.1 独立 **Bridge Preview** 的用户可直接覆盖升级，保留该预览 App 的连接和草稿。
+
+> **v2.2.0 正式版**：[发布页](https://github.com/try2love/codex-mobile-bridge/releases/tag/v2.2.0) · [完整更新说明](RELEASE_NOTES.md) · [手机安装说明](mobile/README.md)。新增 ZCode、多信道连接与原生侧边聊天，优化空闲资源占用。
 
 [简体中文](README.md) · [English](README_EN.md)
 
-**[双语介绍与使用演示 ↗](https://try2love.github.io/codex-mobile-bridge/?lang=zh)** · **[下载桌面与手机 App](https://github.com/try2love/codex-mobile-bridge/releases/tag/v2.0.3)**
+**[双语介绍与使用演示 ↗](https://try2love.github.io/codex-mobile-bridge/?lang=zh)** · **[下载桌面与手机 App](https://github.com/try2love/codex-mobile-bridge/releases/tag/v2.2.0)**
 
 [![桌面网关：客户端与接入（演示数据）](site/assets/v2-clients.png)](https://try2love.github.io/codex-mobile-bridge/?lang=zh)
 
-从手机 App 或浏览器继续电脑上的 **Codex、Claude Code / Cowork、DeepSeek Harness** 会话。三个客户端保留独立聊天列表、账号和工作区；在当前应用下创建会话、查看回复、发送附件、切换可用模型与推理强度、处理权限请求。
+从手机 App 或浏览器继续电脑上的 **Codex、Claude Code / Cowork、DeepSeek Harness、ZCode** 会话。四个客户端保留独立聊天列表、账号和工作区；在当前应用下创建会话、查看回复、发送附件、切换可用模型与推理强度、处理权限请求。
 
 任务继续在原电脑执行，Codex 的 SSH 任务继续在原服务器执行。网关复用原客户端的会话、认证和执行环境，不让手机重新运行一套 Agent。手机无需登录相同的模型账号，使用网关登录或可撤销的扫码配对即可接入。
 
-## v2.0.3 更新
+## v2.2.0 更新
+
+- **ZCode 加入工作台**：继续原生聊天、发送附件、回答问题与审批，选择模型和 Skill，管理 API 与客户端提供的额度。macOS、Windows、Linux 正式包提供本地连接，也支持已配置的官方远控接入。
+- **一台电脑，多种信道**：局域网、固定 HTTPS、临时 HTTPS 合并到一张电脑卡片；查看延迟、手动选择或自动切换，保留聊天、草稿和阅读位置。
+- **原生会话管理**：Codex 侧边聊天归入主会话子标签，关闭标签保留原生聊天；受支持的本机会话可在确认范围、核验任务后永久删除。
+- **模型与独立客户端**：新建聊天前选择模型和思考强度；登记独立 Codex 配置、VS Code 环境，实验性支持独立 Claude/DSH 配置；网关持有的 CLI 连接可等待任务结束后释放。
+- **手机交互**：支持的 Codex 问题可逐题跳过，保留其他答案；Android 不同事件的通知分别保留，可按电脑配置 UU 远程入口。
+- **恢复与能耗**：改善 Tailscale 入口恢复、客户端初始化、第三方思考内容显示和 Unicode 模型 ID 支持；减少空闲轮询，保留长内容阅读位置。
+
+建议网关与手机 App 配套更新，保留原应用标识、签名与数据目录；iOS 仍需自行签名。原生操作以客户端版本和接入能力为准，独立配置与 WSL 账号管理仍为实验性。详见[完整更新说明与使用范围](RELEASE_NOTES.md)。
+
+感谢 [@tiancai123123](https://github.com/tiancai123123)（[#130](https://github.com/try2love/codex-mobile-bridge/pull/130)）、[@laozuzhen](https://github.com/laozuzhen)（[#135](https://github.com/try2love/codex-mobile-bridge/pull/135)）和 [@qybgh](https://github.com/qybgh)（[#139](https://github.com/try2love/codex-mobile-bridge/pull/139)）的贡献。
+
+## v2.1.7 更新
+
+- Android 可选后台任务通知，按连接选择通知来源；Android/iOS 统一主题，改善 iOS 前台提醒（[#47](https://github.com/try2love/codex-mobile-bridge/issues/47)、PR [#85](https://github.com/try2love/codex-mobile-bridge/pull/85)/[#95](https://github.com/try2love/codex-mobile-bridge/pull/95)）。
+- 统一会话菜单与分类整理，增加项目文件引用、历史图片预览、代码高亮及远程项目信任确认（PR [#92](https://github.com/try2love/codex-mobile-bridge/pull/92)、Issue [#99](https://github.com/try2love/codex-mobile-bridge/issues/99)–[#102](https://github.com/try2love/codex-mobile-bridge/issues/102)、[#104](https://github.com/try2love/codex-mobile-bridge/issues/104)）。
+- 改善 Safari 启动、SSH 离线隔离和模型目录、Desktop 连接重建及发送回执恢复；增加可选第三方重置动态，修复公式渲染。
+
+桌面与手机 App 为 **2.1.7**，Android/iOS 构建号 **40**。iOS 本次完善前台提醒，不新增 APNs 后台推送；WSL 账号管理继续作为实验性功能。完整功能、贡献与仍有限制的范围见 [双语发布说明](RELEASE_NOTES.md#v217)。
+
+## v2.1.6 更新
+
+- **会话整理**：列表右键、手机长按与聊天标题共用会话菜单；名称旁的铅笔修改 Codex 聊天名称，详情提供会话 ID 和工作目录复制。置顶先在本地生效，再同步网关；受支持的会话通过二次确认停止并归档。发送管理与聊天分支沿用各客户端能力；Codex 会话可移动到已有的原生项目、分区，也可移出，写入后回读确认，工作目录与执行设置保持原样。
+- **复制与阅读**：修复手机原生剪贴板写入，支持 DSH Session ID 复制、Markdown 阅读与源码切换，以及独立文件字号。
+- **接入与列表**：优化 API 表单和上游模型获取，保留桌面账号与具体额度展示，修复列表更新和跨平台项目分组。
+
+桌面与手机 App 为 **2.1.6**，Android/iOS 构建号 **39**。部分 Codex App 持有的会话仍不能从 Bridge 释放；Claude 与 DSH 归档需要兼容的原生支持，Cowork 暂不支持。详见[完整更新说明与归档限制](RELEASE_NOTES.md#v216)，[#77](https://github.com/try2love/codex-mobile-bridge/issues/77) 继续跟踪。感谢 [@lanchengjiu](https://github.com/lanchengjiu) 的 PR #73 和 [@mc373906408](https://github.com/mc373906408) 的 PR #82，原作者提交完整保留。
+
+## v2.1.5 更新
+
+- **WSL CLI**：接入原环境中的 Codex / Claude Code，保留账号、历史、工作目录、草稿与原生控制能力；按需发现和显式恢复，不因浏览历史启动已停止的发行版。[WSL 接入](docs/wsl-codex.md)
+- **跨客户端新建项目**：统一运行环境与目录选择，可选已有项目、其他目录或新建文件夹；Claude 明确使用“创建并发送”。[项目聊天](docs/project-chats.md)
+- **回复阅读与操作**：代码审查卡、后续操作按钮、Codex / Claude 消息及选中引用、图片添加到附件、文件引用与分页修改摘要位置链接。后续操作先进入草稿；Desktop 审查链接保留原目标。[操作说明](docs/output-interactions.md)
+- **消息管理**：撤回未发送消息、原位编辑、调整实际队列顺序、核对或忽略未确认记录；修复明确发送拒绝后的残留及多个页面互相干扰。[消息管理](docs/message-management.md)
+- **导航与性能**：修复浏览器返回（#67）及 Windows / UNC 项目分组；可选文件和图表资源按需加载，改善缓存、弱网恢复、原生输出与手机连接生命周期。
+- **WSL 账号管理为实验性**：支持的 API 配置按环境导入、切换和恢复，保留外部工具与任务保护；不保证所有配置可用，尚未完成真实多账号全流程验证。[实验性说明](docs/wsl-accounts.md)
+
+桌面与手机 App 为 **2.1.5**，Android/iOS 构建号 **38**。感谢 [@we-worker](https://github.com/we-worker) 的 [PR #64](https://github.com/try2love/codex-mobile-bridge/pull/64)（8 个原始提交保留），以及 [@lanchengjiu](https://github.com/lanchengjiu) 的 [PR #70](https://github.com/try2love/codex-mobile-bridge/pull/70)（原始提交 `d62002b` 保留）。[完整说明与升级边界](RELEASE_NOTES.md#v215)
+
+## v2.1.4 更新
+
+- **公网启动与缓存**：改善 Cloudflare 固定入口、首次资源加载和短暂网络故障恢复；重复打开复用未变化资源。
+- **长会话**：修复超大快照导致连接断开；先展示缓存与最近内容，上翻时再读取旧记录，保留阅读位置、草稿和原会话控制连接。
+- **Web 一键复制**：回复、代码和 Mermaid 源码可点击复制，兼容局域网 HTTP；浏览器拒绝时仍提供重试与手动复制。
+- **可选网络恢复**：默认关闭，可在网关或手机/Web 启用。网络地址变化后更新可用入口，避免同 IP 续期或短暂断网造成不必要的隧道重建。
+
+桌面和手机 App 版本为 **2.1.4**，Android/iOS 构建号 **37**。感谢 [@qybgh](https://github.com/qybgh) 的 [PR #63](https://github.com/try2love/codex-mobile-bridge/pull/63) 网络适配贡献，原始提交完整保留。
+
+<a id="mermaid-preview"></a>
+
+## v2.1.3 更新
+
+- **多目标通知**：可以添加多个独立 Webhook，分别启停、测试和编辑。提供通用自定义、飞书、钉钉、Discord、Telegram 可编辑 JSON 模板；飞书与钉钉支持可选签名。已保存地址与密钥默认隐藏，测试仅使用已保存配置。[配置说明](docs/webhook-notifications.md)
+- **图表阅读**：聊天与 Markdown 文件中的 Mermaid 代码块可预览、查看或复制源码，并全屏缩放。iOS 同步修复图表子页面导航；需要更新配套 App。
+- **弱网与接入**：静态资源按内容缓存，减少重复打开时的传输；Windows 包只保留支持的 Electron 语言资源。修复 DeepSeek Harness 折行配置识别，并为 iOS 网关不可达提供原生重试与返回入口。
+- **手机交互**：弹窗不再被原生“更多”入口遮挡，优化焦点外观和补充回答输入框的键盘可见性。
+
+桌面和手机 App 版本统一为 **2.1.3**，Android/iOS 构建号 **35**。完整说明与贡献者见 [v2.1.3 更新说明](RELEASE_NOTES.md#v213)。
+
+## v2.1.2 更新
+
+- **终端直接输入**：手机与宽屏 Web 默认直接输入，改善中文输入、光标与焦点恢复，新增 Enter；保留可选的“编写后发送模式”和分阶段 Tab 路径补全。
+- **交互与连接**：改善 OpenCode 类终端 CLI 的触摸滚动、鼠标选择与退出后的布局；减少网络往返造成的额外等待，临时断线后自动恢复仍有效的终端。
+- **显示与兼容性**：终端字号独立调节为 6–24px，修复小字号、中文混排与背景边界；Windows 完整携带 ConPTY 组件，修复鼠标事件丢失和安装器漏装组件。
+- **阅读设置**：主题与语言移到设置顶部，正文字号扩为 10–32px，代码字号扩为 8–28px。
+
+### v2.1.1 更新
+
+- **账号与模型**：三个客户端统一账号卡片与模型选择；模型目录缓存优先，按电脑、账号与接入隔离，显示更新时间，支持手动及 12 小时更新。
+- **草稿与文件**：跨聊天和电脑保留未发送草稿；定位文件平滑滚动并高亮，左上角直接返回聊天列表；支持工具截图预览。
+- **日常体验**：修复快速滑动回跳、列表与模型重复加载，优化 iOS 通知跳转；网关和手机可跳过当前更新，修改密码可选择保留有效手机绑定。
+
+### v2.1.0 更新
+
+- **CLI 与文件阅读**：从手机或 Web 阅读、显式恢复 Codex / Claude Code CLI 会话；源码、PDF 和自包含 HTML 有专门的阅读预览。
+- **连接与列表**：接入已有 HTTPS 穿透或反向代理；Codex 列表逐主机呈现，Claude 混合列表按日期排序，来源标签持续可见。
+- **跨平台体验**：改善 Windows 连续终端与 Claude 初始化、DSH 主机识别、iOS Safari 输入时的视区和滑动布局；所有客户端停用后仍可管理网关。
+
+### v2.0.3 更新
 
 - **Android 更新**：在 App 内下载并安装新版，自主选择手机下载或电脑下载；下载完成后可继续安装或导出 APK。详见[手机安装与升级](mobile/README.md#安装与升级)。
 - **第三方通知**：手机与 Web 可选择 Bark（iPhone）、ntfy（Android）或 PushPlus（微信），配置、保存并测试，与电脑网关共用设置。
 - **搜索与布局**：搜索框保留「搜索 / Search」，筛选按内容分配宽度；改善英文、横屏和平板列表，支持 Claude/DSH 下拉刷新，恢复后清除旧错误提示。
 - **连接与工作台**：手机安全保留有效绑定并尝试恢复登录，改善 Claude 重连与初始化；设置入口和文件传输保存文案更清晰，关闭工具标签时保留仍有内容的分屏。
 
+<a id="workspace-reading"></a>
+
+## 文件阅读与预览
+
+- **定位与返回**：聊天文件链接可平滑定位并高亮目标 3 秒。左上角返回直接回聊天列表；文件区上级目录按钮与系统返回仍支持层级导航，全屏的系统返回先退出全屏。
+- **源码阅读**：常见代码显示语法高亮和行号；点击“自动换行”让长行适合屏幕，或切回“原始行宽”。复制代码保留原文，不带行号；这是只读预览，不修改文件。未知语言与较大文本使用纯文本。
+- **PDF 阅读**：手机滑动翻阅、双指缩放，电脑浏览器保留翻页和缩放按钮。有文本层时可选择文字，扫描件不提供 OCR；不同尺寸的页面分别适配宽度。快速缩放时先保留原画面，再替换完成的新画面，减少闪烁。
+- **HTML 阅读**：在“预览 / 源代码”之间切换。自包含 HTML 的内联交互和动画可运行；外部资源、CDN、后端请求、弹窗和表单提交不受支持。预览与网关登录信息、父页面和手机原生接口隔离。
+- **Mermaid 图表**：Markdown 文件与聊天使用相同的图表、源码和全屏阅读入口，见[图表阅读说明](#mermaid-preview)。
+- **紧凑操作与全屏**：下载、复制或预览操作位于文件描述右侧；下载旁可展开全屏。全屏进出保留 PDF 位置和 HTML 状态；切换文件标签后返回 PDF 仍保留位置，HTML 则重新加载。
+
+PDF 在线阅读最大 **20 MiB**，且不超过当前普通点击下载限额；源码和 HTML 为 **512 KiB 以内的 UTF-8 文本**。超限或不支持的文件可下载后打开。完整使用本轮改进需配套更新网关与手机 App；浏览器用户更新网关后刷新即可。
+
+## CLI 会话（v2.1.0 正式版）
+
+现有 CLI 会话可在手机和 Web 中发现、阅读；点击“继续会话”后可接入或恢复原 CLI 会话，原终端无需保持打开。若 Codex App 已接续该聊天，网关会复用经核验的现有执行连接；未发现该连接时，仅会在显式操作时接入或启动已安装的原生托管 daemon。连接后支持模型与推理强度、Skill、普通/计划模式、权限切换，以及兼容本机/SSH 原生 CLI 运行时的 Goal 操作。设置中的“SSH 连接诊断”可查看本机与远端状态、复制摘要或导出脱敏文件；旧版手机 App 需更新后才能导出。详见 [CLI 接入说明](docs/codex-cli.md)。
+
+Codex 与 Claude CLI 接入分别在各自账号管理中配置；本机 CLI 同步需主动启用，并分别显示桌面与 CLI 核验结果，SSH 保留各服务器配置。Claude 可从已有本机或 SSH 项目创建 CLI 聊天，保留所选配置与工作目录。来源标签始终显示；多种会话类型可筛选；Claude 已知上下文容量显示蓝色用量圆环，未知容量显示中性环。
+
+### 平台与接入
+
+桌面安装包覆盖 macOS、Windows 和实验性 Linux x64/ARM64；Codex 与 Claude Code CLI 支持本机及已配置的 SSH 执行端。Linux 的 Claude Code CLI 与 Claude Desktop 是独立通路，Desktop 自动连接适用于 macOS / Windows。详见 [CLI 接入说明](docs/codex-cli.md)和 [Linux 文档](docs/linux.md)。
+
 ## v2 工作台
 
 - **多应用接入**：自动扫描已安装客户端，配置就绪后启用；桌面、Web 和手机可管理启停及重连。Claude Code / Cowork 分组可折叠，应用切换支持图标与可关闭的左右滑动。
-- **聊天之外的工具**：文件、Git、连续终端、Codex 临时侧边聊天与子智能体历史以标签呈现；宽屏、平板和折叠屏支持可调整的分屏，窄屏保留单栏。
+- **聊天之外的工具**：文件、Git、连续终端、Codex 原生侧边聊天与子智能体历史以标签呈现；宽屏、平板和折叠屏支持可调整的分屏，窄屏保留单栏。
 - **文件与图片**：聊天链接可定位所在文件夹或下载；可实时调整普通下载阈值，文件列表支持显式下载大文件/目录。下载浮窗提供进度、速度、暂停和继续；图片支持双指、滚轮、拖动和双击缩放。
-- **账号与上下文**：按客户端查看当前接入、可用模型及上游提供的额度；上下文用量显示在权限旁。Codex 保留 Fast、Skills、计划/目标、官方额度和重置卡能力。
-- **多台电脑与通知**：Android/iOS 扫码保存电脑，按最近访问排序，手动刷新在线状态。应用图标显示网关维护的未读数，点击直达对应聊天列表；普通手机包的后台通知仍需借助 Bark、ntfy 或 PushPlus。
+- **账号与上下文**：按客户端查看当前接入、可用模型及上游提供的额度；Codex 和 Claude 上下文用量显示在权限旁。Codex 保留 Fast、Skills、计划/目标、官方额度和重置卡能力。
+- **多台电脑与通知**：Android/iOS 扫码保存电脑，按最近访问排序，手动刷新在线状态。应用图标显示网关维护的未读数，点击直达对应聊天列表；Android 可在手机设置中开启「后台通知」，iOS 后台提醒可使用 Bark、ntfy 或 PushPlus 等通道。
 - **多种网络入口**：局域网、Cloudflare 临时/固定 HTTPS、Tailscale 固定 HTTPS、自有服务器 + SSH，以及 NAS/已有反代。
 
 | 客户端 | 接入范围 | 需要注意 |
@@ -38,8 +160,9 @@
 | Codex | 本机及已配置 SSH 会话；原生会话操作和工作台 | 依赖安装版本提供的 IPC 与能力 |
 | Claude Desktop | macOS / Windows 的 Code、Cowork | 普通 Chat 不支持；首次连接或重新初始化可能需解锁、辅助功能、开发者模式及目录信任；Linux 自动接入暂不支持 |
 | DeepSeek Harness | 桌面会话、本地接入插件、模型与账号能力 | 插件更新可能需结束任务后重启；能力以对应 Harness 版本为准 |
+| ZCode | 原生聊天、项目、附件、审批、模型、API 与额度 | macOS / Windows / Linux 本地连接或已配置的官方远控；依赖兼容的 ZCode 版本 |
 
-> 社区项目，与 OpenAI、Anthropic 或 DeepSeek 无隶属关系。依赖客户端内部接口，上游更新可能需要适配。电脑休眠或离线时无法远程操作；不能承诺 Claude 冷启动免解锁。平台与历史实测范围见 [验证记录](VERIFICATION.md) 和 [桌面接入说明](docs/deepseek-harness.md)。
+> 社区项目，与 OpenAI、Anthropic、DeepSeek 或 ZCode 官方无隶属关系。依赖客户端内部接口，上游更新可能需要适配。电脑休眠或离线时无法远程操作；不能承诺 Claude 冷启动免解锁。平台与历史实测范围见 [验证记录](VERIFICATION.md) 和 [桌面接入说明](docs/deepseek-harness.md)。
 
 支持 macOS、Windows，以及实验性 Ubuntu x64/ARM64。Linux 安装、VMware 网络及能力边界见 [Linux 文档](docs/linux.md)。开发与定向修改请先阅读 [代码架构导航](docs/architecture/README.md) 和 [验证指南](tests/README.md)。
 
@@ -47,25 +170,25 @@
 
 - 用户消息下方可复制内容。最近一条选择「编辑并重新发送」；更早的消息选择「编辑并新建分支」，原会话保留。
 - 已完成的回答下选择「从这里分支」，新会话保留截至该轮的历史，等待你继续输入。聊天详情中可返回来源会话。
-- 回复支持完整 Markdown 复制，代码块单独复制；长回复自动读取完整正文。浏览器限制剪贴板时显示可选中的文本，支持系统复制操作。
+- 回复支持完整 Markdown 复制，代码块和 Mermaid 源码可单独复制；长回复自动读取完整正文。Web 点击复制会直接写入剪贴板，局域网 HTTP 也会尝试兼容复制；仅在浏览器拒绝自动复制时显示可选文本及重试按钮。
 - 原地编辑要求任务已停止，会重新生成回答。编辑和分支不会撤销既有文件修改；新旧会话共享工作目录。
 - 分支需要 Codex 运行时同时支持指定轮次与目标续跑延迟；旧版会提示更新 Codex App。复制与最近消息编辑不受此分支能力限制。创建分支不会主动发送模型请求。
 - 结果不确定时先检查聊天列表，重复提交同一请求不会再次执行。分支已创建但连接失败时，修改保留为该分支的编辑草稿。
 
 ## 下载与快速开始（推荐）
 
-日常使用直接下载桌面 App，**无需 Agent 帮忙部署，也无需安装 Python、Node.js 或打开终端**。下列链接对应 **v2.0.3 正式版**。
+日常使用直接下载桌面 App，**无需 Agent 帮忙部署，也无需安装 Python、Node.js 或打开终端**。下列链接对应 **v2.2.0 正式版**。
 
 | 系统 | 下载 | 打开方式 |
 | --- | --- | --- |
-| Windows x64（推荐安装包） | [下载 Setup.exe](https://github.com/try2love/codex-mobile-bridge/releases/download/v2.0.3/Codex-Mobile-Bridge-2.0.3-Windows-x64-Setup.exe) | 运行安装包，从快捷方式打开 |
-| Windows x64（免安装） | [下载完整 ZIP](https://github.com/try2love/codex-mobile-bridge/releases/download/v2.0.3/Codex-Mobile-Bridge-2.0.3-Windows-x64.zip) | 完整解压后运行 `Codex Mobile Bridge.exe`，不要单独移动 exe |
-| macOS Apple Silicon（M 系列） | [下载 arm64 DMG](https://github.com/try2love/codex-mobile-bridge/releases/download/v2.0.3/Codex-Mobile-Bridge-2.0.3-macOS-arm64.dmg) | 打开 DMG，将 App 拖入“应用程序” |
-| macOS Intel（英特尔） | [下载 x64 DMG](https://github.com/try2love/codex-mobile-bridge/releases/download/v2.0.3/Codex-Mobile-Bridge-2.0.3-macOS-x64.dmg) | 打开 DMG，将 App 拖入“应用程序” |
-| Ubuntu x64（实验性） | [下载 .deb](https://github.com/try2love/codex-mobile-bridge/releases/download/v2.0.3/Codex-Mobile-Bridge-2.0.3-Linux-amd64.deb) | Ubuntu 22.04；安装后以普通用户启动 |
-| Ubuntu ARM64（实验性） | [下载 .deb](https://github.com/try2love/codex-mobile-bridge/releases/download/v2.0.3/Codex-Mobile-Bridge-2.0.3-Linux-arm64.deb) | Ubuntu 22.04 ARM64；不含 32 位 ARM |
+| Windows x64（推荐安装包） | [下载 Setup.exe](https://github.com/try2love/codex-mobile-bridge/releases/download/v2.2.0/Codex-Mobile-Bridge-2.2.0-Windows-x64-Setup.exe) | 运行安装包，从快捷方式打开 |
+| Windows x64（免安装） | [下载完整 ZIP](https://github.com/try2love/codex-mobile-bridge/releases/download/v2.2.0/Codex-Mobile-Bridge-2.2.0-Windows-x64.zip) | 完整解压后运行 `Codex Mobile Bridge.exe`，不要单独移动 exe |
+| macOS Apple Silicon（M 系列） | [下载 arm64 DMG](https://github.com/try2love/codex-mobile-bridge/releases/download/v2.2.0/Codex-Mobile-Bridge-2.2.0-macOS-arm64.dmg) | 打开 DMG，将 App 拖入“应用程序” |
+| macOS Intel（英特尔） | [下载 x64 DMG](https://github.com/try2love/codex-mobile-bridge/releases/download/v2.2.0/Codex-Mobile-Bridge-2.2.0-macOS-x64.dmg) | 打开 DMG，将 App 拖入“应用程序” |
+| Ubuntu x64（实验性） | [下载 .deb](https://github.com/try2love/codex-mobile-bridge/releases/download/v2.2.0/Codex-Mobile-Bridge-2.2.0-Linux-amd64.deb) | Ubuntu 22.04；安装后以普通用户启动 |
+| Ubuntu ARM64（实验性） | [下载 .deb](https://github.com/try2love/codex-mobile-bridge/releases/download/v2.2.0/Codex-Mobile-Bridge-2.2.0-Linux-arm64.deb) | Ubuntu 22.04 ARM64；不含 32 位 ARM |
 
-[查看所有版本与更新说明](https://github.com/try2love/codex-mobile-bridge/releases) · [下载 SHA256 校验文件](https://github.com/try2love/codex-mobile-bridge/releases/download/v2.0.3/SHA256SUMS.txt)。两种 Mac 同时提供 ZIP，供应用内更新或手动替换使用。Windows ARM 暂无专用安装包。Mac 版采用本地完整性签名但未公证，首次打开可能需要手动允许；Windows 版未做证书签名。详见下方 macOS 首次打开说明。
+[查看所有版本与更新说明](https://github.com/try2love/codex-mobile-bridge/releases) · [下载 SHA256 校验文件](https://github.com/try2love/codex-mobile-bridge/releases/download/v2.2.0/SHA256SUMS.txt)。两种 Mac 同时提供 ZIP，供应用内更新或手动替换使用。Windows ARM 暂无专用安装包。Mac 版采用本地完整性签名但未公证，首次打开可能需要手动允许；Windows 版未做证书签名。详见下方 macOS 首次打开说明。
 
 1. 安装并登录要使用的桌面客户端，打开 **Codex Mobile Bridge**。在 **客户端与接入** 检查扫描结果，完成需要的授权，并启用配置就绪的客户端。
 2. 在 **网络访问** 保留局域网访问或添加 HTTPS 入口，保存后从概览或客户端页点击 **启动网关**。已有配置时沿用原端口。
@@ -74,7 +197,7 @@
 
 需要外网访问时，可选 [Tailscale 固定 HTTPS](docs/tailscale.md)、内置 Cloudflare 临时 HTTPS、[固定 Cloudflare Tunnel](docs/fixed-domain.md)、[自有服务器 + SSH](docs/server-ssh.md) 或 NAS 反代。详细要求见[连接方式说明](#connections)。固定地址不保证国内直连速度，首次配置请用实际蜂窝网络测试。
 
-Android APK、iOS 未签名 IPA 与 Xcode 源码包见同一 [v2.0.3 Release](https://github.com/try2love/codex-mobile-bridge/releases/tag/v2.0.3)。Android 覆盖安装以保留数据；iOS 需自行签名，暂无 App Store/TestFlight 分发。源码运行与自定义部署见后面的[部署 Agent 执行说明](#agent-deployment)。
+Android APK、iOS 未签名 IPA 与 Xcode 源码包见同一 [v2.2.0 Release](https://github.com/try2love/codex-mobile-bridge/releases/tag/v2.2.0)。Android 覆盖安装以保留数据；iOS 需自行签名，暂无 App Store/TestFlight 分发。源码运行与自定义部署见后面的[部署 Agent 执行说明](#agent-deployment)。
 
 <a id="macos-first-launch"></a>
 
@@ -84,7 +207,7 @@ Android APK、iOS 未签名 IPA 与 Xcode 源码包见同一 [v2.0.3 Release](ht
 
 从 `v0.2.0-beta.5` 起，可在桌面 App 的「应用更新」中检查新版、查看说明并点击「更新并重启」。下载与校验完成后短暂重启网关，保留登录、网络、通知和关注聊天配置；失败时尝试恢复原版本。此前版本需要先手动安装一次支持更新的版本。使用临时 HTTPS 时，重启后请打开最新地址。发布与恢复说明见 [桌面更新文档](docs/desktop-updates.md)。
 
-**Windows beta.7 / 1.0.0 用户：**旧更新器可能因目录占用报 `WinError 32` 并回退。请先在托盘选择“停止网关并退出”，再用 **2.0.3 Setup.exe** 安装到原位置；无需卸载或删除数据。1.1.0 修复后续更新的目录占用问题。
+**Windows beta.7 / 1.0.0 用户：**旧更新器可能因目录占用报 `WinError 32` 并回退。请先在托盘选择“停止网关并退出”，再用 **2.1.3 Setup.exe** 安装到原位置；无需卸载或删除数据。1.1.0 修复后续更新的目录占用问题。
 
 Android v2.0.3 起支持应用内 APK 更新，并可选择手机下载或电脑下载；旧版首次升级可手动覆盖安装。电脑协助方式需要配套网关，下载失败可重选方式，已完成的包可继续安装或保存。iOS 仍按签名安装指引升级，详见[手机说明](mobile/README.md#安装与升级)。
 
@@ -94,6 +217,7 @@ Android v2.0.3 起支持应用内 APK 更新，并可选择手机下载或电脑
 - 对话页收拢顶部导航，点击标题可查看完整名称、项目、运行设备和模型信息。
 - 点击模型、提醒、Skill 右侧的箭头，可收起或展开下方输入框与发送/停止栏。收起保留草稿，发送成功不会自动收起；失败时展开错误提示。
 - 在右上角 **“··· → 显示设置”** 独立开关 **思考摘要**、**执行过程**。执行过程包含命令、工具调用、文件变更与中途进度说明；关闭两项可专注阅读回复。用户消息、错误和待确认卡片仍保留；缺少阶段标记的旧回复也会显示。
+- “已编辑 X 个文件”卡片仅展示文件名及增删行数；点击文件名可在原会话的文件页定位并高亮，已删除或项目外文件会提示无法定位。
 - 可选浅色、深色或跟随系统，自定义强调色、正文字号、代码字号和阅读间距。设置即时生效并保存在当前浏览器；电脑网页同样可用。
 
 ### 多账号与 API 切换
@@ -106,7 +230,9 @@ Codex 支持在 Bridge 桌面端添加官方账号、自定义 API 或扫描导�
 
 电脑控制面板和手机端按当前客户端展示「账号与接入」。官方账号卡片展示额度百分比、恢复倒计时与具体时间、可用重置卡和服务提供的 Credits。API 接入展示接入状态与模型信息。
 
-打开账号页时自动读取数据；后续查询保留上次成功结果，并在旁边显示「查询中」。成功后替换，失败时保留旧值和最后成功时间。可见页面每五分钟查询一次，也可手动刷新；倒计时在本地更新。
+Codex 打开账号页时自动读取数据，可见页面每五分钟查询一次，也可手动刷新；倒计时在本地更新。后续查询保留上次成功结果，并在旁边显示「查询中」；成功后替换，失败时保留旧值和最后成功时间。
+
+从 v2.1.0 起，Claude 仅在点击「查看剩余额度」时查询，打开、返回及定时刷新面板只显示已保存快照。查询失败保留旧结果及原成功日期时间；尚未成功查询时明确提示。此改动减少非主动的额度凭据读取，不代表所有钥匙串授权提示均已消除；DSH 的既有查询方式不变。
 
 v2.0.0 支持为当前及其他已保存的官方账号手动使用重置卡，无需先切换登录，也不依赖 Codex 的“允许代理使用用量重置”开关。确认前显示账号与卡片到期时间，等待五秒后才可使用；请求中断后重试原请求，不会生成新的消费标识。
 
@@ -119,7 +245,7 @@ v2.0.0 在线查询订阅周期日期，显示剩余时间和具体日期；接�
 - 网页登录默认勾选 **记住密码（7 天免登录）**：保存登录 Cookie，不保存明文密码，持续使用会续期；七天未刷新后需重新登录。取消勾选使用普通有效期的浏览器会话 Cookie。
 - 同一 IP **连续输错 5 次即自动封禁**，网页显示剩余次数，失败计数与封禁记录在重启后保留。正确登录会重置连续失败次数；封禁后只能在电脑 App 的 **登录与设备 → 自动封禁 IP** 解除并重置次数。
 - **消息通知 → 登录安全通知** 默认开启，封禁时通过已启用的 PushPlus、Bark、ntfy 发送通知，可单独关闭；关闭通知不关闭封禁。
-- 普通登录有效期在 **登录与设备 → 登录有效期（小时）** 中设置。保存后重启网关生效；修改账号、密码、登录方式或有效期会撤销此前登录。普通网关重启和 App 更新保留未过期登录。
+- 普通登录有效期在 **登录与设备 → 登录有效期（小时）** 中设置，保存后重启网关生效。修改账号或登录方式会撤销此前登录；修改密码默认撤销全部登录，也可取消勾选“同时撤销所有已绑定手机”，只保留当前有效且已标记为可信手机的登录，普通浏览器登录须重新登录。此标记沿用现有手机 User-Agent 判定，并非不可伪造的设备身份。保留时须先停止网关。普通网关重启和 App 更新保留未过期登录。
 - `0` 表示不自动过期。浏览器仍可能清理长期未使用的 Cookie；退出登录、清除浏览器数据或更换访问域名后需要重新验证。
 - **登录设备** 展示一次浏览器登录的 IP、浏览器标识、登录时间、最近访问（最多约一分钟延迟）和到期时间。**撤销登录** 只移除该登录，之后可重新验证；**封禁此 IP** 会撤销该 IP 的全部登录并禁止重新登录。
 - IP 白名单默认关闭，启用后仅允许列表内地址；黑名单优先。支持精确 IPv4 / IPv6 地址，每行一个。规则保存后立即生效，可随时从电脑 App 解除，不需要手机端权限。
@@ -130,10 +256,10 @@ v2.0.0 在线查询订阅周期日期，显示剩余时间和具体日期；接�
 
 当前 Mac 版具有本地完整性签名（ad-hoc），**没有 Apple Developer ID 签名和公证**，首次打开仍可能被 macOS 拦截。旧版 `v0.2.0-beta.1` 还存在包签名缺陷，请优先下载 `v1.1.0` 或后续版本。
 
-1. 从本仓库的 Release 下载对应芯片的 DMG 或 ZIP，以及 `SHA256SUMS.txt`。计算下载文件的 SHA-256，与校验文件中同名文件的一行比较；不一致时重新下载，不要放行。以下以 2.0.3 的 M 系列 Mac DMG 为例，其他文件请替换文件名：
+1. 从本仓库的 Release 下载对应芯片的 DMG 或 ZIP，以及 `SHA256SUMS.txt`。计算下载文件的 SHA-256，与校验文件中同名文件的一行比较；不一致时重新下载，不要放行。以下以 2.1.3 的 M 系列 Mac DMG 为例，其他文件请替换文件名：
 
    ```sh
-   shasum -a 256 "$HOME/Downloads/Codex-Mobile-Bridge-2.0.3-macOS-arm64.dmg"
+   shasum -a 256 "$HOME/Downloads/Codex-Mobile-Bridge-2.1.3-macOS-arm64.dmg"
    ```
 
 2. 打开 DMG，将 `Codex Mobile Bridge.app` 拖入“应用程序”，再推出磁盘映像；ZIP 则先解压并移动 App。尝试从“应用程序”打开后，前往 **系统设置 → 隐私与安全性 → 仍要打开**，按系统提示确认。
@@ -170,7 +296,7 @@ Windows 关闭窗口会收起到系统托盘；双击托盘或再次启动 App �
 
 右上角可切换 **简体中文 / English**，与 Mac 新界面位置一致。首次启动按系统语言选择（英文系统使用英文，其他语言回退简体中文），之后记住手动选择，并保留旧 Windows 版已保存的语言偏好。切换立即更新桌面页面、连接配置、状态提示和 Windows 托盘，不重启网关、不丢弃未保存配置。桌面偏好保存在 App 用户目录的 `language.json`。手机网页使用同一翻译表，但语言可独立选择并记忆；原始运行日志和聊天内容不翻译，未知系统错误保留原始诊断信息。
 
-外网访问在“网络访问 → 添加连接”添加并启用连接，可选择临时 HTTPS、自有服务器 SSH 或 NAS 反代。桌面 App 已内置 `cloudflared.exe`，临时和固定 Cloudflare 隧道无需另行安装；复用旧 `.local` 时会查找其 `bin/cloudflared.exe`，旧单入口配置也会自动迁移为连接项。等待入口就绪并检查实际 HTTPS 地址，`127.0.0.1` 不是手机外网入口。默认保留账号密码保护。
+外网访问在“网络访问 → 添加连接”添加并启用连接，可选择临时 HTTPS、已有穿透 / 反向代理、自有服务器 SSH 或 NAS 反代。桌面 App 已内置 `cloudflared.exe`，临时和固定 Cloudflare 隧道无需另行安装；复用旧 `.local` 时会查找其 `bin/cloudflared.exe`，旧单入口配置也会自动迁移为连接项。等待入口就绪并检查实际 HTTPS 地址，`127.0.0.1` 不是手机外网入口。默认保留账号密码保护。
 
 未保存修改会在对应设置页的侧栏入口和底部保存栏显示小红点；切换页面仍保留提示，保存成功或改回原值后清除，保存失败时继续保留。
 
@@ -195,10 +321,11 @@ Windows 关闭窗口会收起到系统托盘；双击托盘或再次启动 App �
 | --- | --- | --- |
 | 仅局域网 | 手机与电脑在同一网络 | 保留局域网开关与端口 |
 | 临时 HTTPS | 无域名，愿意使用 Cloudflare | 添加连接、保存并启动；自动使用内置程序 |
+| 已有穿透 / 反向代理 | 已自行配置好到本机回环网关的 HTTPS 入口 | 只填手机 HTTPS 根地址（可含端口）；见[配置指南](docs/external-tunnel.md) |
 | Cloudflare 固定隧道 | 有私人域名，没有服务器 | 在 Cloudflare 配置 DNS 与公开主机名，填写域名和 Tunnel Token |
 | 固定 HTTPS · Tailscale | 希望固定地址且不自建服务器 | 安装登录官方 Tailscale，检测地址并完成 Funnel/Serve 授权，见[指引](docs/tailscale.md) |
 | 自有服务器 + SSH | 有 Linux 公网服务器；电脑在校园网或 NAT 后 | 准备 HTTPS 与转发权限，再填普通用户 SSH；域名需绑定公网 IP，留空使用 HTTPS 公网 IP 时须有匹配 IP 的受信任证书 |
-| NAS / 已有反代 / Docker | NAS 已能访问电脑，已有域名和 HTTPS 反代 | 填固定 HTTPS 地址、NAS 可达的电脑 HTTP 地址；直接反代或导出 Nginx Docker 包 |
+| NAS / 其他设备（已有穿透的高级选项） | NAS 已能访问电脑，已有域名和 HTTPS 反代 | 填固定 HTTPS 地址、NAS 可达的电脑 HTTP 地址；直接反代或导出 Nginx Docker 包 |
 
 **App 内可导出或复制配置参考**（SSH 连接显示“导出手动配置参考”和“复制手动配置说明”，NAS 保留部署包入口）。生成的包带实际填写的地址、端口、中文步骤、验收项和启停命令，不含登录密码、Token、Codex 数据或 SSH 私钥。首次服务器部署完成后，日常只需打开 App 并启动网关；可启用“打开 App 时自动启动网关”。
 
@@ -216,6 +343,8 @@ Windows 关闭窗口会收起到系统托盘；双击托盘或再次启动 App �
 
 NAS 方案：Docker 只部署 HTTP 入口，原电脑仍需保持唤醒并运行 Codex App 与网关。NAS 反代已有 HTTPS 时可直接转发到电脑，通常无需增加容器。跨网络且不互通时，仅填写域名无法连接，应选择服务器 SSH 方案或先准备可用 VPN 路由。详见 [NAS 部署说明](deploy/nas/README.md)。
 
+已有穿透 / 反向代理方案只保存公开 HTTPS 地址，穿透软件和证书由用户管理。上游须指向本机网关实际回环端口，保留公开 Host；可以关闭 LAN 与本机网页访问。跨设备 NAS 仍使用上表的进阶方式。安装页见[图解步骤](site/setup.html#external)。
+
 启动后点击 **检测固定入口**：核验 HTTPS 返回的是当前网关实例，而非其他服务。该检测从电脑发起，仍需手机关闭 Wi-Fi 后用蜂窝网络验证。所有启用的固定地址显示在首页。通知跳转地址留空时优先使用列表中第一个启用的固定地址，再选临时 HTTPS 或局域网；也可在通知设置中明确指定地址。域名和服务器费用由所选服务商决定，本项目不会代购或自动开通资源。
 
 Cloudflare Tunnel 和 Tailscale 公网转发/中继可能经过境外节点，中国大陆直连可能较慢或超时；稳定的代理线路可能改善体验，实际速度以当前网络为准。Tailscale 私有组网可采用点对点连接，具体取决于网络条件。
@@ -231,6 +360,8 @@ Cloudflare Tunnel 和 Tailscale 公网转发/中继可能经过境外节点，�
 电脑 App 顶部和手机网页 **更多 → 显示设置** 中有 **Language / 语言** 选择器，各自记住选择。无需重启网关；切换时保留未保存配置、消息草稿和待确认表单的输入。翻译仅覆盖界面文案，聊天原文、模型 / Skill 内容、命令和日志原文保持不变。部署 ZIP 同时包含中文和英文说明，“复制给部署 Agent”按当前界面语言生成。
 
 ### 配置第三方通知：Bark、ntfy 与 PushPlus
+
+v2.1.3 支持配置多个 **Webhook** 接收目标：每个机器人可分别命名、启停、编辑、测试和删除，自定义 HTTPS 地址、请求头与 JSON 模板。旧版单个 Webhook 配置会保留，投递继续复用现有提醒策略、去重和重试。见 [Webhook 配置说明](docs/webhook-notifications.md)。
 
 直连网关后，从手机「外观与显示」、Web 设置或聊天列表底部进入 **第三方通知**，选择 **Bark（iPhone）、ntfy（Android）或 PushPlus（微信）**，再进入对应配置页。英文入口显示 **Push alerts**。共享中继不开放此配置入口。
 
@@ -254,7 +385,7 @@ Cloudflare Tunnel 和 Tailscale 公网转发/中继可能经过境外节点，�
 
 新配置默认开启地址通知，升级保留已保存的关闭选择。在电脑 App 的 **消息通知 → 网关启动与入口通知** 可设置“每次启动网关及入口变化时发送地址”，可填写网关名称。先启用至少一个 PushPlus、Bark 或 ntfy 通道并保存配置，再启动网关、点击“发送当前入口测试通知”，确认手机收到。
 
-每次启动网关都会汇总发送已启用的访问地址，即使地址未变。包括局域网、NAS / 已有反代固定域名、自有服务器（SSH 转发建立后）和临时 HTTPS（隧道就绪后）；稍晚就绪的入口和地址变化会补发更新。关闭的网卡、关闭的入口和回环地址不在通知中。局域网链接需同一网络，固定域名需已完成部署。
+每次启动网关都会汇总发送已启用的访问地址，即使地址未变。包括局域网、NAS / 已有反代固定域名、自有服务器（SSH 转发建立后）和临时 HTTPS（隧道就绪后）；稍晚就绪的入口和地址变化会补发更新。关闭的网卡、关闭的入口和回环地址不在通知中。局域网链接需同一网络，固定域名需要先完成部署。
 
 此开关与聊天提醒独立，新配置默认开启，升级保留原有选择。通知使用当前入口，忽略聊天通知的固定跳转地址，不包含密码或登录令牌；各通道分别重试，停止网关或关闭开关后停止新的发送。升级到 v1.3.2 或后续版本后请先配置并实测，再依靠通知获取后续重启的新入口；旧版本尚不具备此功能。
 
@@ -280,7 +411,7 @@ npm run pack:desktop
 
 Windows 可再执行 `npm run build:windows` 生成安装包与 ZIP；文件位于 `dist/desktop/`。随后执行 `npm run test:windows-app` 验证实际打包窗口、内置运行时、托盘恢复与启停。此检查使用临时端口和合成数据，不发送模型请求或真实通知，需要可显示窗口的 Windows 会话和 Node.js 24。开发测试可用 `CMB_DATA_DIR` 指定独立数据目录，`CMB_PYTHON` 指定开发用 Python；打包后的 App 使用内置运行时。运行 `python -B -m unittest discover -s tests -v` 和 `npm run test:desktop` 进行自动检查。产品图标源为 `assets/icon.png`，可用 `npm run icons:desktop` 更新桌面 PNG/ICO、手机网页和介绍页图标。macOS 打包时会从桌面 PNG 生成系统图标。
 
-App 设置界面通过本机进程通信管理网关；网关启停、更新及网络配置管理不对局域网或隧道开放。直连网关的网页登录用户可以修改 Bark、ntfy、PushPlus 及通用通知配置，沿用 Host、Origin、登录与 CSRF 校验；共享中继不开放这些配置入口。配置、通知密钥、凭据和投递记录位于网关数据目录，三个推送通道默认关闭；打包与提交不包含 `.local`、`.tmp` 或个人配置。
+App 设置界面通过本机进程通信管理网关；网关启停、更新及访问范围配置不对局域网或隧道开放；默认关闭的网络恢复开关允许已认证的直连客户端修改，并校验 CSRF。直连网关的网页登录用户可以修改 Bark、ntfy、PushPlus 及通用通知配置，沿用 Host、Origin、登录与 CSRF 校验；共享中继不开放这些配置入口。配置、通知密钥、凭据和投递记录位于网关数据目录，三个推送通道默认关闭；打包与提交不包含 `.local`、`.tmp` 或个人配置。
 
 ## Codex 会话功能
 
@@ -295,7 +426,7 @@ App 设置界面通过本机进程通信管理网关；网关启停、更新及�
 | 手机回应 | 支持命令、文件、临时权限请求及提问卡片；复杂请求提示回到桌面处理 |
 | SSH 会话 | 显示桌面 App 已连接主机的聊天，操作继续交给对应主机的会话 |
 | 聊天列表 | 最近交互或项目视图、主机标签、运行中与完成未查看标识 |
-| 模型设置 | 更改当前聊天的模型与推理强度，支持自定义模型 ID；符合条件的官方账号可开关 Fast 模式 |
+| 模型设置 | 更改当前聊天的模型与推理强度，支持自定义模型 ID；符合原生模型目录与工作区条件的接入可开关 Fast 模式 |
 | 计划与目标模式 | 从网页开启计划或原生目标；计划完成后可直接执行或继续修改 |
 | Skill | 按会话所在主机与工作目录读取已安装技能，搜索后随消息发送原生 Skill 引用 |
 | 登录方式 | 独立账号密码；可配置免密 |
@@ -371,11 +502,11 @@ python3 -B "$PWD/run.py" --lan
 
 打开聊天时先显示保存的历史，同时在后台连接桌面；“连接桌面中”不影响阅读历史。列表兼容旧版 App 的来源标记和来源为空的旧桌面记录，并继续排除子代理。
 
-如果聊天只显示历史记录，请先在电脑 App 打开该聊天，再点击手机页面的“重新连接”。网关不会自动为尚未加载的聊天启动新的执行实例。看到“桌面读取超时”表示实时状态尚未取得，不代表已经发送消息；只有发送操作结果不明时才会提示“操作可能已提交”，此时请先查看聊天，避免重复发送。
+如果 Desktop 聊天只显示历史记录，请先在电脑 App 打开该聊天，再点击手机页面的“重新连接”；网关不会另建执行实例替代原桌面 owner。v2.1.0 的 CLI 聊天可点击“继续会话”显式接入或恢复，原终端无需保持打开；被动阅读不会启动运行时。看到“桌面读取超时”表示实时状态尚未取得，不代表已经发送消息；只有发送操作结果不明时才会提示“操作可能已提交”，此时请先查看聊天，避免重复发送。
 
 不加 `--lan` 时，仅监听本机 `127.0.0.1`。前台运行时按 `Ctrl+C` 停止；也可以运行 `python3 -B stop.py`，或双击 `停止手机网关.command`。从旧版本升级后，首次请在旧服务窗口按 `Ctrl+C` 停止，再启用新的停止控制机制。
 
-网关不安装开机启动服务。重启网关后需要重新登录。
+网关不安装开机启动服务。使用同一数据目录重启时，仍有效的登录与可信手机绑定会保留。
 
 ## 外网访问：临时 HTTPS 隧道
 
@@ -476,9 +607,9 @@ SSH 列表复用 App 保存的连接和项目配置。手机不需要保存 SSH 
 
 点击输入框上方的模型按钮，选择模型与推理强度。当前任务正在运行时，新设置从下一轮使用。自定义模型 ID 必须由当前 provider 支持。
 
-使用官方 ChatGPT 账号，且当前聊天的模型与工作区允许时，面板显示 **Fast 模式** 开关。勾选或取消后点击 **应用到此聊天**，从下一轮生效；取消会明确切回标准速度。开关同步桌面实际设置，刷新后仍可查看。只调整模型或推理强度而未操作开关时，会保留原有速度档位。
+使用官方 ChatGPT 账号，或使用显式 Codex 原生模型目录的聚合接入，且当前聊天的模型与工作区允许时，面板显示 **Fast 模式** 开关。路由模型保留完整 ID，速度能力以该模型实际返回的原生元数据为准，不从名称相近的基础模型推断。勾选或取消后点击 **应用到此聊天**，从下一轮生效；取消会明确切回标准速度。开关同步桌面实际设置，刷新后仍可查看。只调整模型或推理强度而未操作开关时，会保留原有速度档位。
 
-Fast 会增加额度消耗，具体以[官方速度说明](https://learn.chatgpt.com/docs/agent-configuration/speed)为准。API、自定义服务或不支持的模型不显示该开关；SSH 聊天按远端账号和工作区判断。设置只作用于当前聊天。
+Fast 会增加额度消耗，具体以[官方速度说明](https://learn.chatgpt.com/docs/agent-configuration/speed)为准。普通 API 模型列表仅提供模型与推理强度选项；Fast 开关还要求原生模型速度能力、当前聊天接入和工作区策略匹配。SSH 聊天按远端账号和工作区判断。设置只作用于当前聊天。
 
 较长的模型名称会在工具栏中省略，推理强度完整保留。点击按钮可在设置面板查看完整模型 ID，电脑端也可悬停查看。
 
@@ -490,13 +621,13 @@ Fast 会增加额度消耗，具体以[官方速度说明](https://learn.chatgpt
 
 - **普通模式**：直接处理任务。
 - **计划模式**：先讨论并制定计划。计划完成后，可在网页展开全文、点击 **按照当前规划结果执行计划**，或填写修改意见后点击 **按照修改意见继续规划**。有修改意见时强调继续规划，并禁用直接执行，避免忽略意见。执行计划会切回普通模式，继续规划保留计划模式。
-- **目标模式**：输入要完成的目标。通过本机 Codex 原生 Goal 接口设置目标，再由原聊天的桌面 owner 开始执行。网页显示目标内容、状态和 Token 用量；操作结果未确认时保留请求标识，不自动重发。
+- **目标模式**：输入要完成的目标。本机 App 聊天通过原生 Goal 接口设置目标，再由原桌面 owner 执行；兼容的本机/SSH CLI 聊天通过其同一原生 daemon 设置和执行目标。网页显示目标内容、状态和 Token 用量；操作结果未确认时保留请求标识，不自动重发。
 
 目标栏右侧的 **×** 可隐藏该栏，目标继续运行。隐藏后，点击发送键旁的 **目标进度** 恢复显示；窄屏下显示为目标图标。同一目标在当前浏览器标签页刷新后保持隐藏，新目标默认显示。
 
 模式选择跟随当前聊天，并保留手动选择。补充正在运行的任务会沿用该任务的模式；普通和计划消息可排队，目标需等当前任务结束后直接发送，最多 4000 字。已有未完成目标或尚未确认的目标请求时，不能重复开启。
 
-模式操作使用聊天原有的主机、模型、provider 和权限设置。目标提交成功后，后续消息恢复普通输入；这不会取消已经创建的目标。本机聊天的目标栏提供暂停、恢复、修改和关闭；SSH 聊天暂不支持这些操作。修改内容前须先暂停，修改会替换原目标并重置用量统计，保存后保持暂停、保留原 Token 预算，点击恢复后继续。暂停和关闭目标不等于中断当前回复；需要立即中断时使用“停止”。预算调整仍使用 Codex 原有操作。相关能力依赖桌面运行时支持，实测范围见[验证记录](VERIFICATION.md)。
+模式操作使用聊天原有的主机、模型、provider 和权限设置。目标提交成功后，后续消息恢复普通输入；这不会取消已经创建的目标。兼容聊天的目标栏提供暂停、恢复、修改和关闭；SSH 上由 App owner 执行的聊天尚不支持这些操作。修改内容前须先暂停，修改会替换原目标并重置用量统计，保存后保持暂停、保留原 Token 预算，点击恢复后继续。暂停和关闭目标不等于中断当前回复；需要立即中断时使用“停止”。预算调整仍使用 Codex 原有操作。相关能力依赖实际执行端的运行时支持，实测范围见[验证记录](VERIFICATION.md)。
 
 ### 文件与图片附件
 
@@ -592,7 +723,7 @@ flowchart TD
 
 - macOS 与 Windows 的真实验证范围分别记录在 [验证记录](VERIFICATION.md)；Linux 原生安装与网关检查由 CI 覆盖，实际桌面 IPC、Wayland/FUSE 和不同发行版仍需实机验证。
 - 内部 IPC 不是稳定的公开 API；Codex App 更新后可能出现不兼容。
-- 尚未加载的聊天可查看保存历史，发送前可能需要在 App 中打开一次。
+- 尚未加载的 Desktop 聊天可查看保存历史，发送前可能需要在 App 中打开一次；CLI 聊天使用“继续会话”显式恢复。
 - 桌面自有服务器入口支持密码、私钥及主机指纹交互；Codex 远端聊天仍复用其已有非交互 SSH 配置，未新增 MFA 或跳板机部署支持。
 - 云聊天、SSH 文件下载尚未接入。
 - 本地文件只允许访问聊天引用的工作目录及 Codex visualizations 内文件；目录外附件只显示描述。
@@ -802,15 +933,35 @@ python3 -B -m unittest discover -s tests -v
 
 感谢 [LINUX DO](https://linux.do/) 社区及各位佬友的支持。
 
+感谢 [@heiqiu47](https://github.com/heiqiu47) 在 [PR #167](https://github.com/try2love/codex-mobile-bridge/pull/167) 与 [PR #169](https://github.com/try2love/codex-mobile-bridge/pull/169) 中贡献聊天内交互图表和 Codex 协议兼容，以及 [@windowmmk](https://github.com/windowmmk) 在 [PR #171](https://github.com/try2love/codex-mobile-bridge/pull/171) 中修复大型日志中的原生端口发现。
+
+感谢 [@windowmmk](https://github.com/windowmmk) 在 [PR #150](https://github.com/try2love/codex-mobile-bridge/pull/150) 中提供已采纳的 Antigravity 接入基础，并在 [PR #170](https://github.com/try2love/codex-mobile-bridge/pull/170) 中贡献原生等待交互、模型额度和历史图片增强；感谢 [@heiqiu47](https://github.com/heiqiu47) 在 [PR #146](https://github.com/try2love/codex-mobile-bridge/pull/146) 和 [PR #157](https://github.com/try2love/codex-mobile-bridge/pull/157) 中贡献自定义 HTTPS 端口与 macOS 菜单栏图标。原作者提交完整保留，选择性采纳、修复与整合调整单独提交。
+
+感谢 [@heiqiu47](https://github.com/heiqiu47) 的 PR [#85](https://github.com/try2love/codex-mobile-bridge/pull/85)、[#86](https://github.com/try2love/codex-mobile-bridge/pull/86)、[#92](https://github.com/try2love/codex-mobile-bridge/pull/92)、[#95](https://github.com/try2love/codex-mobile-bridge/pull/95)，[@mc373906408（waken）](https://github.com/mc373906408) 的 [#88](https://github.com/try2love/codex-mobile-bridge/pull/88)，以及 [@littltstream](https://github.com/littltstream) 的 [#96](https://github.com/try2love/codex-mobile-bridge/pull/96)。原作者提交完整保留，各项贡献见 [v2.1.7 发布说明](RELEASE_NOTES.md#v217)。
+
+感谢 [@we-worker](https://github.com/we-worker) 在 [PR #64](https://github.com/try2love/codex-mobile-bridge/pull/64) 中贡献 Windows WSL Codex 接入、Magpie 兼容与项目目录能力。v2.1.5 保留全部 8 个原始提交，统一界面及跨接入新建项目的调整另行提交。
+
 感谢 [@qybgh（Luoran Yau）](https://github.com/qybgh) 在 [PR #8](https://github.com/try2love/codex-mobile-bridge/pull/8) 中对移动端计划、目标模式、附件预览和界面体验的贡献。v1.3.1 在该贡献基础上完成目标控制、通知和交互优化。
 
 感谢 [@heiqiu47](https://github.com/heiqiu47) 在 [PR #24](https://github.com/try2love/codex-mobile-bridge/pull/24) 中贡献 v2.0.2 的文件兼容、手机文件打开、系统栏与登录自启改进。
 
 感谢 [@SevenPwZ（des1re）](https://github.com/SevenPwZ) 在 [PR #32](https://github.com/try2love/codex-mobile-bridge/pull/32) 中贡献 Android 应用内更新；v2.0.3 在此基础上整合电脑协助下载、下载方式选择与安装恢复优化。
 
+感谢 [@wangzheuser](https://github.com/wangzheuser) 提交 [PR #51](https://github.com/try2love/codex-mobile-bridge/pull/51)，修复 DSH 接入配置折行后的识别问题；保留原提交作者 [@w154594742](https://github.com/w154594742) 的署名。
+
+感谢 [@RigerWu](https://github.com/RigerWu) 在 [PR #52](https://github.com/try2love/codex-mobile-bridge/pull/52) 中贡献 iOS 网关不可达时的原生重试与返回电脑列表入口。
+
+感谢 [@heiqiu47](https://github.com/heiqiu47) 在 [PR #40](https://github.com/try2love/codex-mobile-bridge/pull/40) 中提出账号与模型界面及查询改进；v2.1.3 仅采纳查询生命周期收敛。
+
+感谢 [@jasongzy](https://github.com/jasongzy) 通过 [Issue #60](https://github.com/try2love/codex-mobile-bridge/issues/60) 提出通用 Webhook 通知需求。
+
+感谢 [@tiancai123123](https://github.com/tiancai123123) 通过 [Issue #54](https://github.com/try2love/codex-mobile-bridge/issues/54) 定位并复现弱网下静态资源重复下载问题，并在 [PR #56](https://github.com/try2love/codex-mobile-bridge/pull/56) 中贡献内容哈希、浏览器缓存及条件请求的实现与测试。整合保留其原始提交，并与项目已有的缓存失效和资源版本处理统一。
+
+感谢 [@tiancai123123](https://github.com/tiancai123123) 在 [PR #130](https://github.com/try2love/codex-mobile-bridge/pull/130) 中贡献第三方 Codex 思考正文与增量展示修复（[Issue #110](https://github.com/try2love/codex-mobile-bridge/issues/110)），并提供 Windows 和 Android 验证。原作者提交完整保留。
+
 ## 许可证与参考
 
-项目源码使用 [MIT License](LICENSE)。Codex App 为独立软件，不随本项目分发。桌面构建内置 cloudflared 并附带其许可证；二进制不提交到源码仓库，遵循其自身许可。
+项目整体使用 [GNU AGPLv3（仅第 3 版，`AGPL-3.0-only`）](LICENSE)。旧版 MIT 代码的许可与版权通知保留在 [NOTICE](NOTICE)，第三方组件继续遵循各自许可。此前按 MIT 发布的版本不受本次变更影响。修改版本供用户通过网络交互时，须依照 AGPL 第 13 条向这些用户提供对应源码。Codex App 为独立软件，不随本项目分发。桌面构建内置 cloudflared 并附带其许可证；二进制不提交到源码仓库，遵循其自身许可。
 
 - [OpenAI Codex App Server 文档](https://learn.chatgpt.com/docs/app-server)
 - [Cloudflare Quick Tunnel 文档](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/)
@@ -819,7 +970,11 @@ python3 -B -m unittest discover -s tests -v
 
 ### 按网卡选择访问地址
 
-桌面 App → **网络与登录**，在「局域网访问范围」选择 **仅选中的 IPv4 地址**，勾选需要使用的网卡地址，取消 WSL、VMware 等不需要的虚拟网卡。先停止网关，保存后重新启动；未选地址不监听端口。选择绑定到当前 IP，DHCP 地址变化后需重新选择，不会自动退回开放所有网卡。保留「所有 IPv4 地址」可继续原来的访问方式。
+桌面 App → **网络访问**，在「局域网访问范围」选择 **自动内网地址** 或 **仅选中的网卡**。自动模式只发布非虚拟网卡上的私有内网地址；Parallels、WSL、Docker 和 VPN 虚拟网卡不会出现在通知里。选择网卡可自定义范围，取消不需要的虚拟网卡。先停止网关并保存访问范围；未选网卡不监听端口，也不会在出错时退回开放所有网卡。
+
+**网络变化自动恢复默认关闭。** 可在桌面「网络访问」，或登录后的 Web / 手机 App「应用管理 → 网关连接」中启用或关闭，立即生效，无需重启网关。启用后通过系统网络事件和低频兜底检查跟踪地址变化；同一网卡获得新 DHCP 地址、断网后恢复时，更新成功监听的入口，并沿用已有通知设置。租约续期但地址不变时不调整入口。关闭后保留当前入口，不继续检测地址变化。
+
+Quick Tunnel 在默认出口变化后先等待原连接自行恢复，只有连续健康检查确认未恢复时才尝试重建，并限制重建频率；局域网地址单独变化不会更换正常的公网域名。已有固定域名、Tailscale 和 SSH 转发沿用各自的恢复方式。此功能不会替手机修改已保存的旧 IP：旧入口已不可达时，仍需通过已有备用地址、发现功能、通知中的新地址或重新扫码进入；原密码与手机绑定保持不变。
 
 「允许本机网页访问」单独控制 `127.0.0.1 / localhost`。关闭后隐藏本机入口并拒绝网页/API 访问，但保留仅供桌面状态检查及 HTTPS 隧道使用的内部回环连接。关闭局域网总开关不会关闭已配置的外网入口。
 

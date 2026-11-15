@@ -22,11 +22,57 @@ class UploadActivityTests(unittest.TestCase):
     setUp = support.IntegrationTests.setUp
     tearDown = support.IntegrationTests.tearDown
 
+    def test_tool_images_are_thread_scoped_and_read_without_owner_activation(self):
+        session = self.bridge.session(THREAD)
+        with session.condition:
+            session.state = {'turns': [{'turnId': 'tool-turn', 'items': [
+                {'type': 'mcpToolCall', 'id': 'shot', 'result': {'content': [
+                    {'type': 'image', 'mimeType': 'image/png', 'data': base64.b64encode(PNG).decode()}]}}]}]}
+            session.changed()
+        identifier = hashlib.sha256(PNG).hexdigest()
+        with patch.object(self.bridge, 'session', return_value=session) as lookup:
+            result, variant = self.bridge.desktop_image_preview(THREAD, identifier)
+            lookup.assert_called_once_with(THREAD, attach=False)
+        self.assertEqual(result['previewBytes'], PNG)
+        self.assertEqual(result['previewMime'], 'image/png')
+        self.assertEqual(variant, 'tool')
+        with self.assertRaises(KeyError):
+            self.bridge.desktop_image_preview(THREAD, '0' * 64)
+        with session.condition:
+            session.state = {'turns': []}
+            session.changed()
+        with self.assertRaises(KeyError):
+            self.bridge.desktop_image_preview(THREAD, identifier)
+        self.assertEqual(self.calls(), [])
+
     def upload(self, name='报告.txt', data=b'fixture attachment'):
         return self.bridge.upload(THREAD, str(uuid.uuid4()), name, data)
 
     def calls(self, method='thread-follower-start-turn'):
         return [r for r in self.fixture.requests if r['method'] == method]
+
+    def test_project_references_use_native_context_without_upload_and_bind_retries(self):
+        project = self.root / 'project'; project.mkdir()
+        file = project / '中文 file.txt'; file.write_text('fixture')
+        directory = project / 'folder'; directory.mkdir()
+        refs = [{'path': p.name, 'absolutePath': str(p)} for p in [file, directory]]
+        original = self.bridge.store.get
+        with patch.object(self.bridge.store, 'get', side_effect=lambda tid: {**original(tid), 'cwd': str(project)}):
+            identifier = str(uuid.uuid4())
+            result = self.bridge.send(THREAD, 'read references', identifier, references=refs)
+            self.assertEqual(result['status'], 'accepted')
+            self.bridge.send(THREAD, 'read references', identifier, references=refs)
+            self.assertEqual(len(self.calls()), 1)
+            context = self.calls()[0]['params']['turnStart']['context']
+            self.assertEqual(context['fileAttachments'], [{'path': str(p), 'label': p.name} for p in [file, directory]])
+            self.assertEqual(context['attachments'], [{'path': str(p), 'fsPath': str(p), 'label': p.name} for p in [file, directory]])
+            self.assertEqual(context['localTurnMetadata'], {'fileAttachmentCount': 2})
+            prompt = self.calls()[0]['params']['turnStart']['request']['input'][0]['text']
+            self.assertIn(str(file), prompt)
+            self.assertNotIn('[中文 file.txt]', prompt)
+            with self.assertRaises(ValueError):
+                self.bridge.send(THREAD, 'read references', identifier, references=refs[:1])
+            self.assertFalse(self.bridge.uploads.root.exists())
 
     def test_multiple_files_and_image_only_use_original_owner_and_native_image_input(self):
         file, image = self.upload(), self.upload('photo.png', PNG)
@@ -39,13 +85,16 @@ class UploadActivityTests(unittest.TestCase):
         turn = call['params']['turnStart']
         self.assertEqual(turn['request']['input'][1]['type'], 'localImage')
         self.assertEqual(Path(turn['request']['input'][1]['path']).read_bytes(), PNG)
-        self.assertEqual(turn['request']['input'][0]['text'], '')
-        self.assertNotIn('Attached files', turn['request']['input'][0]['text'])
+        self.assertIn('# Files mentioned by the user:', turn['request']['input'][0]['text'])
+        self.assertIn('## 报告.txt: ', turn['request']['input'][0]['text'])
+        self.assertIn('## My request:', turn['request']['input'][0]['text'])
         self.assertEqual(turn['context']['fileAttachments'], [
             {'path': self.bridge.uploads.get(THREAD, file['id'])['path'], 'label': '报告.txt'},
             {'path': self.bridge.uploads.get(THREAD, image['id'])['path'], 'label': 'photo.png'},
         ])
         self.assertTrue(turn['context']['inheritThreadSettings'])
+        self.assertEqual(turn['context']['attachments'][1]['isImageAttachment'], True)
+        self.assertEqual(turn['context']['localTurnMetadata']['fileAttachmentCount'], 1)
         self.bridge.send(THREAD, '', identifier, attachments=[file['id'], image['id']])
         self.assertEqual(len(self.calls()), 1)
         with self.assertRaises(ValueError): self.bridge.send(THREAD, '', identifier, attachments=[file['id']])
@@ -58,8 +107,11 @@ class UploadActivityTests(unittest.TestCase):
         self.bridge.send(THREAD, 'later', identifier, 'queue', attachments=[file['id']])
         self.assertEqual(self.bridge.view(THREAD)['submissions'][0]['attachments'], ['报告.txt'])
         self.bridge.send(THREAD, 'steer', str(uuid.uuid4()), 'steer', attachments=[file['id']])
-        self.assertEqual(self.calls('thread-follower-steer-turn')[0]['params']['input'][0]['text'], 'steer')
+        steer_text=self.calls('thread-follower-steer-turn')[0]['params']['input'][0]['text']
+        self.assertTrue(steer_text.endswith('steer'))
+        self.assertIn('## 报告.txt: ', steer_text)
         self.assertIn('报告.txt', json.dumps(self.calls('thread-follower-steer-turn')[0]['params']['restoreMessage']['context'], ensure_ascii=False))
+        self.assertEqual(self.calls('thread-follower-steer-turn')[0]['params']['attachments'][0]['label'], '报告.txt')
         session.state['threadRuntimeStatus']['type'] = 'idle'
         key = THREAD+':'+identifier
         self.bridge._send_queued(session, key, self.bridge.submissions[key])
@@ -117,7 +169,8 @@ class UploadActivityTests(unittest.TestCase):
             with session.condition: self.assertTrue(session.condition.wait_for(lambda: session.state['threadRuntimeStatus']['type']=='active', timeout=2))
             self.assertEqual(self.bridge.activity([THREAD])[0]['status'], 'active')
             self.bridge._disconnected()
-            self.assertEqual(self.bridge.activity([THREAD])[0]['status'], 'unknown')
+            with patch.object(self.bridge, '_attach'):
+                self.assertEqual(self.bridge.activity([THREAD])[0]['status'], 'unknown')
 
     def test_opening_activity_only_session_still_loads_saved_prefix(self):
         self.fixture.state['turnsPagination'] = {'hasLoadedOldest': False}
@@ -368,6 +421,20 @@ class UploadHttpTests(unittest.TestCase):
             self.assertIn('private',headers['Cache-Control']);self.assertIn('immutable',headers['Cache-Control'])
             self.assertEqual(self.preview(path.replace(image_id,'0'*64),credentials)[0],404)
 
+    def test_inline_tool_image_uses_authenticated_image_route_and_etag(self):
+        identifier = hashlib.sha256(PNG).hexdigest()
+        self.server.bridge.desktop_image_preview = lambda *args: ({
+            'previewBytes': PNG, 'previewMime': 'image/png',
+            'previewSha256': identifier, 'name': 'Image 1.png'}, 'tool')
+        path = '/api/sessions/' + THREAD + '/desktop-images/' + identifier
+        self.assertEqual(self.preview(path, {})[0], 401)
+        credentials = self.login()
+        status, headers, body = self.preview(path, credentials)
+        self.assertEqual((status, body), (200, PNG))
+        self.assertEqual(headers['Content-Type'], 'image/png')
+        self.assertEqual(headers['X-Content-Type-Options'], 'nosniff')
+        self.assertEqual(self.preview(path, {**credentials, 'If-None-Match': headers['ETag']})[0], 304)
+
     def upload_preview(self,path,headers,data=None,method='GET'):
         conn=http.client.HTTPConnection('127.0.0.1',self.port,timeout=3);self.addCleanup(conn.close)
         conn.request(method,path,body=data,headers=headers)
@@ -414,6 +481,11 @@ class UploadHttpTests(unittest.TestCase):
             original=preview+'?variant=original'
             status,headers,body=self.upload_preview(original,credentials)
             self.assertEqual(status,200);self.assertEqual(headers['Content-Type'],'image/png');self.assertEqual(body,PNG)
+            status,headers,body=self.upload_preview(preview+'?download=1&variant=thumb',credentials)
+            self.assertEqual(status,200);self.assertEqual(body,PNG)
+            self.assertEqual(headers['X-Preview-Variant'],'original')
+            self.assertTrue(headers['Content-Disposition'].startswith('attachment;'))
+            self.assertEqual(headers['Cache-Control'],'private, no-store')
 
 class UploadBoundaryRegressions(unittest.TestCase):
     setUp = support.IntegrationTests.setUp

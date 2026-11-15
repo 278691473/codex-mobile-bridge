@@ -5,6 +5,8 @@ const {defaults,normalize,colors}=require('../web/features/settings/presentation
 test('invalid or older saved appearance values keep the page readable',()=>{
   for(const value of [null,42,'bad',{}, {theme:'unknown',accent:'url(external)',fontSize:100,codeSize:-1,density:'tiny'}])assert.deepEqual(normalize(value),defaults);
   assert.deepEqual(normalize({theme:'dark',accent:'#123ABC',fontSize:20,codeSize:17,density:'compact'}),{...defaults,theme:'dark',accent:'#123ABC',fontSize:20,codeSize:17,density:'compact'});
+  for(const [fontSize,codeSize] of [[10,8],[32,28]])assert.deepEqual(normalize({fontSize,codeSize}),{...defaults,fontSize,codeSize});
+  for(const [fontSize,codeSize] of [[9,7],[33,29]])assert.deepEqual(normalize({fontSize,codeSize}),defaults);
   assert.equal(normalize({showReasoning:false,showProcess:false}).showReasoning,false);
   assert.equal(normalize({showReasoning:false,showProcess:false}).showProcess,false);
   assert.deepEqual(normalize({showReasoning:'false',showProcess:null}),defaults);
@@ -12,6 +14,9 @@ test('invalid or older saved appearance values keep the page readable',()=>{
   assert.equal(normalize({showComputer:false}).showComputer,false);
   assert.equal(normalize({showComputer:'false'}).showComputer,true);
   assert.equal(normalize({showFileThumbnails:'false'}).showFileThumbnails,true);
+  assert.equal(normalize({}).showToolImages,true);
+  assert.equal(normalize({showToolImages:'false'}).showToolImages,true);
+  assert.equal(normalize({showToolImages:false}).showToolImages,false);
 });
 
 function luminance(hex){

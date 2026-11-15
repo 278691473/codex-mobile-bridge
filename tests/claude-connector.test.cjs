@@ -10,7 +10,10 @@ const pack = value => {
 };
 let request = pack({seq:0,type:'idle'}), response, calls = [];
 let failWrites=0,catalogHung=false,usageCalls=[],realContextBudget=false;
+let trusted=false,trustSaves=0;
 const api = {
+  async checkTrust(path){assert.equal(path,'D:/fixture');return {trusted,private:'SECRET'};},
+  async saveTrust(path){assert.equal(path,'D:/fixture');trustSaves++;trusted=true;},
   async readFileAtCwd() { return {contents:request}; },
   async writeSessionFile(sid,path,text) { if(failWrites>0){failWrites--;throw Error('temporary write failure');}response=JSON.parse(JSON.parse(text).payload); return {hash:'ok'}; },
   async getAll() { if(catalogHung)return new Promise(()=>{});return [{sessionId:'local_test',cwd:'D:/fixture',title:'Codex Bridge Connector',oauthToken:'SECRET'}]; },
@@ -21,8 +24,8 @@ const api = {
   async sendMessage(...args) { calls.push(args); },
   async getTranscript() {return [
     {type:'user',isSynthetic:true,uuid:'retry',message:{role:'user',content:[{type:'text',text:'internal retry'}]}},
-    {type:'assistant',uuid:'answer',message:{role:'assistant',content:[{type:'thinking',thinking:'PRIVATE_THINKING'},{type:'text',text:'visible'}]}},
-    {type:'result',uuid:'native-result',subtype:'success',is_error:false,num_turns:2,parent_tool_use_id:null,result:'PRIVATE_RESULT',usage:{secret:'PRIVATE_USAGE'},apiKey:'SECRET'},
+    {type:'assistant',uuid:'answer',message:{role:'assistant',model:'fixture-model',usage:{input_tokens:10,cache_creation_input_tokens:20,cache_read_input_tokens:30,output_tokens:999,secret:'PRIVATE_USAGE'},content:[{type:'thinking',thinking:'PRIVATE_THINKING'},{type:'text',text:'visible'}]}},
+    {type:'result',uuid:'native-result',subtype:'success',is_error:false,num_turns:2,parent_tool_use_id:null,result:'PRIVATE_RESULT',usage:{secret:'PRIVATE_USAGE'},apiKey:'SECRET',modelUsage:{'fixture-model':{inputTokens:9999,contextWindow:200000,secret:'PRIVATE_MODEL_USAGE'},'other-model':{contextWindow:1000000},'bad-model':{contextWindow:-1}}},
     {type:'result',uuid:'nested-result',subtype:'success',is_error:false,parent_tool_use_id:'tool-id',isSidechain:true},
     {type:'result',uuid:'synthetic-result',subtype:'success',is_error:false,isSyntheticResult:true},
     {type:'result',uuid:'failure',subtype:'error_during_execution',is_error:true,num_turns:0},
@@ -68,13 +71,14 @@ const waitFor = async predicate => {
   assert.equal(response.result[0].isSynthetic,true);
   assert.ok(!JSON.stringify(response).includes('PRIVATE_THINKING'));
   assert.equal(response.result[1].message.content[0].text,'visible');
+  assert.deepEqual(response.result[1].message.usage,{input_tokens:10,cache_creation_input_tokens:20,cache_read_input_tokens:30});
   assert.deepEqual(response.result.slice(2),[
-    {type:'result',uuid:'native-result',subtype:'success',is_error:false,num_turns:2,parent_tool_use_id:null},
+    {type:'result',uuid:'native-result',subtype:'success',is_error:false,num_turns:2,parent_tool_use_id:null,modelUsage:{'fixture-model':{contextWindow:200000},'other-model':{contextWindow:1000000}}},
     {type:'result',uuid:'nested-result',subtype:'success',is_error:false,parent_tool_use_id:'tool-id',isSidechain:true},
     {type:'result',uuid:'synthetic-result',subtype:'success',is_error:false,isSyntheticResult:true},
     {type:'result',uuid:'failure',subtype:'error_during_execution',is_error:true,num_turns:0},
   ]);
-  assert.ok(!JSON.stringify(response).includes('PRIVATE_RESULT')&&!JSON.stringify(response).includes('PRIVATE_USAGE')&&!JSON.stringify(response).includes('SECRET'));
+  assert.ok(!JSON.stringify(response).includes('PRIVATE_RESULT')&&!JSON.stringify(response).includes('PRIVATE_USAGE')&&!JSON.stringify(response).includes('PRIVATE_MODEL_USAGE')&&!JSON.stringify(response).includes('SECRET'));
   failWrites=1;catalogHung=true;
   request=pack({type:'request',seq:6,surface:'code',method:'mobileCatalog',args:['local_test'],expires:Date.now()/1000+10});
   await waitFor(()=>response.seq===6 && response.done);
@@ -137,6 +141,25 @@ const waitFor = async predicate => {
   request=pack({generation:'next',type:'request',seq:++seq,surface:'cowork',method:'mobileDetail',args:['local_test'],expires:Date.now()/1000+10});
   await waitFor(()=>response.seq===seq&&response.done);
   assert.equal(response.result.contextUsage,null);assert.equal(response.result.contextUsageStatus,'unsupported');
+  const imageData='iVBORw0KGgo=',originalTranscript=api.getTranscript;
+  api.getTranscript=async()=>[{type:'user',uuid:'native-image',message:{role:'user',content:[{type:'unknown',secret:'PRIVATE'},
+    {type:'image',source:{type:'base64',media_type:'image/png',data:imageData}}]}}];
+  request=pack({generation:'next',type:'request',seq:++seq,surface:'code',method:'getTranscript',args:['local_test'],expires:Date.now()/1000+10});
+  await waitFor(()=>response.seq===seq&&response.done);
+  assert.deepEqual(response.result[0].message.content,[{type:'image',imageRef:{event:'native-image',part:1}}]);
+  assert.ok(!JSON.stringify(response).includes(imageData));
+  request=pack({generation:'next',type:'request',seq:++seq,surface:'code',method:'mobileImage',args:['local_test',{event:'native-image',part:1}],expires:Date.now()/1000+10});
+  await waitFor(()=>response.seq===seq&&response.done);assert.deepEqual(response.result,{mediaType:'image/png',data:imageData});
+  request=pack({generation:'next',type:'request',seq:++seq,surface:'code',method:'mobileImage',args:['local_test',{event:'other-image',part:1}],expires:Date.now()/1000+10});
+  await waitFor(()=>response.seq===seq&&response.done);assert.ok(response.error);
+  for(const [surface,confirmed,wantError] of [['code',false,false],['cowork',true,true],['code','true',true],['code',true,false],['code',true,false]]){
+    request=pack({generation:'next',type:'request',seq:++seq,surface,method:'mobileProjectTrust',args:['D:/fixture',confirmed],expires:Date.now()/1000+10});
+    await waitFor(()=>response.seq===seq&&response.done);
+    assert.equal(Boolean(response.error),wantError);
+    if(!wantError)assert.deepEqual(response.result,{trusted:confirmed,path:'D:/fixture'});
+  }
+  assert.equal(trustSaves,1,'Explicit native trust is idempotent and never sent by a passive check');
+  api.getTranscript=originalTranscript;
   window.__claudeMobileBridge.stop(); await running;
   assert.equal(window.__claudeMobileBridge.status().stopped,true);
   console.log('Desktop file connector: handshake, original session dispatch, deduplication, same-generation reinjection without replay, expiry, allowlist, redaction, restart, replay rejection, stop passed.');

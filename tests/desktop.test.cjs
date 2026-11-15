@@ -20,11 +20,11 @@ test('tray prefers public HTTPS and rejects non-web addresses',()=>{
 });
 
 async function trayFixture(t){
-  let menu,timer,destroyed=false,cleared=false,quit=false,opened=false,copied,error,failStop=false;
+  let menu,timer,destroyed=false,cleared=false,quit=false,opened=false,copied,error,failStop=false,renders=0;
   const state={runtime:{running:true},urls:['http://127.0.0.1:8787','https://example.com']};
   const actions=[];
   const tray=createTray({
-    Tray:class{on(){}setToolTip(){}setContextMenu(value){menu=value;}destroy(){destroyed=true;}},
+    Tray:class{on(){}setToolTip(){}setContextMenu(value){menu=value;renders++;}destroy(){destroyed=true;}},
     Menu:{buildFromTemplate:value=>value},icon:'icon',show:()=>{opened=true;},t,
     worker:async action=>{if(action==='snapshot')return state;actions.push(action);if(failStop)throw Error('stop failed');state.runtime.running=false;},
     open:async()=>{opened=true;},copy:async value=>{copied=value;},quit:()=>{quit=true;},onError:value=>{error=value;},
@@ -32,13 +32,40 @@ async function trayFixture(t){
   });
   await new Promise(setImmediate);
   return {tray,state,actions,find:text=>menu.find(item=>item.label?.includes(text)),poll:()=>timer(),
-    fail:()=>{failStop=true;},result:()=>({destroyed,cleared,quit,opened,copied,error})};
+    fail:()=>{failStop=true;},result:()=>({destroyed,cleared,quit,opened,copied,error,renders})};
 }
+
+test('unchanged tray snapshots reuse the menu; URL and busy changes remain immediate',async()=>{
+  const ui=await trayFixture(),before=ui.result().renders;
+  for(let i=0;i<10;i++)await ui.poll();
+  assert.equal(ui.result().renders,before);
+  ui.state.urls=['https://new.example.com'];await ui.poll();
+  assert.equal(ui.result().renders,before+1);
+  await ui.find('复制手机').click();
+  assert.equal(ui.result().copied,'https://new.example.com');
+  assert.equal(ui.result().renders,before+3);ui.tray.dispose();
+});
 
 test('tray can stop then quit and dispose without duplicate operations',async()=>{
   const ui=await trayFixture();await ui.find('复制手机').click();assert.equal(ui.result().copied,'https://example.com');
   await ui.find('停止网关').click();assert.deepEqual(ui.actions,['stop']);assert.equal(ui.result().quit,true);
   ui.tray.dispose();assert.equal(ui.result().destroyed,true);assert.equal(ui.result().cleared,true);
+});
+
+test('window observations defer tray reads and a late fallback cannot replace a newer address',async()=>{
+  const timers=new Map();let serial=0,menu,reads=0,resolve;
+  const state=url=>({runtime:{running:true},urls:[url]});
+  const tray=createTray({Tray:class{on(){}setToolTip(){}setContextMenu(value){menu=value;}destroy(){}},
+    Menu:{buildFromTemplate:v=>v},worker:()=>{reads++;return new Promise(done=>{resolve=done;});},
+    setTimer:(cb,ms)=>{const id=++serial;timers.set(id,{cb,ms});return id;},clearTimer:id=>timers.delete(id),copy:()=>{}});
+  resolve(state('https://first.test'));await new Promise(setImmediate);
+  for(let i=0;i<10;i++)tray.observe(state('https://first.test'));
+  assert.equal(reads,1);assert.equal(timers.size,1);
+  const [id,fallback]=[...timers][0];assert.equal(fallback.ms,5000);timers.delete(id);
+  const read=fallback.cb();assert.equal(reads,2);
+  tray.observe(state('https://new.test'));const newest=menu;
+  resolve(state('https://stale.test'));await read;assert.equal(menu,newest);
+  tray.dispose();assert.equal(timers.size,0);
 });
 
 test('tray can relabel without changing gateway state',async()=>{
@@ -65,6 +92,12 @@ test('file-transfer settings reach the worker through the IPC allowlist',async()
   const result=await runWorker({executable:process.execPath,prefix:['-e',script],dataDir:'/fixture'},'transfer-settings',{clickDownloadMiB:60});
   assert.deepEqual(result,{action:'transfer-settings',payload:{clickDownloadMiB:60}});
 });
+test('named Webhook edits reach the worker through the IPC allowlist',async()=>{
+  const script="let value='';process.stdin.on('data',data=>value+=data);process.stdin.on('end',()=>console.log(JSON.stringify({ok:true,result:{action:process.argv[1],payload:JSON.parse(value)}})));";
+  const payload={action:'delete',webhookId:'named-1'};
+  const result=await runWorker({executable:process.execPath,prefix:['-e',script],dataDir:'/fixture'},'webhook-endpoint',payload);
+  assert.deepEqual(result,{action:'webhook-endpoint',payload});
+});
 test('unknown IPC action cannot become a command',async()=>{await assert.rejects(runWorker({executable:'unused',dataDir:'unused'},'shell'),/未知操作/);});
 test('development launch keeps script as its own argument',()=>{
   const result=workerFor({packaged:false,root:'/source path',dataDir:'/data'});assert.deepEqual(result.prefix,['-B',path.join('/source path','desktop.py')]);
@@ -72,29 +105,45 @@ test('development launch keeps script as its own argument',()=>{
 
 // Exercise the real renderer's start and polling handlers with a controlled
 // backend and clock. DOM layout and input editing are outside these checks.
-async function renderer(initialLanguage='zh-CN',{autoStart=false,hidden=false,loginStartup}={}){
+async function renderer(initialLanguage='zh-CN',{autoStart=false,hidden=false,loginStartup,AccountsPanel,DesktopConnectionsPanel,platform='darwin'}={}){
   const fs=require('node:fs'),vm=require('node:vm');
   const nodes=new Map();
-  function node(){return {parentNode:{insertBefore(){}},getAnimations(){return [];},animate(){},closest(){return null;},value:'',checked:false,hidden:false,textContent:'',dataset:{},
-    classList:{toggle(){}},click(){return this.onclick?.();},append(...items){this.children=(this.children||[]).concat(items);},replaceChildren(...items){this.children=items;},setAttribute(){},removeAttribute(){},querySelectorAll(){return [];}};}
+  function node(){return {parentNode:{insertBefore(){}},getAnimations(){return [];},animate(){},scrollIntoView(){},focus(){},addEventListener(){},closest(){return null;},value:'',checked:false,hidden:false,textContent:'',dataset:{},
+    classList:{toggle(){},add(){},contains(){return false;}},before(item){this.beforeNode=item;},get options(){return this.children||[];},click(){return this.onclick?.();},append(...items){this.children=(this.children||[]).concat(items);},replaceChildren(...items){this.children=items;},setAttribute(){},removeAttribute(){},querySelectorAll(){return [];}};}
   const html=fs.readFileSync(path.join(__dirname,'../desktop/index.html'),'utf8');
   for(const match of html.matchAll(/\bid="([^"]+)"/g))nodes.set(match[1],node());
-  for(const id of ['clients-start','clients-stop'])nodes.set(id,node());
+  for(const id of ['clients-start','clients-stop','clients-page'])nodes.set(id,node());
   const value={loginStartup,runtime:{running:false,portOccupied:false,supportsNotifications:true},
     preferences:{port:8787,lan:true,tunnel:false,autoStart,connections:[]},
-    auth:{mode:'password',username:'admin'},notifications:{enabled:false,server:'https://ntfy.sh',topic:''},
+    auth:{mode:'password',username:'admin'},notifications:{enabled:false,server:'https://ntfy.sh',topic:'',webhookTemplates:{generic:'{"event":"{{event}}"}',feishu:JSON.stringify({msg_type:'text',content:{text:'{{title}}\n{{body}}\n{{url}}'}}),dingtalk:'{"msgtype":"text"}',discord:'{"content":"{{body}}"}',telegram:'{"chat_id":"","text":"{{body}}"}'}},
     notificationStatus:{},watches:[],origins:[],urls:[],dataDir:'/test',credentialsAvailable:false};
   let now=1000,poll;
   const calls=[];
-  const api={account:async()=>({visible:false}),language:async()=>initialLanguage,setLanguage:async value=>value,snapshot:async()=>{calls.push('snapshot');return structuredClone(value);},start:async()=>{calls.push('start');return {started:true,message:'正在启动网关'};},
+  const api={platform,account:async()=>({visible:false}),language:async()=>initialLanguage,setLanguage:async value=>value,snapshot:async()=>{calls.push('snapshot');return structuredClone(value);},start:async()=>{calls.push('start');return {started:true,message:'正在启动网关'};},
     save:async payload=>{value.preferences={...value.preferences,...payload.preferences};return structuredClone(value);},logs:async()=>({text:''})};
-  const context=vm.createContext({window:{bridgeDesktop:api},
-    localStorage:{getItem(){return null;},setItem(){}},document:{hidden,addEventListener(name,fn){this[name]=fn;},documentElement:{},getElementById:id=>nodes.get(id),createElement:node,querySelectorAll:()=>[]},
+  api.cliAccess=async payload=>{calls.push({cliAccess:structuredClone(payload)});return payload.operation==='environments'?{provider:payload.provider,environments:[]}:{provider:payload.provider,entry:payload.entry,identity:'fixture-identity',available:true,accounts:[],blockers:[],capabilities:{switch:true,models:true}};};
+  const context=vm.createContext({window:{bridgeDesktop:api},AccountsPanel,DesktopConnectionsPanel,Option:function(text,value){return Object.assign(node(),{textContent:text,value});},
+    localStorage:{getItem(){return null;},setItem(){}},document:{head:{append(script){script.onload?.();}},hidden,addEventListener(name,fn){this[name]=fn;},documentElement:{},getElementById:id=>nodes.get(id),createElement:node,querySelectorAll:()=>[]},
     URL,Date:class extends Date{static now(){return now;}},setTimeout(){},clearTimeout(){},clearInterval(){},setInterval:(callback,ms)=>{if(callback.name==='refresh')poll=callback;}});
-  for(const name of ['web/shared/i18n.js','desktop/shared/secret-fields.js','desktop/features/connections/connections.js','desktop/features/connections/pairing.js','web/features/accounts/account.js','desktop/features/notifications/watches.js','desktop/shell/renderer.js'])vm.runInContext(fs.readFileSync(path.join(__dirname,'..',name),'utf8'),context);
+  for(const name of ['web/shared/i18n.js','desktop/shared/secret-fields.js','desktop/features/connections/connections.js','desktop/features/connections/pairing.js','web/features/accounts/account.js','desktop/features/notifications/watches.js','web/features/accounts/wsl-accounts.js','desktop/shell/renderer.js'])vm.runInContext(fs.readFileSync(path.join(__dirname,'..',name),'utf8'),context);
   await new Promise(setImmediate);
   return {nodes,value,context,api,calls,run:code=>vm.runInContext(code,context),poll:()=>poll(),advance:ms=>{now+=ms;},start:()=>nodes.get('start').onclick()};
 }
+
+test('desktop tab transitions update visibility before Codex account polling resumes',async()=>{
+  const events=[],accounts={dataset:{panel:'accounts'},hidden:true},overview={dataset:{panel:'overview'},hidden:false};
+  const ui=await renderer('zh-CN',{AccountsPanel:class{
+    attachApiAccess(panel,details){this.apiAccess=panel;this.apiDetails=details;}
+    visible(){return !accounts.hidden;}
+    refresh(){events.push(['refresh',accounts.hidden]);}
+    resume(){events.push(['resume',accounts.hidden]);}
+    render(){}
+  }});
+  ui.context.document.querySelectorAll=selector=>selector==='[data-panel]'?[accounts,overview]:[];
+  events.length=0;
+  ui.run("tab('accounts')");ui.run("tab('overview')");ui.run("tab('accounts')");
+  assert.deepEqual(events,[['refresh',false],['resume',true],['refresh',false]]);
+});
 
 for(const transferFirst of [false,true])test(`independent transfer settings ${transferFirst?'before':'after'} snapshot do not block gateway startup or hide real drafts`,async()=>{
   const ui=await renderer(),fs=require('node:fs'),vm=require('node:vm');
@@ -137,6 +186,33 @@ for(const transferFirst of [false,true])test(`independent transfer settings ${tr
   assert.equal(ui.value.preferences.autoStart,true,'independent validation cannot block saving gateway settings');
 });
 
+test('client account controls cannot dirty or block saving the gateway, and a gateway draft links to its field',async()=>{
+  const ui=await renderer();
+  const port=ui.nodes.get('port'),settings=ui.nodes.get('settings');
+  const network={dataset:{panel:'network'}},client={dataset:{panel:'accounts'}};
+  port.id='port';port.type='number';port.closest=selector=>selector==='[data-panel]'?network:null;
+  port.validity={valid:true};
+  // Agent account editors mount after the first snapshot. Their required name and auth fields
+  // share an empty DOM id, have different defaults and are saved by the account API.
+  const independent=['','bearer'].map(value=>({id:'',value,dataset:{},validity:{valid:false},
+    closest:selector=>selector==='[data-panel]'?client:null}));
+  settings.querySelectorAll=()=>[port];
+  ui.run('dirty=false;render(snapshot)');
+  settings.querySelectorAll=()=>[port,...independent];
+  ui.run('updateDirty()');assert.equal(ui.run('dirty'),false);
+  port.value='9797';ui.run('updateDirty()');assert.equal(ui.run('dirty'),true);
+  assert.equal(port.dataset.unsaved,'true');
+  let focused=false;port.focus=()=>{focused=true;};
+  const list=ui.nodes.get('dirty-fields');
+  assert.equal(list.children.length,1);list.children[0].click();
+  assert.equal(ui.run('activeTab'),'network');assert.equal(focused,true);
+  port.value=8787;ui.run('updateDirty()');assert.equal(ui.run('dirty'),false);
+  port.value='9797';ui.run('updateDirty()');
+  await settings.onsubmit({preventDefault(){}});
+  assert.equal(ui.value.preferences.port,9797);assert.equal(ui.run('dirty'),false);
+  assert.equal(port.dataset.unsaved,undefined);assert.equal(independent[1].value,'bearer');
+});
+
 test('Tailscale detection fills a read-only URL and preserves its unsaved identity across polls',async()=>{
   const ui=await renderer('en');
   ui.run(`connectionDraft=[{id:'ts',name:'',enabled:true,accessMode:'tailscale',publicUrl:'',tailscaleMode:'funnel',tailscalePort:443,tailscaleNodeId:''}];savedConnections=JSON.stringify(connectionDraft);renderConnections();updateDirty();`);
@@ -153,6 +229,116 @@ test('Tailscale detection fills a read-only URL and preserves its unsaved identi
   assert.equal(ui.run('connectionDraft[0].publicUrl'),'https://mac.example.ts.net');
   controls=descendants(ui.nodes.get('connections'));
   assert.equal(controls.find(node=>node.dataset.connectionAction==='tailscaleInspect').textContent,'Detect Tailscale and read URL');
+});
+
+test('existing tunnel needs only an HTTPS address and keeps NAS upstream in the advanced location',async()=>{
+  const descendants=node=>[node,...(node.children||[]).flatMap(descendants)];
+  for(const language of ['zh-CN','en']){
+    const ui=await renderer(language);
+    ui.run(`connectionDraft=[{id:'entry',name:'Home',enabled:true,accessMode:'external',publicUrl:'',proxyUpstream:''}];renderConnections();`);
+    let controls=descendants(ui.nodes.get('connections'));
+    const url=controls.find(node=>node.dataset.connectionField==='publicUrl');
+    assert.equal(url.required,true);assert.equal(url.value,'');
+    assert.equal(controls.some(node=>node.dataset.connectionField==='proxyUpstream'),false);
+    assert.equal(controls.some(node=>node.dataset.connectionAction==='exportDeployment'),false);
+    assert.equal(controls.some(node=>node.dataset.connectionAction==='checkEntry'),true);
+    assert.equal(controls.find(node=>node.textContent==='http://127.0.0.1:8787')?.textContent,'http://127.0.0.1:8787');
+    url.value='bridge.example.com:8443';url.oninput();url.onblur();
+    assert.equal(ui.run('connectionDraft[0].publicUrl'),'https://bridge.example.com:8443');
+    assert.equal(ui.run("normalizeExternalUrl('http://bridge.example.com')"),'http://bridge.example.com');
+    assert.equal(ui.run("normalizeExternalUrl('bridge.example.com/path')"),'bridge.example.com/path');
+    const location=controls.find(node=>node.dataset.connectionField==='targetLocation');location.value='nas';location.onchange();
+    assert.equal(ui.run('connectionDraft[0].accessMode'),'nas');
+    controls=descendants(ui.nodes.get('connections'));
+    assert.equal(controls.some(node=>node.dataset.connectionField==='proxyUpstream'),true);
+    assert.equal(controls.some(node=>node.dataset.connectionAction==='exportDeployment'),true);
+    const copy=controls.map(node=>node.textContent).join(' ');
+    assert.match(copy,language==='en'?/Enable LAN access/:/需要开启局域网访问/);
+    assert.doesNotMatch(copy,language==='en'?/[\u4e00-\u9fff]/:/Fixed domain · NAS/);
+  }
+});
+
+test('submitting a focused bare hostname saves a strict HTTPS origin',async()=>{
+  const ui=await renderer();
+  ui.run(`connectionDraft=[{id:'entry',name:'Home',enabled:true,accessMode:'external',publicUrl:''}];renderConnections();`);
+  const descendants=node=>[node,...(node.children||[]).flatMap(descendants)];
+  const url=descendants(ui.nodes.get('connections')).find(node=>node.dataset.connectionField==='publicUrl');
+  url.value='bridge.example.com:8443';url.oninput();
+  let submitted;ui.api.save=async payload=>{submitted=payload;ui.value.preferences={...ui.value.preferences,...payload.preferences};return structuredClone(ui.value);};
+  await ui.nodes.get('settings').onsubmit({preventDefault(){}});
+  assert.equal(submitted.preferences.connections[0].publicUrl,'https://bridge.example.com:8443');
+  assert.equal(ui.value.preferences.connections[0].accessMode,'external');
+});
+
+test('external status updates detail while summary reports saved enablement',async()=>{
+  const ui=await renderer();
+  ui.value.preferences.connections=[{id:'entry',name:'Home',enabled:true,accessMode:'external',publicUrl:'https://bridge.example.com'}];
+  await ui.poll();
+  const descendants=node=>[node,...(node.children||[]).flatMap(descendants)];
+  const card=ui.nodes.get('connections').children[0],items=descendants(card);
+  const status=items.find(node=>node.dataset.connectionStatus==='entry');
+  const summary=items.find(node=>node.className==='connection-summary');
+  status.closest=()=>({querySelector:()=>summary});
+  ui.context.document.querySelectorAll=selector=>selector==='[data-connection-status]'?[status]:[];
+  ui.context.document.activeElement={closest:selector=>selector==='#connections'?card:null};
+  await ui.poll();
+  assert.match(status.textContent,/保存并启动网关后可检测入口/);
+  assert.doesNotMatch(status.textContent,/导出部署包/);
+  ui.value.externalStatus={entry:{message:'入口已连接'}};
+  await ui.poll();
+  assert.match(summary.textContent,/Home · https:\/\/bridge.example.com · 已启用/);
+  assert.match(status.textContent,/入口已连接/);
+  assert.equal(ui.nodes.get('connections').children[0],card);
+});
+
+test('disabled connection ignores stale online status',async()=>{
+  const ui=await renderer();ui.value.preferences.connections=[{id:'entry',name:'Home',enabled:false,accessMode:'external',publicUrl:'https://bridge.example.com'}];
+  ui.value.externalStatus={entry:{message:'入口已连接'}};await ui.poll();
+  const descendants=node=>[node,...(node.children||[]).flatMap(descendants)];
+  const card=ui.nodes.get('connections').children[0],items=descendants(card);
+  assert.match(items.find(node=>node.className==='connection-summary').textContent,/已配置但未启用/);
+  const status=items.find(node=>node.dataset.connectionStatus==='entry');
+  ui.context.document.querySelectorAll=selector=>selector==='[data-connection-status]'?[status]:[];
+  ui.value.externalStatus={entry:{message:'入口仍显示已连接'}};
+  await ui.poll();assert.equal(status.textContent,'已配置但未启用');
+});
+
+test('fixed-entry retry replaces an earlier error in card and summary across polling',async()=>{
+  const ui=await renderer();
+  ui.value.preferences.connections=[{id:'entry',name:'Home',enabled:true,accessMode:'external',publicUrl:'https://bridge.example.com:8443'}];
+  await ui.poll();
+  const descendants=node=>[node,...(node.children||[]).flatMap(descendants)];
+  const items=()=>descendants(ui.nodes.get('connections'));
+  const check=()=>items().find(node=>node.dataset.connectionAction==='checkEntry').click();
+  const text=()=>items().filter(node=>node.dataset.connectionStatus==='entry'||node.className==='connection-summary').map(node=>node.textContent).join('\n');
+  ui.api.checkEntry=async()=>{throw Error("Error invoking remote method 'bridge:check-entry': Error: HTTPS 证书或 TLS 握手失败；请检查域名、证书和反代配置");};
+  await check();assert.match(text(),/TLS/);
+  const message='固定 HTTPS 入口已连到当前网关。请再用手机蜂窝网络验证登录与聊天。';
+  ui.api.checkEntry=async()=>({url:'https://bridge.example.com:8443',message});
+  await check();assert.ok(text().includes(message));assert.doesNotMatch(text(),/TLS|Error invoking/);
+  await ui.poll();assert.ok(text().includes(message));assert.doesNotMatch(text(),/TLS|Error invoking/);
+  ui.run("applyLanguage('en')");assert.doesNotMatch(text(),/TLS|Error invoking/);
+  ui.api.checkEntry=async()=>{throw Error('入口没有连接到当前网关；请检查反代目标，旧版网关须先更新并重启');};
+  await check();assert.doesNotMatch(text(),/Please also verify|固定 HTTPS 入口已/);
+});
+
+test('fixed-entry results belong to the checked target and gateway instance',async()=>{
+  const ui=await renderer();
+  ui.value.runtime={running:true,instanceId:'first'};
+  ui.value.preferences.connections=[{id:'entry',name:'Home',enabled:true,accessMode:'external',publicUrl:'https://one.example.com'}];
+  await ui.poll();
+  const descendants=node=>[node,...(node.children||[]).flatMap(descendants)];
+  const check=()=>descendants(ui.nodes.get('connections')).find(node=>node.dataset.connectionAction==='checkEntry').click();
+  let finish,requests=0;
+  ui.api.checkEntry=()=>{requests++;return new Promise(resolve=>finish=resolve);};
+  const pending=check();await new Promise(setImmediate);await check();assert.equal(requests,1);
+  ui.value.preferences.connections[0].publicUrl='https://two.example.com';
+  await ui.poll();finish({message:'first target passed'});await pending;
+  assert.equal(ui.run("connectionSetupState.has('entry')"),false);
+  ui.api.checkEntry=async()=>({message:'second target passed'});await check();
+  assert.equal(ui.run("connectionSetupState.get('entry')"),'second target passed');
+  ui.value.runtime.instanceId='second';await ui.poll();
+  assert.equal(ui.run("connectionSetupState.has('entry')"),false);
 });
 
 test('changing the Tailscale HTTPS port invalidates the previously detected URL',async()=>{
@@ -249,6 +435,96 @@ test('notification test buttons select the channel and block unsaved drafts',asy
   assert.equal(calls.length,2);assert.match(ui.nodes.get('toast-message').textContent,/请先保存通知配置/);
 });
 
+test('desktop Webhook edits save per endpoint and failed saves retain secrets',async()=>{
+  const ui=await renderer();ui.value.notifications.webhookEndpoints=[{webhookId:'legacy',webhookName:'Default Webhook',webhookProvider:'auto',webhookBodyTemplate:'{\"event\":\"{{event}}\"}',webhookTemplates:ui.value.notifications.webhookTemplates}];await ui.poll();
+  ui.nodes.get('webhook-url').value='https://example.test/hook?token=secret';ui.nodes.get('webhook-headers').value='{bad';
+  let payload;ui.api.webhookEndpoint=async value=>{payload=value;throw Error('Save failed');};
+  await ui.nodes.get('webhook-save').onclick();assert.equal(payload,undefined);assert.match(ui.nodes.get('toast-message').textContent,/JSON/);
+  ui.nodes.get('webhook-headers').value='{"X-Key":"secret"}';await ui.nodes.get('webhook-save').onclick();assert.equal(ui.nodes.get('webhook-url').value,'https://example.test/hook?token=secret');
+  ui.api.webhookEndpoint=async value=>{payload=value;return {selectedWebhookId:'legacy',webhookEndpoints:[{webhookId:'legacy',webhookName:'Default Webhook',webhookEnabled:true,webhookProvider:'auto',webhookBodyTemplate:value.webhookBodyTemplate,hasWebhookUrl:true,webhookUrlDisplay:'https://example.test',hasWebhookHeaders:true,webhookTemplates:ui.value.notifications.webhookTemplates}]};};
+  ui.nodes.get('webhook-enabled').checked=true;await ui.nodes.get('webhook-save').onclick();
+  assert.equal(payload.webhookId,'legacy');assert.equal(payload.webhookUrl,'https://example.test/hook?token=secret');assert.deepEqual(JSON.parse(JSON.stringify(payload.webhookHeaders)),{'X-Key':'secret'});
+  assert.equal(ui.nodes.get('webhook-url').value,'');assert.equal(ui.nodes.get('webhook-headers').value,'');
+  assert.equal(ui.run('collect().notifications.webhookUrl'),undefined);
+});
+
+test('desktop Webhook test is saved-only and named creation has isolated identity',async()=>{
+  const ui=await renderer();await ui.poll();ui.nodes.get('webhook-add').onclick();ui.nodes.get('webhook-name').value='Ops';ui.nodes.get('webhook-provider').value='feishu';ui.nodes.get('webhook-sign-secret').value='sample-secret';ui.nodes.get('webhook-use-template').onclick();
+  let tests=0;ui.api.testNotification=async()=>{tests++;return {message:'accepted'};};await ui.nodes.get('test-webhook').onclick();assert.equal(tests,0);
+  let payload;ui.api.webhookEndpoint=async value=>{payload=value;return {selectedWebhookId:'named-1',webhookEndpoints:[{webhookId:'named-1',webhookName:'Ops',webhookEnabled:true,webhookProvider:'feishu',webhookBodyTemplate:value.webhookBodyTemplate,webhookTemplates:ui.value.notifications.webhookTemplates}]};};
+  await ui.nodes.get('webhook-save').onclick();assert.equal(payload.webhookId,undefined);assert.equal(payload.webhookSignSecret,'sample-secret');assert.equal(ui.nodes.get('webhook-sign-secret').value,'');
+  await ui.nodes.get('test-webhook').onclick();assert.equal(tests,1);
+});
+
+test('desktop saved Webhook URL reveal is scoped to selected endpoint',async()=>{
+  const ui=await renderer(),url=ui.nodes.get('webhook-url');ui.value.notifications.webhookEndpoints=[{webhookId:'named-1',webhookName:'Ops',hasWebhookUrl:true,webhookUrlDisplay:'https://example.test',webhookTemplates:ui.value.notifications.webhookTemplates}];await ui.poll();ui.run("activeTab='notifications'");
+  let calls=0;ui.api.readCredentials=async request=>{calls++;assert.deepEqual(JSON.parse(JSON.stringify(request)),{channel:'webhook',webhookId:'named-1'});return {webhookUrl:'https://example.test/hook?token=private'};};
+  await ui.nodes.get('webhook-url-eye').onclick();assert.equal(calls,1);assert.equal(url.type,'text');assert.equal(ui.run('webhookDirty()'),false);assert.equal(ui.run('webhookUrlDraft()'),'');
+  await ui.nodes.get('webhook-url-eye').onclick();assert.equal(url.value,'');assert.equal(url.type,'password');
+});
+
+test('desktop slow create adopts its ID while preserving edits made during save',async()=>{
+  const ui=await renderer();await ui.poll();ui.nodes.get('webhook-add').onclick();ui.nodes.get('webhook-name').value='First';
+  let complete,payload;ui.api.webhookEndpoint=value=>{payload=value;return new Promise(resolve=>{complete=resolve;});};
+  const pending=ui.nodes.get('webhook-save').onclick();ui.nodes.get('webhook-name').value='Edited while saving';
+  complete({selectedWebhookId:'named-1',webhookEndpoints:[{webhookId:'named-1',webhookName:'First',webhookBodyTemplate:payload.webhookBodyTemplate,webhookTemplates:ui.value.notifications.webhookTemplates}]});await pending;
+  assert.equal(ui.run('webhookSelectedId'),'named-1');assert.equal(ui.run('webhookCreating'),false);
+  assert.equal(ui.nodes.get('webhook-name').value,'Edited while saving');assert.equal(ui.run('webhookDirty()'),true);
+  ui.api.webhookEndpoint=async value=>{payload=value;return {selectedWebhookId:'named-1',webhookEndpoints:[]};};
+  await ui.nodes.get('webhook-save').onclick();assert.equal(payload.webhookId,'named-1');
+});
+
+test('ordinary desktop settings save omits every legacy Webhook field',async()=>{
+  const ui=await renderer();await ui.poll();const notifications=ui.run('collect().notifications');
+  assert.deepEqual(Object.keys(notifications).filter(key=>/^webhook|^clearWebhook/.test(key)),[]);
+});
+
+test('unrelated desktop snapshot does not hide a revealed Webhook URL',async()=>{
+  const ui=await renderer(),url=ui.nodes.get('webhook-url');ui.value.notifications.webhookEndpoints=[{webhookId:'named-1',webhookName:'Ops',hasWebhookUrl:true,webhookUrlDisplay:'https://example.test',webhookTemplates:ui.value.notifications.webhookTemplates}];await ui.poll();ui.run("activeTab='notifications'");
+  ui.api.readCredentials=async()=>({webhookUrl:'https://example.test/hook?token=private'});
+  await ui.nodes.get('webhook-url-eye').onclick();ui.value.runtime.running=true;await ui.poll();
+  assert.equal(url.type,'text');assert.equal(url.value,'https://example.test/hook?token=private');assert.equal(ui.run('webhookDirty()'),false);
+});
+
+test('desktop language switch translates Webhook hints without losing drafts or revealed URL',async()=>{
+  const ui=await renderer(),url=ui.nodes.get('webhook-url'),body=ui.nodes.get('webhook-body-template');
+  ui.value.notifications.webhookEndpoints=[{webhookId:'legacy',webhookName:'默认 Webhook',webhookProvider:'auto',webhookResolvedProvider:'feishu',hasWebhookUrl:true,webhookUrlDisplay:'https://example.test',hasWebhookHeaders:true,hasWebhookSignSecret:true,webhookBodyTemplate:'{"event":"{{event}}"}',webhookTemplates:ui.value.notifications.webhookTemplates}];
+  await ui.poll();ui.run("activeTab='notifications'");ui.api.readCredentials=async()=>({webhookUrl:'https://example.test/hook?token=private'});
+  await ui.nodes.get('webhook-url-eye').onclick();body.value='{"custom":"{{body}}"}';
+  ui.context.applyLanguage('en');
+  assert.equal(url.type,'text');assert.equal(url.value,'https://example.test/hook?token=private');assert.equal(body.value,'{"custom":"{{body}}"}');
+  assert.equal(ui.nodes.get('webhook-url-eye').textContent,'Hide address');
+  assert.equal(ui.nodes.get('webhook-name').value,'Default Webhook');assert.equal(ui.run('webhookDirty()'),true);
+  for(const id of ['webhook-provider-hint','webhook-url-saved','webhook-headers-saved','webhook-sign-saved'])assert.doesNotMatch(ui.nodes.get(id).textContent,/[\u4e00-\u9fff]/);
+});
+
+test('desktop language switch translates new Webhook hints without clearing its draft',async()=>{
+  const ui=await renderer();await ui.poll();ui.nodes.get('webhook-add').onclick();ui.nodes.get('webhook-name').value='Ops';ui.nodes.get('webhook-sign-secret').value='private draft';
+  ui.context.applyLanguage('en');
+  assert.equal(ui.nodes.get('webhook-name').value,'Ops');assert.equal(ui.nodes.get('webhook-sign-secret').value,'private draft');
+  for(const id of ['webhook-provider-hint','webhook-url-saved','webhook-headers-saved','webhook-sign-saved'])assert.doesNotMatch(ui.nodes.get(id).textContent,/[\u4e00-\u9fff]/);
+});
+
+test('remote deletion keeps a desktop Webhook draft tied to its original ID',async()=>{
+  const ui=await renderer(),templates=ui.value.notifications.webhookTemplates;
+  ui.value.notifications.webhookEndpoints=[{webhookId:'named-1',webhookName:'First',webhookBodyTemplate:templates.generic,webhookTemplates:templates},{webhookId:'named-2',webhookName:'Second',webhookBodyTemplate:templates.generic,webhookTemplates:templates}];
+  await ui.poll();ui.run("selectWebhook('named-2')");ui.nodes.get('webhook-name').value='Unsaved second';
+  ui.value.notifications.webhookEndpoints=ui.value.notifications.webhookEndpoints.slice(0,1);await ui.poll();
+  assert.equal(ui.run('webhookSelectedId'),'named-2');assert.equal(ui.nodes.get('webhook-name').value,'Unsaved second');
+  let requested;ui.api.webhookEndpoint=async value=>{requested=value;throw Error('Webhook 不存在，请刷新列表');};
+  await ui.nodes.get('webhook-save').onclick();assert.equal(requested.webhookId,'named-2');assert.equal(ui.nodes.get('webhook-name').value,'Unsaved second');
+});
+
+test('watch panel recognizes Webhook and PushPlus as enabled notification channels',async()=>{
+  const ui=await renderer();
+  ui.value.runtime.running=true;
+  ui.value.watches=[{id:'fixture-chat',host:'local',title:'Fixture'}];
+  ui.value.notifications.webhookEnabled=true;await ui.poll();
+  assert.match(ui.nodes.get('watches').children[0].textContent,/正在监控/);
+  ui.value.notifications.webhookEnabled=false;ui.value.notifications.pushplusEnabled=true;await ui.poll();
+  assert.match(ui.nodes.get('watches').children[0].textContent,/正在监控/);
+});
+
 test('Bark drafts survive polling and language changes and remain after saving',async()=>{
   const ui=await renderer();
   const ids=['bark-key','bark-server','bark-enabled','clear-bark-key'];
@@ -275,7 +551,7 @@ test('Bark drafts survive polling and language changes and remain after saving',
 
 test('preload forwards the selected notification channel over private IPC',()=>{
   const fs=require('node:fs'),vm=require('node:vm'),calls=[];let api;
-  vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../desktop/preload.cjs'),'utf8'),{require:()=>({
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../desktop/preload.cjs'),'utf8'),{process:{platform:'darwin'},require:()=>({
     contextBridge:{exposeInMainWorld:(name,value)=>{api=value;}},ipcRenderer:{invoke:(...args)=>{calls.push(args);}}
   })});
   assert.equal('documentsAccess' in api,false);
@@ -414,6 +690,43 @@ test('packaging rejects a gateway from another architecture, OS or version',asyn
     await assert.rejects(verify(context),/ENOENT/);
   }finally{await fs.rm(root,{recursive:true,force:true});}
 });
+test('Windows packaging requires the complete locked ConPTY pair',async()=>{
+  const fs=require('node:fs/promises'),os=require('node:os'),{Arch}=require('builder-util');
+  const verify=require('../scripts/verify-build.cjs'),root=await fs.mkdtemp(path.join(os.tmpdir(),'gateway-conpty-build-'));
+  const context={packager:{projectDir:root,appInfo:{version:'1.2.2'}},arch:Arch.x64,electronPlatformName:'win32'};
+  const priorFilter=process.env.ELECTRON_BUILDER_7Z_FILTER;
+  try{
+    const runtime=path.join(root,'dist/gateway/_internal');
+    await fs.mkdir(path.join(runtime,'client-helpers'),{recursive:true});
+    await fs.mkdir(path.join(runtime,'cloudflared'),{recursive:true});
+    await fs.mkdir(path.join(runtime,'conpty'),{recursive:true});
+    await fs.mkdir(path.join(root,'scripts'));
+    await fs.writeFile(path.join(root,'dist/update-version.json'),JSON.stringify({platform:'win32',arch:'x64',version:'1.2.2'}));
+    await fs.writeFile(path.join(root,'dist/gateway/codex-mobile-gateway.exe'),'fixture');
+    for(const name of ['claude-bridge-helper.exe','codex-quit-helper.exe'])
+      await fs.writeFile(path.join(runtime,'client-helpers',name),'fixture');
+    await fs.writeFile(path.join(root,'scripts/cloudflared-lock.json'),JSON.stringify({version:'fixture'}));
+    await fs.writeFile(path.join(runtime,'cloudflared/version.json'),JSON.stringify({platform:'win32',arch:'amd64',version:'fixture'}));
+    await fs.writeFile(path.join(runtime,'cloudflared/cloudflared.exe'),'fixture');
+    await fs.writeFile(path.join(runtime,'cloudflared/LICENSE'),'fixture');
+    const conpty=path.join(runtime,'conpty');
+    await fs.writeFile(path.join(root,'scripts/conpty-lock.json'),JSON.stringify({version:'1.25',sha256:'fixturehash'}));
+    await fs.writeFile(path.join(conpty,'version.json'),JSON.stringify({version:'1.25',arch:'x64',packageSha256:'fixturehash'}));
+    await assert.rejects(verify(context),/ENOENT/);
+    for(const name of ['conpty.dll','x86/OpenConsole.exe','x64/OpenConsole.exe','arm64/OpenConsole.exe','LICENSE']){
+      await fs.mkdir(path.dirname(path.join(conpty,name)),{recursive:true});
+      await fs.writeFile(path.join(conpty,name),'fixture');
+    }
+    await verify(context);
+    assert.equal(process.env.ELECTRON_BUILDER_7Z_FILTER,'BCJ');
+    await fs.writeFile(path.join(conpty,'version.json'),JSON.stringify({version:'other',arch:'x64',packageSha256:'fixturehash'}));
+    await assert.rejects(verify(context),/ConPTY does not match/);
+  }finally{
+    if(priorFilter===undefined)delete process.env.ELECTRON_BUILDER_7Z_FILTER;
+    else process.env.ELECTRON_BUILDER_7Z_FILTER=priorFilter;
+    await fs.rm(root,{recursive:true,force:true});
+  }
+});
 test('Cloudflare installer selects official platform assets and rejects unsafe redirects',async()=>{
   assert.equal(cloudflared.assetName('darwin','arm64'),'cloudflared-darwin-arm64.tgz');
   assert.equal(cloudflared.assetName('darwin','x64'),'cloudflared-darwin-amd64.tgz');
@@ -523,6 +836,16 @@ test('check update button locks immediately and unlocks after failed check',asyn
   assert.equal(ui.nodes.get('check-update').disabled,false);
   assert.match(ui.nodes.get('update-state').textContent,/network failed/);
 });
+test('skipped update hides the automatic prompt while manual check offers installation',async()=>{
+  const ui=await renderer();let skips=0;
+  ui.value.update={state:'available',current:'2.0.0-preview.1',version:'2.0.0-preview.2'};await ui.poll();
+  assert.equal(ui.nodes.get('skip-update').hidden,false);
+  ui.api.skipUpdate=async()=>{skips++;ui.value.update={state:'skipped',current:'2.0.0-preview.1',version:'2.0.0-preview.2'};};
+  await ui.nodes.get('skip-update').onclick();assert.equal(skips,1);assert.equal(ui.nodes.get('update-banner').hidden,true);assert.equal(ui.nodes.get('skip-update').hidden,true);
+  ui.api.checkUpdate=async()=>{ui.value.update={state:'available',current:'2.0.0-preview.1',version:'2.0.0-preview.2',skipped:true};};
+  await ui.nodes.get('check-update').onclick();assert.equal(ui.nodes.get('install-update').hidden,false);assert.match(ui.nodes.get('update-state').textContent,/已跳过/);
+  ui.run("applyLanguage('en')");assert.match(ui.nodes.get('update-state').textContent,/skipped/);
+});
 
 test('download and retry states disable updates without permanently locking settings',async()=>{
   const ui=await renderer();
@@ -546,6 +869,17 @@ test('login validity is collected as zero and survives polling and language edit
   ui.run('dirty=false;render(snapshot)');assert.equal(Number(field.value),12);
   field.value='0';ui.run('updateDirty()');await ui.poll();ui.run("applyLanguage('en')");
   assert.equal(field.value,'0');assert.equal(ui.run('collect().auth.sessionHours'),0);
+});
+
+test('password edit defaults to revoking phones and can keep bindings explicitly',async()=>{
+  const ui=await renderer();
+  const password=ui.nodes.get('password'),option=ui.nodes.get('revoke-bound-devices-option'),box=ui.nodes.get('revoke-bound-devices');
+  assert.equal(option.hidden,true);assert.equal(box.checked,true);
+  password.value='a new password';ui.nodes.get('settings').oninput();
+  assert.equal(option.hidden,false);assert.equal(ui.run('collect().auth.revokeBoundDevices'),true);
+  box.checked=false;ui.nodes.get('settings').onchange();
+  assert.equal(ui.run('collect().auth.revokeBoundDevices'),false);
+  password.value='';ui.nodes.get('settings').oninput();assert.equal(option.hidden,true);
 });
 
 test('device policy drafts survive list refresh and language changes and use local IPC',async()=>{
@@ -572,13 +906,16 @@ test('failed device policy save retains the editable draft',async()=>{
 
 test('LAN selection drafts survive polling and are saved with local browser access disabled',async()=>{
   const ui=await renderer();
-  ui.value.networkInterfaces=[{name:'Ethernet',address:'192.168.1.7'},{name:'VMnet8',address:'192.168.55.1'}];
+  ui.value.networkInterfaces=[
+    {id:'Ethernet',name:'Ethernet',addresses:['192.168.1.7']},
+    {id:'VMnet8',name:'VMnet8',addresses:['192.168.55.1']}];
   await ui.poll();
-  assert.deepEqual(Array.from(ui.run('lanDraft')),['192.168.1.7','192.168.55.1']);
+  assert.deepEqual(Array.from(ui.run('lanDraft')),['Ethernet','VMnet8']);
   ui.nodes.get('lan-scope').value='selected';
   ui.nodes.get('local-access').checked=false;
-  ui.run("lanDraft=['192.168.1.7'];savedFields=fieldValues();savedLan='[]';updateDirty()");
+  ui.run("lanDraft=['Ethernet'];savedFields=fieldValues();savedLan='[]';updateDirty()");
   await ui.poll();
+  assert.deepEqual(Array.from(ui.run('collect().preferences.lanInterfaces')),['Ethernet']);
   assert.deepEqual(Array.from(ui.run('collect().preferences.lanAddresses')),['192.168.1.7']);
   assert.equal(ui.run('collect().preferences.localAccess'),false);
   let saved;
@@ -589,6 +926,56 @@ test('LAN selection drafts survive polling and are saved with local browser acce
   ui.value.runtime.running=true;await ui.poll();
   assert.equal(ui.nodes.get('lan-scope').disabled,true);
   assert.equal(ui.nodes.get('local-access').disabled,true);
+});
+
+test('selected adapter identity survives its address changing',async()=>{
+  const ui=await renderer();
+  ui.value.preferences.lanInterfaces=['Wi-Fi'];
+  ui.value.preferences.lanAddresses=['192.168.1.7'];
+  ui.value.networkInterfaces=[{id:'Wi-Fi',name:'Wi-Fi',addresses:['192.168.1.7']}];
+  await ui.poll();
+  ui.value.networkInterfaces=[{id:'Wi-Fi',name:'Wi-Fi',addresses:['192.168.3.9']}];
+  await ui.poll();
+  assert.deepEqual(Array.from(ui.run('lanDraft')),['Wi-Fi']);
+  assert.match(ui.run("document.getElementById('lan-addresses').children[0].children[1].textContent"),/192\.168\.3\.9/);
+  assert.deepEqual(Array.from(ui.run('collect().preferences.lanAddresses')),['192.168.3.9']);
+});
+
+test('network recovery is a separate default-off live setting and does not overwrite general drafts',async()=>{
+  const ui=await renderer(),calls=[];ui.value.networkAdaptation={enabled:false};ui.value.runtime.running=true;
+  ui.api.networkAdaptation=async payload=>{calls.push(payload);ui.value.networkAdaptation={enabled:payload.enabled};return ui.value.networkAdaptation;};
+  await ui.poll();const box=ui.nodes.get('network-adaptation-enabled');assert.equal(box.checked,false);assert.equal(box.disabled,false);
+  ui.nodes.get('port').value='8790';box.checked=true;await box.onchange({stopPropagation(){}});
+  assert.equal(calls.length,1);assert.equal(calls[0].action,'set');assert.equal(calls[0].enabled,true);assert.equal(box.checked,true);assert.equal(ui.nodes.get('port').value,'8790');
+  assert.equal(Object.hasOwn(ui.run('collect().preferences'),'networkAdaptation'),false);
+  assert.equal(Object.hasOwn(ui.run('collect().preferences'),'networkAdaptationEnabled'),false);
+  box.id='network-adaptation-enabled';ui.nodes.get('settings').querySelectorAll=()=>[box];assert.equal(ui.run('fields().length'),0);
+});
+
+test('desktop network recovery reconciles an uncertain write exactly once',async()=>{
+  const ui=await renderer(),calls=[];ui.value.networkAdaptation={enabled:false};
+  ui.api.networkAdaptation=async payload=>{calls.push(payload);if(payload.action==='set')throw Error('timeout');return {enabled:true};};await ui.poll();
+  const box=ui.nodes.get('network-adaptation-enabled');box.checked=true;await box.onchange();
+  assert.deepEqual(calls.map(row=>row.action),['set','status']);assert.equal(box.checked,true);assert.equal(box.disabled,false);
+  assert.doesNotMatch(ui.nodes.get('toast-message').textContent,/timeout/);
+  ui.api.networkAdaptation=async payload=>{if(payload.action==='set')throw Error('save rejected');return {enabled:true};};
+  box.checked=false;await box.onchange();assert.equal(box.checked,true);assert.match(ui.nodes.get('toast-message').textContent,/save rejected/);
+});
+
+test('a snapshot started before the live network save cannot undo its result',async()=>{
+  const ui=await renderer();ui.value.networkAdaptation={enabled:false};ui.api.networkAdaptation=async()=>({enabled:true});await ui.poll();
+  let finish;ui.api.snapshot=()=>new Promise(resolve=>finish=resolve);const reading=ui.poll();
+  const box=ui.nodes.get('network-adaptation-enabled');box.checked=true;await box.onchange();finish(structuredClone(ui.value));await reading;
+  assert.equal(box.checked,true);assert.equal(ui.run('snapshot.networkAdaptation.enabled'),true);
+});
+
+test('network recovery IPC is narrowly allowlisted and forwarded by preload',async()=>{
+  const fs=require('node:fs'),vm=require('node:vm');
+  const script="let value='';process.stdin.on('data',data=>value+=data);process.stdin.on('end',()=>console.log(JSON.stringify({ok:true,result:{action:process.argv[1],payload:JSON.parse(value)}})));";
+  const payload={action:'set',enabled:true};const result=await runWorker({executable:process.execPath,prefix:['-e',script],dataDir:'/fixture'},'network-adaptation',payload);
+  assert.deepEqual(result,{action:'network-adaptation',payload});
+  let api;const calls=[];vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../desktop/preload.cjs'),'utf8'),{process:{platform:'darwin'},require:()=>({contextBridge:{exposeInMainWorld(_name,value){api=value;}},ipcRenderer:{invoke(...args){calls.push(args);}}})});
+  api.networkAdaptation(payload);assert.deepEqual(calls,[['bridge:network-adaptation',payload]]);
 });
 
 test('project navigation uses fixed project destinations',async()=>{
@@ -643,15 +1030,15 @@ test('snapshot worker reuses a process and isolates data directory changes',asyn
 });
 
 
-test('native window title ignores page changes and only updates when locale changes',()=>{
+test('native window title and local target copy respect their fixed origins',async()=>{
   const fs=require('node:fs'),vm=require('node:vm'),requireMain=require('node:module').createRequire(path.resolve(__dirname,'../desktop/main.cjs'));
-  const handlers={},events={};let instance,changes=0;
+  const handlers={},events={},copied=[],opened=[];let instance,changes=0;
   class Window {
     constructor(options){instance=this;this.title=options.title;this.webContents={mainFrame:{url:require('node:url').pathToFileURL(path.resolve(__dirname,'../desktop/index.html')).href},setWindowOpenHandler(){},on(){},once(){}};}
     on(name,handler){events[name]=handler;}loadFile(){}getTitle(){return this.title;}setTitle(value){changes++;this.title=value;}
   }
   const context=vm.createContext({__dirname:path.resolve(__dirname,'../desktop'),process:{env:{},platform:'darwin'},require(name){
-    if(name==='electron')return {app:{requestSingleInstanceLock:()=>true,whenReady:()=>({then(){}}),on(){},getPath:()=>'.tmp'},BrowserWindow:Window,ipcMain:{handle:(name,handler)=>handlers[name]=handler}};
+    if(name==='electron')return {app:{requestSingleInstanceLock:()=>true,whenReady:()=>({then(){}}),on(){},getPath:()=>'.tmp'},BrowserWindow:Window,ipcMain:{handle:(name,handler)=>handlers[name]=handler},clipboard:{writeText:value=>copied.push(value)},shell:{openExternal:url=>opened.push(url)}};
     if(name==='node:fs')return {...fs,mkdirSync(){},writeFileSync(){}};
     if(name==='./features/connections/qr.cjs')return {};
     if(name==='./shared/gateway-language.cjs')return {publishLanguage(){}};
@@ -663,9 +1050,24 @@ test('native window title ignores page changes and only updates when locale chan
   let prevented=0;events['page-title-updated']({preventDefault(){prevented++;}},'Different page title');
   assert.equal(prevented,1);assert.equal(instance.title,'Codex 手机网关');
   const event={sender:instance.webContents,senderFrame:instance.webContents.mainFrame};
+  const originalWorker=context.worker,networkCalls=[];
+  context.worker=async(action,payload)=>{networkCalls.push({action,payload});return {enabled:payload.enabled===true};};
+  assert.equal((await handlers['bridge:network-adaptation'](event,{action:'set',enabled:true})).enabled,true);
+  assert.deepEqual(networkCalls,[{action:'network-adaptation',payload:{action:'set',enabled:true}}]);
+  await assert.rejects(handlers['bridge:network-adaptation']({...event,senderFrame:{}},{action:'set',enabled:false}),/不允许的界面来源/);
+  assert.equal(networkCalls.length,1);context.worker=originalWorker;
   handlers['bridge:set-language'](event,'zh-CN');assert.equal(changes,0);
   handlers['bridge:set-language'](event,'en');assert.equal(changes,1);
   handlers['bridge:set-language'](event,'en');assert.equal(changes,1);
+  vm.runInContext("lastSnapshot={urls:[],preferences:{port:8787}};updateQuitting=true;updater={status(){return {}}}",context);
+  await handlers['bridge:copy'](event,'http://127.0.0.1:8787');
+  await handlers['bridge:copy'](event,'http://127.0.0.1:8788');
+  assert.deepEqual(copied,['http://127.0.0.1:8787','http://127.0.0.1:8788']);
+  await assert.rejects(handlers['bridge:copy'](event,'http://127.0.0.1:65536'),/地址不可用/);
+  await assert.rejects(handlers['bridge:copy'](event,'http://127.0.0.1:8788/path'),/地址不可用/);
+  await assert.rejects(handlers['bridge:copy'](event,'http://192.168.1.2:8787'),/地址不可用/);
+  await handlers['bridge:open'](event,'setup-external');
+  assert.match(opened[0],/#external$/);
 });
 
 
@@ -757,4 +1159,45 @@ test('Windows startup lookup handles Electron quoted paths with spaces',()=>{
   const startup=createLoginStartup(app,{platform:'win32',executable:'C:/Program Files/Codex Mobile Bridge.exe'});
   assert.equal(startup.status().enabled,true);
   assert.deepEqual(queries,['C:/Program Files/Codex Mobile Bridge.exe','"C:/Program Files/Codex Mobile Bridge.exe"']);
+});
+
+test('desktop WSL scope uses registered environment transport and restores native content',async()=>{
+ let nativeReads=0;const ui=await renderer('zh-CN',{platform:'win32',AccountsPanel:class{attachApiAccess(panel,details){this.apiAccess=panel;this.apiDetails=details;}visible(){return true;}refresh(){nativeReads++;}resume(){}render(){}clear(){this.generation=(this.generation||0)+1;}}}),entry='wsl:'+'a'.repeat(32),requests=[];
+ ui.api.cliAccess=async payload=>{requests.push(structuredClone(payload));return payload.operation==='environments'?{provider:'codex',environments:[{id:entry,label:'Ubuntu',distribution:'Ubuntu',user:'developer',configDir:'/home/developer/.codex'}]}:{provider:'codex',entry,identity:'wsl-digest',available:true,accounts:[],capabilities:{switch:true,models:true},blockers:[]};};
+ await ui.run('wslAccountScopes[0].load()');const native=ui.nodes.get('accounts-content'),wrapper=native.beforeNode,select=wrapper.children[0].children[1];
+ assert.equal(select.options.length,2);assert.equal(select.options[1].value,entry);select.value=entry;await select.onchange();await new Promise(setImmediate);
+ assert.equal(native.hidden,true);assert.equal(ui.run('wslAccountScopes[0].panel.value.entry'),entry);assert.deepEqual(requests.at(-1),{action:'wslAccounts',provider:'codex',entry,operation:'list'});
+ const readsBeforeReturn=nativeReads;select.value='local';select.onchange();assert.equal(nativeReads,readsBeforeReturn+1);assert.equal(native.hidden,false);assert.equal(ui.run('wslAccountScopes[0].panel.value'),null);assert.equal(ui.run('wslAccountScopes[0].panel.entry'),'');
+});
+
+for(const platform of ['darwin','linux'])test(platform+' desktop does not initialize WSL account scopes',async()=>{
+ const ui=await renderer('zh-CN',{platform});assert.equal(ui.run('wslAccountScopes.length'),0);assert.equal(ui.calls.some(call=>call.cliAccess?.action==='wslAccounts'),false);
+ await assert.rejects(ui.context.window.loadWslAccounts(),/不支持 WSL/);
+});
+
+
+test('Codex quota remains visible in the client overview and pauses off the page',async()=>{
+ const ui=await renderer('zh-CN',{DesktopConnectionsPanel:class{managementClients(){return this.rows||[];}},AccountsPanel:class{visible(){return false;}resume(){}render(){}refresh(){}}});
+ ui.nodes.get('clients-page').hidden=false;assert.equal(ui.run('accountsPanel.visible()'),false);
+ ui.run("desktopConnections.rows=[{id:'codex',enabled:true}]");assert.equal(ui.run('accountsPanel.visible()'),true);
+ ui.nodes.get('clients-page').hidden=true;assert.equal(ui.run('accountsPanel.visible()'),false);
+ ui.nodes.get('clients-page').hidden=false;ui.context.document.hidden=true;assert.equal(ui.run('accountsPanel.visible()'),false);
+ ui.context.document.hidden=false;ui.nodes.get('clients-page').classList.contains=()=>true;assert.equal(ui.run('accountsPanel.visible()'),false);
+});
+
+test('update reminder routes directly to the maintenance update tab without a synthetic tab click',async()=>{
+ const fs=require('node:fs'),vm=require('node:vm'),ui=await renderer();
+ const panels=Object.fromEntries(['advanced','updates','logs'].map(name=>[name,{dataset:{panel:name},hidden:false}]));
+ const tabs=['general','updates','logs'].map(name=>({dataset:{maintenanceTab:name},classList:{toggle(_name,value){this.active=value;}}}));
+ const scope=vm.createContext({window:{},maintenance:panels.advanced,maintenanceTabs:{querySelectorAll:()=>tabs},description:{dataset:{}},back:{},client:null,
+   descriptions:{advanced:'Application maintenance'},t:value=>value,selectClient(){},hasClient(){},clientPage(){},forgetClient(){},document:{querySelector:selector=>panels[selector.match(/data-panel="([^"]+)"/)[1]]}});
+ const layout=fs.readFileSync(path.join(__dirname,'../desktop/shell/layout.js'),'utf8');
+ vm.runInContext(layout.split('\n').find(line=>line.trim().startsWith('function maintenanceTab('))+'\n'+layout.split('\n').find(line=>line.trim().startsWith('window.GatewayLayout=')),scope);
+ ui.context.window.GatewayLayout=scope.window.GatewayLayout;
+ const banner=ui.nodes.get('update-banner'),html=fs.readFileSync(path.join(__dirname,'../desktop/index.html'),'utf8');banner.dataset.jump=html.match(/id="update-banner" data-jump="([^"]+)"/)[1];
+ ui.context.document.querySelectorAll=selector=>selector==='[data-panel]'?Object.values(panels):selector==='[data-jump]'?[banner]:[];
+ const code=fs.readFileSync(path.join(__dirname,'../desktop/shell/renderer.js'),'utf8');ui.run(code.split('\n').find(line=>line.startsWith("document.querySelectorAll('[data-jump]')")));
+ banner.onclick();assert.equal(ui.run('activeTab'),'advanced');assert.equal(panels.updates.hidden,false);assert.equal(panels.advanced.hidden,true);assert.equal(panels.logs.hidden,true);assert.equal(tabs[1].classList.active,true);
+ ui.run("tab('logs')");assert.equal(panels.logs.hidden,false);assert.equal(panels.updates.hidden,true);
+ ui.run("tab('advanced')");assert.equal(panels.advanced.hidden,false);assert.equal(panels.updates.hidden,true);assert.equal(tabs[0].classList.active,true);
 });

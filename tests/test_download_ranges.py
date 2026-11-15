@@ -8,6 +8,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+from urllib.parse import quote
 
 from bridge.clients.codex.remote import RemoteStore
 from bridge.app.service import Bridge
@@ -47,7 +48,7 @@ class DownloadSnapshotTests(unittest.TestCase):
 
     def test_ssh_stream_executes_secure_workspace_source_and_transfers_only_range(self):
         store = RemoteStore('fixture-host'); store.get = lambda _: {'cwd': str(self.root)}
-        bridge = SimpleNamespace(host='remote:fixture', store=store)
+        bridge = SimpleNamespace(host='remote:fixture', local=False, store=store)
         original_run = subprocess.run
         def run(command, **kwargs):
             self.assertIn('StrictHostKeyChecking=yes', command)
@@ -95,6 +96,68 @@ class DownloadHttpTests(unittest.TestCase):
         result = response.status, dict(response.getheaders()), response.read()
         connection.close()
         return result
+
+    def test_trusted_artifact_outside_project_can_be_located_with_an_absolute_path(self):
+        import json
+        project = self.root/'project'; project.mkdir()
+        self.server.bridge.store = SimpleNamespace(get=lambda _: {'cwd': str(project)})
+        self.server.bridge.artifact = lambda thread, identifier: {'path': self.file, 'name': self.file.name, 'image': False}
+        url = '/api/sessions/' + support.THREAD + '/files/' + 'a' * 64 + '?info=1'
+        status, _, body = self.get(self.login(), url)
+        result = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertTrue(result['locatable'])
+        self.assertEqual(result['path'], self.file.as_posix())
+        self.assertIsNone(result['projectPath'])
+
+    def test_audio_artifact_preview_keeps_range_and_original_download_action(self):
+        path = self.root/'sound.wav'
+        path.write_bytes(b'RIFF'+self.data)
+        self.server.bridge.artifact = lambda thread, identifier: {'path': path, 'name': path.name, 'image': False}
+        url = '/api/sessions/'+support.THREAD+'/files/'+'a'*64
+        self.assertEqual(self.get({'Range': 'bytes=0-15'}, url+'?preview=1')[0], 401)
+        auth = self.login()
+        status, headers, body = self.get({**auth, 'Range': 'bytes=0-15'}, url+'?preview=1')
+        self.assertEqual(status, 206)
+        self.assertEqual(headers['Content-Type'], 'audio/wav')
+        self.assertTrue(headers['Content-Disposition'].startswith('inline;'))
+        self.assertEqual(headers['Accept-Ranges'], 'bytes')
+        self.assertEqual(body, path.read_bytes()[:16])
+        status, headers, _ = self.get({**auth, 'Range': 'bytes=0-15'}, url)
+        self.assertEqual(status, 206)
+        self.assertEqual(headers['Content-Type'], 'application/octet-stream')
+        self.assertTrue(headers['Content-Disposition'].startswith('attachment;'))
+        with path.open('wb') as stream:
+            stream.truncate(MAX_TRANSFER + 1)
+        self.assertEqual(self.get({**auth, 'Range': 'bytes=0-15'}, url+'?preview=1')[0], 400)
+
+    def test_host_file_scope_requires_auth_and_never_grants_write_or_git_access(self):
+        project = self.root/'project'; project.mkdir()
+        self.server.bridge.workspace = lambda thread, action, params: operate(str(project), action, params)
+        base = '/api/sessions/'+support.THREAD+'/workspace'
+        target = '?scope=host&path='+quote(self.file.as_posix(), safe='')
+        self.assertEqual(self.get({}, base+'/preview'+target)[0], 401)
+        auth = self.login()
+        status, _, body = self.get(auth, base+'/download'+target+'&info=1')
+        self.assertEqual(status, 200)
+        self.assertIn(b'"projectPath": null', body)
+        status, headers, data = self.get({**auth, 'Range': 'bytes=0-3'}, base+'/download'+target)
+        self.assertEqual((status, data), (206, self.data[:4]))
+        self.assertEqual(self.get(auth, base+'/git-status'+target)[0], 403)
+        self.assertEqual(self.request('POST', base+'/upload'+target, {}, auth)[0], 403)
+        self.assertEqual(self.get(auth, base+'?scope=unknown')[0], 400)
+
+    def test_media_workspace_preview_is_typed_without_enabling_inline_html(self):
+        auth = self.login()
+        for name, expected in (('sound.m4a', 'audio/mp4'), ('clip.mp4', 'video/mp4'),
+                               ('page.html', 'application/octet-stream')):
+            (self.root/name).write_bytes(self.data)
+            url = '/api/sessions/'+support.THREAD+'/workspace/download?path='+name+'&preview=1'
+            status, headers, body = self.get({**auth, 'Range': 'bytes=2-5'}, url)
+            self.assertEqual(status, 206)
+            self.assertEqual(headers['Content-Type'], expected)
+            self.assertEqual(body, self.data[2:6])
+            self.assertTrue(headers['Content-Disposition'].startswith('attachment;' if name.endswith('.html') else 'inline;'))
 
     def test_chunk_reconstruction_pause_and_resume_with_strong_validator(self):
         auth = self.login(); output = bytearray(); etag = None
@@ -285,7 +348,8 @@ class WorkspaceReferenceTests(unittest.TestCase):
             rows = workspace_references(messages, str(project))
             self.assertEqual([row['path'] for row in rows], ['large.bin'])
             self.assertEqual(workspace_references(messages, ''), [])
-            self.assertEqual(workspace_references([{'role': 'user', 'text': '[large](large.bin)'}], str(project)), [])
+            self.assertEqual([row['path'] for row in workspace_references(
+                [{'role': 'user', 'text': messages[0]['text']}], str(project))], ['large.bin'])
 
 
 class TransferPolicyHttpTests(unittest.TestCase):

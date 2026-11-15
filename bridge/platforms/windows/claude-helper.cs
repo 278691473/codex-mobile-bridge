@@ -8,6 +8,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Windows.Automation;
+using System.Windows.Automation.Text;
 
 class ClaudeKeyboard {
     [StructLayout(LayoutKind.Sequential)] struct INPUT { public uint type; public UNION data; }
@@ -56,6 +57,13 @@ class ClaudeKeyboard {
     static int quitPid;
     static int session=Process.GetCurrentProcess().SessionId;
     static void Stage(string text) {Console.WriteLine(text);Console.Out.Flush();}
+    static string OwnerIssue(string value,string marker) {
+        if(String.IsNullOrEmpty(marker)||!value.Contains("["+marker+"]"))return null;
+        if(value.Contains("BRIDGE_OWNER_BUSY"))return "OWNER_BUSY";
+        if(value.Contains("BRIDGE_OWNER_UNCONFIRMED"))return "OWNER_UNCONFIRMED";
+        if(value.Contains("BRIDGE_OWNER_LEGACY")||value.Contains("Claude 桥接连接被其他网关占用"))return "OWNER_LEGACY";
+        return null;
+    }
     static string DesktopName(IntPtr desktop) {
         var value=new StringBuilder(256);uint needed;
         return desktop!=IntPtr.Zero&&GetUserObjectInformation(desktop,2,value,512,out needed)?value.ToString():null;
@@ -255,7 +263,7 @@ class ClaudeKeyboard {
         for(int i=0;i<10;i++){Thread.Sleep(100);CheckForeground();try{CheckPrompt(prompt);return;}catch{}}
         CheckPrompt(prompt);
     }
-    static INPUT Key(ushort vk,bool up) { var i=new INPUT(); i.type=1;i.data.key.vk=vk;i.data.key.flags=up?2u:0u;return i; }
+    static INPUT Key(ushort vk,bool up) { var i=new INPUT(); i.type=1;i.data.key.vk=vk;i.data.key.flags=(up?2u:0u)|((vk>=33&&vk<=40)?1u:0u);return i; }
     static void Send(INPUT[] keys) {
         CheckForeground();
         if(SendInput((uint)keys.Length,keys,Marshal.SizeOf(typeof(INPUT)))!=keys.Length) throw new Exception("Windows 拒绝键盘输入，请检查 Claude 与助手的权限是否一致");
@@ -382,41 +390,31 @@ class ClaudeKeyboard {
         // Preserve Claude's native Enable/Don't Enable confirmation.
         Stage("请确认 Claude 的开发者模式提示，完成后会继续连接");
     }
-    const string QuitMenuUnavailable="找不到 Claude 的原生退出菜单，请在电脑端检查菜单后重试";
-    static bool QuitMenuName(string role,ControlType type,string name) {
-        if(role=="menu")return type==ControlType.Button&&(name=="Menu"||name=="菜单"||name=="選單");
-        if(type!=ControlType.MenuItem)return false;
-        if(role=="file")return name=="File"||name=="文件"||name=="檔案";
-        return role=="exit"&&(name=="Exit"||name=="退出"||name=="結束");
+    const string QuitMenuUnavailable="Claude 当前没有可验证的后台退出入口，尚未提交退出；请在电脑端正常退出，或另行确认强制退出";
+    static bool QuitMenuName(ControlType type,string name) {
+        return type==ControlType.MenuItem&&(name=="Exit"||name=="退出"||name=="結束");
     }
     static T UniqueQuitControl<T>(IEnumerable<T> items,Func<T,bool> matches) where T:class {
         T found=null;
         foreach(var item in items)if(matches(item)) {
-            if(found!=null)throw new Exception("Claude 退出菜单不唯一，请在电脑端检查后重试");
+            if(found!=null)throw new Exception("Claude 后台退出入口不唯一，尚未提交退出；请在电脑端正常退出");
             found=item;
         }
         return found;
     }
-    static void QuitMenu<T>(Func<string,T> find,Action<T> invoke,Action<T> expand,Action check,Action pause,Action<T> submit=null) where T:class {
-        check();var file=find("file");
-        if(file==null) {
-            var menu=find("menu");if(menu==null)throw new Exception(QuitMenuUnavailable);
-            check();invoke(menu);
-            file=WaitMenuEntry(()=>find("file"),check,pause);
-        }
-        if(file==null)throw new Exception(QuitMenuUnavailable);
-        check();expand(file);
-        var exit=WaitMenuEntry(()=>find("exit"),check,pause);
+    static void InvokeExistingQuit<T>(Func<T> find,Func<T,T,bool> same,Action<T> invoke,Action check) where T:class {
+        check();var exit=find();
         if(exit==null)throw new Exception(QuitMenuUnavailable);
-        check();(submit??invoke)(exit);
+        check();var current=find();
+        if(current==null||!same(exit,current))throw new Exception("Claude 后台退出入口已变化，尚未提交退出");
+        check();invoke(current);
     }
-    static AutomationElement FindQuitControl(AutomationElement root,string role,int pid) {
-        var elements=root.FindAll(TreeScope.Descendants,new PropertyCondition(AutomationElement.ControlTypeProperty,
-            role=="menu"?ControlType.Button:ControlType.MenuItem));
+    static AutomationElement FindQuitControl(AutomationElement root,int pid) {
+        var elements=root.FindAll(TreeScope.Descendants,new PropertyCondition(AutomationElement.ControlTypeProperty,ControlType.MenuItem));
         var candidates=new List<AutomationElement>();
         foreach(AutomationElement item in elements)candidates.Add(item);
         return UniqueQuitControl(candidates,item=>item.Current.ProcessId==pid&&AvailableMenuControl(item)
-            &&QuitMenuName(role,item.Current.ControlType,item.Current.Name));
+            &&QuitMenuName(item.Current.ControlType,item.Current.Name));
     }
     static bool SameQuitTarget(bool exited,bool owned,long actualStart,long expectedStart,bool exists,int windowPid,int expectedPid) {
         return !exited&&owned&&actualStart==expectedStart&&exists&&windowPid==expectedPid;
@@ -428,15 +426,13 @@ class ClaudeKeyboard {
             started,IsWindow(window),(int)pid,process.Id))
             throw new Exception("Claude 主进程或窗口已改变，退出请求已停止，请重试");
     }
-    static void InvokeQuitControl(AutomationElement item,Action check,bool expand,Action submitting=null) {
+    static void InvokeQuitControl(AutomationElement item,Action check,Action submitting) {
         check();
-        if(item==null||item.Current.ProcessId!=quitPid||!AvailableMenuControl(item))throw new Exception(QuitMenuUnavailable);
+        if(item==null||item.Current.ProcessId!=quitPid||!AvailableMenuControl(item)||
+           !QuitMenuName(item.Current.ControlType,item.Current.Name))throw new Exception(QuitMenuUnavailable);
         object pattern;
-        if(expand&&item.TryGetCurrentPattern(ExpandCollapsePattern.Pattern,out pattern)) {
-            ((ExpandCollapsePattern)pattern).Expand();return;
-        }
         if(!item.TryGetCurrentPattern(InvokePattern.Pattern,out pattern))throw new Exception(QuitMenuUnavailable);
-        check();if(submitting!=null)submitting();
+        check();submitting();
         ((InvokePattern)pattern).Invoke();
     }
     sealed class QuitSubmission {
@@ -447,27 +443,29 @@ class ClaudeKeyboard {
         public bool CancelBeforeSubmit() {
             lock(gate) {if(Started)return false;cancelled=true;return true;}
         }
+        public QuitSubmission() {}
+        public void BeginSubmit(Action evidence,Func<bool> cancellationPending) {
+            lock(gate) {
+                if(cancelled||Started||cancellationPending())throw new OperationCanceledException();
+                Started=true;evidence();
+            }
+        }
         public QuitSubmission(Process process,long started,IntPtr window) {
             Action check=delegate {
                 lock(gate) {if(cancelled)throw new OperationCanceledException();}
                 CheckQuitNavigation(process,started,window);
             };
-            Action submitting=delegate {
-                lock(gate) {
-                    if(cancelled)throw new OperationCanceledException();Started=true;
-                    // A timeout or lost final reply cannot prove that Exit was
-                    // not delivered. Flush this evidence before invoking it.
-                    Stage("{\"quitPhase\":\"dispatching\",\"pid\":"+process.Id+"}");
-                }
-            };
-            // Any menu provider call can block. Keep the entire navigation on
-            // an MTA worker; only this worker can submit Exit, exactly once.
+            Action submitting=()=>BeginSubmit(delegate {
+                // Flush evidence before Invoke: a lost reply cannot prove non-delivery.
+                Stage("{\"quitPhase\":\"dispatching\",\"pid\":"+process.Id+"}");
+            },()=>cancelFile!=null&&File.Exists(cancelFile));
+            // UIA providers can block. Inspect only existing controls on an MTA
+            // worker; do not open menus or retry after an uncertain invocation.
             var thread=new Thread(delegate() {
                 try {
                     check();var root=AutomationElement.FromHandle(window);
-                    QuitMenu(role=>FindQuitControl(root,role,process.Id),item=>InvokeQuitControl(item,check,false),
-                        item=>InvokeQuitControl(item,check,true),check,()=>Thread.Sleep(100),
-                        item=>InvokeQuitControl(item,check,false,submitting));
+                    InvokeExistingQuit(()=>FindQuitControl(root,process.Id),(a,b)=>Automation.Compare(a,b),
+                        item=>InvokeQuitControl(item,check,submitting),check);
                 }
                 catch(Exception error) {Error=error;}
                 finally {Finished=true;}
@@ -518,47 +516,39 @@ class ClaudeKeyboard {
         Console.WriteLine("{\"quitState\":"+JsonString(state)+",\"reason\":"+JsonString(reason)+",\"pid\":"+pid+"}");
     }
     static void QuitNative(Process process) {
-        // This explicit exit path invokes native controls only. It must never
-        // enter the DevTools, SendInput or Console focus paths below.
+        // Normal Quit must not restore windows, activate the App or open menus.
         long started=process.StartTime.ToUniversalTime().Ticks;
         if(HasNativeDialog(process)) {
             QuitResult("pending","Claude 有待处理的原生对话框，请在电脑端确认或取消",process.Id);return;
         }
-        var window=WaitAppWindow(process,true);
         CheckCancelled();
-        if(process.HasExited||!Owned(process.Id)||process.StartTime.ToUniversalTime().Ticks!=started)
-            throw new Exception("Claude 主进程已改变，退出请求已停止");
-        QuitSubmission submission=null;string state=null;
-        for(int attempt=0;attempt<2;attempt++) {
-            submission=new QuitSubmission(process,started,window);
-            var timer=Stopwatch.StartNew();
+        var selected=SelectWindow(ReadWindows(process.Id),process.Id,GetForegroundWindow());
+        if(selected.Handle==IntPtr.Zero)throw new Exception(QuitMenuUnavailable);
+        var window=selected.Handle;
+        CheckQuitNavigation(process,started,window);
+        var submission=new QuitSubmission(process,started,window);string state=null;
+        var timer=Stopwatch.StartNew();
+        try {
             while(!submission.Started&&!submission.Finished&&timer.Elapsed.TotalSeconds<8) {
                 CheckCancelled();
                 if(process.HasExited) {state="exited";break;}
                 if(HasNativeDialog(process)) {state="pending";break;}
                 Thread.Sleep(100);
             }
-            if(state!=null) {submission.CancelBeforeSubmit();break;}
-            if(submission.Started)break;
-            bool finished=submission.Finished;
-            if(!submission.CancelBeforeSubmit())break;
-            // Only a completed failure before Exit can receive one foreground
-            // fallback. A stalled provider must never race a second attempt.
-            string unavailable=DesktopUnavailable();
-            if(attempt==0&&finished&&unavailable==null) {
-                CheckQuitNavigation(process,started,window);
-                inputWindow=window;Activate(window);continue;
-            }
-            if(unavailable!=null)throw new Exception(unavailable+"；Claude 未接收退出请求");
-            throw submission.Error??new Exception("Claude 退出菜单操作超时，请重试");
+        } catch {
+            if(submission.CancelBeforeSubmit())throw;
+            // Dispatch won the race; cancellation/error cannot establish failure.
+            state="submitted";
         }
-        // Normal teardown changes focus and can take time to flush sessions.
-        // Never repeat Exit or accept a native busy-work confirmation.
+        if(state!=null)submission.CancelBeforeSubmit();
+        else if(!submission.Started&&submission.CancelBeforeSubmit())
+            throw submission.Error??new Exception("Claude 后台退出入口核验超时，尚未提交退出；请在电脑端正常退出");
+        // Never repeat Quit or accept a native busy-work confirmation.
         if(state==null)state=ObserveQuit(()=>process.HasExited,()=>HasNativeDialog(process),()=>Thread.Sleep(200),16);
         if(state=="submitted"&&!submission.Started)
-            throw submission.Error??new Exception("Claude 尚未接收退出请求，请重试");
+            throw submission.Error??new Exception("Claude 尚未接收退出请求，请在电脑端正常退出");
         // An Invoke exception after dispatch may only mean its acknowledgement
-        // was lost. The parent must keep observing the real process shutdown.
+        // was lost. The parent must keep observing the original process.
         bool uncertain=submission.Started&&submission.Finished&&submission.Error!=null;
         QuitResult(state,state=="exited"?"Claude 已正常退出":state=="pending"?
             "Claude 正在等待电脑端退出确认，请自行确认或取消":uncertain?
@@ -946,6 +936,21 @@ class ClaudeKeyboard {
         if(prompt.TryGetCurrentPattern(ValuePattern.Pattern,out pattern)) value=((ValuePattern)pattern).Current.Value;
         return ReadContents(text,value).TrimEnd('\r','\n');
     }
+    static bool ConsoleSourceShape(string text,bool background) {
+        const string marker="/* codex bridge connector */";
+        if(text==null||text.Length>300000||text.Contains("\r")||
+           !text.StartsWith(marker,StringComparison.Ordinal))return false;
+        if(!text.Contains("\n"))return true;
+        if(background)return false;
+        var lines=text.Split('\n');
+        if(lines.Length<2||lines.Length>16)return false;
+        for(int i=0;i<lines.Length;i++) {
+            if(lines[i].Length==0||lines[i].Length>3500)return false;
+            if(i<lines.Length-1&&!lines[i].EndsWith(";",StringComparison.Ordinal)&&
+               !lines[i].EndsWith("{",StringComparison.Ordinal))return false;
+        }
+        return true;
+    }
     static void SubmitVerifiedConsole(string text,Func<string> readDraft,Action<string> replace,
         Func<string> readDocument,Action check,Action pause,Func<bool> expired,Action submit,bool allowConnectorDraft=true) {
         check();
@@ -957,11 +962,50 @@ class ClaudeKeyboard {
         // echo the new value before CodeMirror's actual document has changed.
         while(true) {
             check();
-            if(readDocument()==text)break;
+            string observed=readDocument();
+            if(observed==text)break;
             if(expired())throw new Exception("Console 脚本尚未完整写入，未执行；请通过手动初始化重试");
             pause();
         }
         check();submit();
+    }
+    static void SubmitConsoleDirect(Action check,Action<INPUT[]> send) {
+        check();send(new[]{Key(13,false),Key(13,true)});
+    }
+    static int UniqueSegmentStart(string expected,string observed) {
+        if(String.IsNullOrEmpty(observed)||observed.Length<32)return -1;
+        int start=expected.IndexOf(observed,StringComparison.Ordinal);
+        return start>=0&&expected.LastIndexOf(observed,StringComparison.Ordinal)==start?start:-1;
+    }
+    static bool VirtualizedConsoleGap(string expected,string observed) {
+        for(int split=observed.IndexOf('\n');split>=0;split=observed.IndexOf('\n',split+1)) {
+            string before=observed.Substring(0,split),after=observed.Substring(split+1);
+            int first=UniqueSegmentStart(expected,before),second=UniqueSegmentStart(expected,after);
+            if(first>=0&&second>first+before.Length)return true;
+        }
+        return false;
+    }
+    static bool CompatibleConsoleView(string expected,string observed) {
+        return UniqueSegmentStart(expected,observed)>=0||
+            !String.IsNullOrEmpty(observed)&&VirtualizedConsoleGap(expected,observed);
+    }
+    static void SubmitForegroundConsole(string text,Func<string> readDraft,Action<string> replace,
+        Func<string> readVisible,Action check,Action pause,Func<bool> settled,Func<bool> expired,Action<INPUT[]> submit) {
+        check();
+        string pending=readDraft().Trim('\r','\n',' ','\t','\u200b','\ufeff');
+        if(!String.IsNullOrWhiteSpace(pending))
+            throw new Exception("Console 中已有未提交内容，已保留，请处理后重试连接");
+        check();replace(text);
+        // A visible UIA slice is a compatibility check, not proof that the
+        // complete script executed. Only the signed bridge receipt proves that.
+        while(true) {
+            check();
+            string visible=readVisible();
+            if(visible==text||CompatibleConsoleView(text,visible)&&settled())break;
+            if(expired())throw new Exception("Console 未显示本次脚本，未提交；请在电脑端检查后重试");
+            pause();
+        }
+        SubmitConsoleDirect(check,submit);
     }
     static void WriteConsoleOnce(AutomationElement prompt,string text) {
         CheckPrompt(prompt);
@@ -971,12 +1015,12 @@ class ClaudeKeyboard {
             !prompt.TryGetCurrentPattern(TextPattern.Pattern,out textObject))
             throw new Exception("当前 Claude Console 不支持一次写入，请在电脑端手动初始化连接");
         var value=(ValuePattern)valueObject;var document=(TextPattern)textObject;
-        var timer=Stopwatch.StartNew();
-        SubmitVerifiedConsole(text,()=>Contents(prompt),value.SetValue,
+        var timer=new Stopwatch();
+        SubmitForegroundConsole(text,()=>Contents(prompt),valueText=>{value.SetValue(valueText);timer.Restart();},
             ()=>document.DocumentRange.GetText(-1).TrimEnd('\r','\n'),()=>CheckPrompt(prompt),
-            ()=>Thread.Sleep(50),()=>timer.Elapsed.TotalSeconds>=6,delegate {
-                Stage("脚本已完整写入并核对，正在提交");
-                Send(new[]{Key(13,false),Key(13,true)});
+            ()=>Thread.Sleep(50),()=>timer.ElapsedMilliseconds>=250,()=>timer.ElapsedMilliseconds>=1200,keys=>{
+                Stage("脚本已写入 Console，正在提交并等待连接回执");
+                Send(keys);
             });
     }
     static void CheckWindowSelection() {
@@ -1045,35 +1089,66 @@ class ClaudeKeyboard {
         if(!rejected)throw new Exception("Claude 启动入口允许列表自检失败");
     }
     static void CheckDirectSubmission() {
-        const string text="/* codex bridge connector */void 0;";
-        int writes=0,submits=0,pauses=0;
-        SubmitVerifiedConsole(text,()=>"/* codex bridge connector */partial",
-            value=>{if(value!=text)throw new Exception("wrong write");writes++;},
-            ()=>pauses==0?"old document":text,()=>{},()=>pauses++,()=>pauses>=3,()=>submits++);
-        if(writes!=1||submits!=1||pauses!=1)throw new Exception("Console 异步整段写入自检失败");
-        writes=0;submits=0;pauses=0;bool refused=false;
-        try {SubmitVerifiedConsole(text,()=>"",value=>writes++,()=>"partial",()=>{},()=>pauses++,()=>pauses>=2,()=>submits++);}
+        const string marker="/* codex bridge connector */";
+        string text=marker+"(async()=>{\nvoid 0;\n})();";
+        if(!ConsoleSourceShape(text,false)||ConsoleSourceShape(text,true)||
+           ConsoleSourceShape(text.Replace("\n","\r\n"),false)||
+           ConsoleSourceShape(marker+"void 0\n();",false)||
+           ConsoleSourceShape(marker+new String('x',3500)+";\nvoid 0;",false)||
+           !ConsoleSourceShape(marker+"void 0;",true))
+            throw new Exception("Console 有限行格式自检失败");
+        int writes=0,enters=0,pauses=0,checks=0;INPUT[] keys=null;
+        SubmitForegroundConsole(text,()=>"",value=>{if(value!=text)throw new Exception("wrong source");writes++;},
+            ()=>pauses==0?"":pauses==1?text.Substring(10,1):pauses==2?text.Substring(10,31):text.Substring(10,32),
+            ()=>checks++,()=>pauses++,()=>pauses>=4,()=>pauses>=6,
+            sent=>{enters++;keys=sent;});
+        if(writes!=1||enters!=1||pauses!=4||keys.Length!=2||
+           keys[0].data.key.vk!=13||keys[0].data.key.flags!=0||
+           keys[1].data.key.vk!=13||keys[1].data.key.flags!=2)
+            throw new Exception("Console 片段可见与单次直接 Enter 自检失败");
+        writes=0;enters=0;pauses=0;
+        SubmitForegroundConsole(text,()=>"",value=>writes++,()=>pauses<2?"":text,
+            ()=>{},()=>pauses++,()=>false,()=>pauses>=5,sent=>enters++);
+        if(writes!=1||enters!=1||pauses!=2)throw new Exception("Console 异步空白后全文立即提交自检失败");
+        writes=0;enters=0;pauses=0;bool refused=false;
+        try {SubmitForegroundConsole(text,()=>"",value=>writes++,()=>text.Substring(10,1),
+            ()=>{},()=>pauses++,()=>true,()=>pauses>=2,sent=>enters++);}
         catch(Exception){refused=true;}
-        if(!refused||writes!=1||submits!=0)throw new Exception("Console 不完整脚本拒绝执行自检失败");
-        writes=0;submits=0;refused=false;
-        try {SubmitVerifiedConsole(text,()=>"userCommand()",value=>writes++,()=>text,()=>{},()=>{},()=>true,()=>submits++);}
+        if(!refused||writes!=1||enters!=0)throw new Exception("Console 单字符片段不得提交自检失败");
+        writes=0;enters=0;pauses=0;refused=false;
+        try {SubmitForegroundConsole(text,()=>"",value=>writes++,()=>"foreign Console draft",
+            ()=>{},()=>pauses++,()=>true,()=>pauses>=2,sent=>enters++);}
         catch(Exception){refused=true;}
-        if(!refused||writes!=0||submits!=0)throw new Exception("Console 用户草稿保护自检失败");
-        writes=0;submits=0;int checks=0;refused=false;
-        try {SubmitVerifiedConsole(text,()=>"",value=>writes++,()=>text,
-            ()=>{if(++checks==4)throw new Exception("focus changed before Enter");},()=>{},()=>false,()=>submits++);}
+        if(!refused||writes!=1||enters!=0)throw new Exception("Console 无关内容拒绝提交自检失败");
+        writes=0;enters=0;refused=false;
+        try {SubmitForegroundConsole(text,()=>"userCommand()",value=>writes++,()=>text,
+            ()=>{},()=>{},()=>true,()=>false,sent=>enters++);}
         catch(Exception){refused=true;}
-        if(!refused||writes!=1||submits!=0)throw new Exception("Console 提交前焦点保护自检失败");
-        writes=0;submits=0;checks=0;refused=false;
-        try {SubmitVerifiedConsole(text,()=>"",value=>writes++,()=>"partial",
-            ()=>{if(++checks==4)throw new OperationCanceledException();},()=>{},()=>false,()=>submits++);}
+        if(!refused||writes!=0||enters!=0)throw new Exception("Console 用户草稿保护自检失败");
+        writes=0;enters=0;
+        SubmitForegroundConsole(text,()=>"\u200b\ufeff",value=>writes++,()=>text,
+            ()=>{},()=>{},()=>false,()=>false,sent=>enters++);
+        if(writes!=1||enters!=1)throw new Exception("Console 不可见空草稿自检失败");
+        writes=0;enters=0;checks=0;refused=false;
+        try {SubmitForegroundConsole(text,()=>"",value=>writes++,()=>text,
+            ()=>{if(++checks==3)throw new Exception("focus changed");},()=>{},()=>true,()=>false,sent=>enters++);}
+        catch(Exception){refused=true;}
+        if(!refused||writes!=1||enters!=0)throw new Exception("Console 提交前失焦保护自检失败");
+        writes=0;enters=0;checks=0;refused=false;
+        try {SubmitForegroundConsole(text,()=>"",value=>writes++,()=>"",
+            ()=>{if(++checks==4)throw new OperationCanceledException();},()=>{},()=>false,()=>false,sent=>enters++);}
         catch(OperationCanceledException){refused=true;}
-        if(!refused||writes!=1||submits!=0)throw new Exception("Console 异步等待取消自检失败");
-        writes=0;submits=0;refused=false;
-        try {SubmitVerifiedConsole(text,()=>"",value=>writes++,()=>text,
-            ()=>{throw new OperationCanceledException();},()=>{},()=>false,()=>submits++);}
-        catch(OperationCanceledException){refused=true;}
-        if(!refused||writes!=0||submits!=0)throw new Exception("Console 写入前取消自检失败");
+        if(!refused||writes!=1||enters!=0)throw new Exception("Console 等待取消自检失败");
+        writes=0;enters=0;refused=false;
+        try {SubmitForegroundConsole(text,()=>"",value=>{writes++;throw new Exception("write failed");},()=>text,
+            ()=>{},()=>{},()=>true,()=>false,sent=>enters++);}
+        catch(Exception){refused=true;}
+        if(!refused||writes!=1||enters!=0)throw new Exception("Console 写入失败不得提交自检失败");
+        writes=0;enters=0;refused=false;
+        try {SubmitForegroundConsole(text,()=>"",value=>writes++,()=>text,
+            ()=>{},()=>{},()=>true,()=>false,sent=>{enters++;throw new Exception("submit uncertain");});}
+        catch(Exception){refused=true;}
+        if(!refused||writes!=1||enters!=1)throw new Exception("Console 提交不确定时不得重放自检失败");
     }
     static void CheckDetachedReuse() {
         var tools=new AppWindow {Handle=new IntPtr(21),Pid=7,Visible=true,Title="DevTools - app://localhost"};
@@ -1092,28 +1167,34 @@ class ClaudeKeyboard {
            SameQuitTarget(false,false,11,11,true,7,7)||SameQuitTarget(false,true,12,11,true,7,7)||
            SameQuitTarget(false,true,11,11,false,7,7)||SameQuitTarget(false,true,11,11,true,8,7))
             throw new Exception("Claude 原生退出目标身份自检失败");
-        var actions=new List<string>();int stage=0;
-        Func<string,string> find=role=>(role=="menu"&&stage==0||role=="file"&&stage==1||role=="exit"&&stage==2)?role:null;
-        Action<string> invoke=item=>{actions.Add("invoke:"+item);stage++;};
-        Action<string> expand=item=>{actions.Add("expand:"+item);stage++;};
-        QuitMenu(find,invoke,expand,()=>{},()=>{});
-        if(String.Join(",",actions.ToArray())!="invoke:menu,expand:file,invoke:exit")throw new Exception("Claude 原生退出导航自检失败");
-        actions.Clear();stage=0;bool cancelled=false;
-        try {QuitMenu(find,invoke,expand,()=>{if(stage==2)throw new OperationCanceledException();},()=>{});}
+        var actions=new List<string>();int reads=0,checks=0;
+        Func<string> find=()=>{reads++;return "exit";};
+        Action<string> invoke=item=>actions.Add("invoke:"+item);
+        InvokeExistingQuit(find,(a,b)=>a==b,invoke,()=>checks++);
+        if(String.Join(",",actions.ToArray())!="invoke:exit"||reads!=2||checks!=3)
+            throw new Exception("Claude 既有后台退出入口自检失败");
+        actions.Clear();reads=0;checks=0;bool cancelled=false;
+        try {InvokeExistingQuit(find,(a,b)=>a==b,invoke,()=>{if(++checks==2)throw new OperationCanceledException();});}
         catch(OperationCanceledException){cancelled=true;}
-        if(!cancelled||actions.Contains("invoke:exit"))throw new Exception("Claude 原生退出取消自检失败");
-        actions.Clear();stage=0;bool missing=false;
-        try {QuitMenu(role=>role=="file"?role:null,invoke,expand,()=>{},()=>{});}
-        catch(Exception){missing=true;}
-        if(!missing||actions.Contains("invoke:exit"))throw new Exception("Claude 缺失退出菜单自检失败");
-        if(!QuitMenuName("exit",ControlType.MenuItem,"Exit")||!QuitMenuName("exit",ControlType.MenuItem,"退出")||
-           !QuitMenuName("exit",ControlType.MenuItem,"結束")||QuitMenuName("exit",ControlType.Button,"Exit")||
-           QuitMenuName("exit",ControlType.Button,"Quit anyway")||QuitMenuName("exit",ControlType.MenuItem,"Close Window"))
-            throw new Exception("Claude 退出菜单允许列表自检失败");
+        if(!cancelled||actions.Count!=0)throw new Exception("Claude 后台退出取消自检失败");
+        foreach(string mode in new[]{"missing","hidden","changed","disappeared"}) {
+            actions.Clear();reads=0;bool refused=false;
+            Func<string> existing=()=>{reads++;return mode=="missing"||mode=="hidden"?null:reads==1?"exit":mode=="changed"?"replacement":null;};
+            try {InvokeExistingQuit(existing,(a,b)=>a==b,invoke,()=>{});}catch(Exception){refused=true;}
+            if(!refused||actions.Count!=0)throw new Exception("Claude 缺失或变化退出入口不得导航或提交自检失败");
+        }
+        actions.Clear();reads=0;bool uncertain=false;
+        try {InvokeExistingQuit(find,(a,b)=>a==b,item=>{invoke(item);throw new Exception("lost acknowledgement");},()=>{});}
+        catch(Exception){uncertain=true;}
+        if(!uncertain||actions.Count!=1||reads!=2)throw new Exception("Claude 不确定退出不得重试自检失败");
+        if(!QuitMenuName(ControlType.MenuItem,"Exit")||!QuitMenuName(ControlType.MenuItem,"退出")||
+           !QuitMenuName(ControlType.MenuItem,"結束")||QuitMenuName(ControlType.Button,"Exit")||
+           QuitMenuName(ControlType.Button,"Quit anyway")||QuitMenuName(ControlType.MenuItem,"Close Window"))
+            throw new Exception("Claude 退出入口允许列表自检失败");
         bool ambiguous=false;
         try {UniqueQuitControl(new[]{"exit","exit"},item=>item=="exit");}catch(Exception){ambiguous=true;}
         if(!ambiguous)throw new Exception("Claude 退出菜单歧义自检失败");
-        int checks=0;
+        checks=0;
         if(ObserveQuit(()=>++checks==2,()=>false,()=>{},3)!="exited"||
            ObserveQuit(()=>false,()=>true,()=>{},3)!="pending"||
            ObserveQuit(()=>false,()=>false,()=>{},3)!="submitted")throw new Exception("Claude 退出结果自检失败");
@@ -1130,6 +1211,35 @@ class ClaudeKeyboard {
                 ()=>exited,()=>false),()=>{},2)!="exited"||
            ObserveQuit(()=>false,()=>ProbeNativeDialog(failedProbe,()=>false,()=>false),()=>{},2)!="submitted")
             throw new Exception("Claude 退出期间窗口销毁结果自检失败");
+    }
+    static void CheckQuitSubmissionCancellation() {
+        int evidence=0,invocations=0;bool cancelledNow=false;
+        var stopped=new QuitSubmission();bool rejected=false;
+        cancelledNow=true;
+        try {stopped.BeginSubmit(()=>evidence++,()=>cancelledNow);invocations++;}
+        catch(OperationCanceledException){rejected=true;}
+        if(!rejected||stopped.Started||evidence!=0||invocations!=0)
+            throw new Exception("Claude 派发锁内取消文件核验自检失败");
+        using(var checkedTarget=new ManualResetEvent(false))using(var proceed=new ManualResetEvent(false)) {
+            var before=new QuitSubmission();Exception failure=null;
+            var worker=new Thread(delegate() {
+                try {
+                    checkedTarget.Set();if(!proceed.WaitOne(2000))throw new Exception("barrier timeout");
+                    before.BeginSubmit(()=>evidence++,()=>false);invocations++;
+                } catch(OperationCanceledException) {} catch(Exception error){failure=error;}
+            });
+            worker.IsBackground=true;worker.Start();
+            if(!checkedTarget.WaitOne(2000))throw new Exception("Claude 取消交错屏障自检超时");
+            bool cancelled=before.CancelBeforeSubmit();proceed.Set();
+            if(!worker.Join(2000)||failure!=null||!cancelled||before.Started||evidence!=0||invocations!=0)
+                throw new Exception("Claude 末次身份核验后的取消自检失败");
+        }
+        var after=new QuitSubmission();bool cancellationWon=true;
+        after.BeginSubmit(()=>{evidence++;cancellationWon=after.CancelBeforeSubmit();},()=>false);invocations++;
+        bool repeated=false;
+        try {after.BeginSubmit(()=>evidence++,()=>false);invocations++;}catch(OperationCanceledException){repeated=true;}
+        if(!after.Started||cancellationWon||!repeated||evidence!=1||invocations!=1)
+            throw new Exception("Claude 已派发取消和重复提交保护自检失败");
     }
     static void CheckBackgroundConnection() {
         foreach(string title in new[]{"DevTools - app://localhost","Developer Tools - app://localhost/new?example=1","开发者工具 - app://localhost/"})
@@ -1268,6 +1378,12 @@ class ClaudeKeyboard {
         Console.OutputEncoding=new UTF8Encoding(false);
         try {
             if(args.Length==1&&args[0]=="--self-check") {
+                if(OwnerIssue("Error: BRIDGE_OWNER_BUSY [current]","current")!="OWNER_BUSY"||
+                   OwnerIssue("Error: BRIDGE_OWNER_UNCONFIRMED [current]","current")!="OWNER_UNCONFIRMED"||
+                   OwnerIssue("Error: BRIDGE_OWNER_LEGACY [current]","current")!="OWNER_LEGACY"||
+                   OwnerIssue("Error: Claude 桥接连接被其他网关占用 [current]","current")!="OWNER_LEGACY"||
+                   OwnerIssue("Error: BRIDGE_OWNER_BUSY [old]","current")!=null||
+                   OwnerIssue("Error: BRIDGE_OWNER_BUSY", "current")!=null)throw new Exception("桥接错误隔离自检失败");
                 if(Marshal.SizeOf(typeof(INPUT))!=(IntPtr.Size==8?40:28)||!PromptName("Console prompt","")||PromptName("Message Claude","")) throw new Exception("键盘组件自检失败");
                 if(ReadContents("script","")!="script"||ReadContents("","value")!="value"||ReadContents(null,"value")!="value"||ReadContents("",null)!="")throw new Exception("Console 文本读取自检失败");
                 if(!DevToolsTitle("Developer Tools - app://localhost/new")||!DevToolsTitle("DevTools - app://localhost")||DevToolsTitle("Claude"))throw new Exception("开发者工具窗口匹配自检失败");
@@ -1279,13 +1395,14 @@ class ClaudeKeyboard {
                 CheckDirectSubmission();
                 CheckDetachedReuse();
                 CheckNativeQuit();
+                CheckQuitSubmissionCancellation();
                 CheckBackgroundConnection();
                 CheckBackgroundCleanup();
                 CheckBackgroundStartupReadiness();
                 CheckBackgroundNativeResume();
                 CheckBackgroundWindowRestore();
                 CheckBackgroundConsoleReadiness();
-                Console.WriteLine("keyboard ABI, Console allowlist and contenteditable text fallback OK; window selection and cancellable restore OK; menu navigation OK; packaged launch OK; atomic console submission OK; detached console reuse OK; native menu quit guards OK; background console guards OK; background cleanup guards OK; background startup readiness OK; background native resume OK; background window restore OK; background Console readiness OK");return 0;
+                Console.WriteLine("keyboard ABI, Console allowlist and contenteditable text fallback OK; window selection and cancellable restore OK; menu navigation OK; packaged launch OK; atomic console submission OK; detached console reuse OK; existing background quit guards OK; atomic quit cancellation guards OK; background console guards OK; background cleanup guards OK; background startup readiness OK; background native resume OK; background window restore OK; background Console readiness OK");return 0;
             }
             if(args.Length!=3 && args.Length!=4) throw new Exception("键盘连接参数无效");
             quitAction=args[1]=="--quit";
@@ -1305,14 +1422,15 @@ class ClaudeKeyboard {
                 var texts=AutomationElement.FromHandle(WaitAppWindow(process,false)).FindAll(TreeScope.Descendants,new PropertyCondition(AutomationElement.ControlTypeProperty,ControlType.Text));
                 foreach(AutomationElement item in texts) {
                     string value=item.Current.Name;
-                    if(args.Length==4 && value.Contains("Claude 桥接连接被其他网关占用") && value.Contains("["+args[3]+"]")) {Stage("OWNER_CONFLICT");return 0;}
+                    string ownerIssue=args.Length==4?OwnerIssue(value,args[3]):null;
+                    if(ownerIssue!=null) {Stage(ownerIssue);return 0;}
                     if((value.StartsWith("Error:")||value.StartsWith("Uncaught"))&&(value.Contains("尚未信任目录")||value.Contains("WorkspaceTrustError")||value.Contains("trust_required"))) {Stage("NEEDS_TRUST");return 0;}
                 }
                 Stage("NO_TRUST_ERROR");return 0;
             }
             string script=backgroundAction?args[1].Substring("--connect-background=".Length):args[1];
             string text=File.ReadAllText(script,Encoding.UTF8);
-            if(text.Length>300000||text.Contains("\n")||text.Contains("\r")||!text.StartsWith("/* codex bridge connector */")) throw new Exception("连接脚本格式无效");
+            if(!ConsoleSourceShape(text,backgroundAction))throw new Exception("连接脚本格式无效");
             if(backgroundAction){RunBackgroundConnection(process,text);return 0;}
             Stage("正在等待 Claude 窗口");
             GetAsyncKeyState(27); // Clear an old Escape press, subsequent presses cancel.
@@ -1344,7 +1462,7 @@ class ClaudeKeyboard {
             Stage("已定位 Console 输入框");
             // This foreground bootstrap is used only for explicit manual
             // initialization. Reconnects never launch this keyboard helper.
-            FocusPrompt(prompt);WriteConsoleOnce(prompt,text);Thread.Sleep(700);
+            FocusPrompt(prompt);WriteConsoleOnce(prompt,text);
             Console.WriteLine("脚本已输入，等待连接回执");return 0;
         } catch(Exception e) {
             string message=FailureMessage(e,quitAction);

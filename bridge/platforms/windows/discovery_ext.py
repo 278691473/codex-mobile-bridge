@@ -9,7 +9,7 @@ from pathlib import Path, PureWindowsPath
 
 
 PRODUCT_NAMES = {'codex': ('Codex', 'ChatGPT'), 'claude': ('Claude', 'Claude Desktop'),
-                 'deepseek': ('DSH Desktop', 'DeepSeek Harness', 'DeepSeekHarness', 'deepseek-harness')}
+                 'deepseek': ('DSH Desktop', 'DeepSeek Harness', 'DeepSeekHarness', 'deepseek-harness'), 'zcode': ('ZCode',)}
 PACKAGE_NAMES = {'openai.codex': 'codex', 'claude': 'claude'}
 
 # Appx registration is readable even when enumerating WindowsApps is forbidden.
@@ -24,8 +24,8 @@ try {
         Where-Object {$_.Name -in @('OpenAI.Codex', 'Claude')} |
         Select-Object Name,InstallLocation,PackageFamilyName)
 } catch {}
-$product = '^(Codex|ChatGPT|Claude( Desktop)?|DSH Desktop|DeepSeek Harness|DeepSeekHarness|deepseek-harness)(\s+\d[\w. -]*)?$'
-$binary = '^(Codex|ChatGPT|Claude( Desktop)?|DSH Desktop|DeepSeek Harness|DeepSeekHarness|deepseek-harness)\.exe$'
+$product = '^(Codex|ChatGPT|Claude( Desktop)?|DSH Desktop|DeepSeek Harness|DeepSeekHarness|deepseek-harness|ZCode)(\s+\d[\w. -]*)?$'
+$binary = '^(Codex|ChatGPT|Claude( Desktop)?|DSH Desktop|DeepSeek Harness|DeepSeekHarness|deepseek-harness|ZCode)\.exe$'
 foreach ($base in @('HKCU:\Software', 'HKLM:\Software', 'HKCU:\Software\WOW6432Node', 'HKLM:\Software\WOW6432Node')) {
     try {
         $result.uninstall += @(Get-ItemProperty -Path ($base + '\Microsoft\Windows\CurrentVersion\Uninstall\*') |
@@ -220,12 +220,22 @@ def application_execution_alias(executable):
     return next(iter(matches)) if len(matches) == 1 else None
 
 
-def launch_windows_desktop(executable, *, cancelled=None, **options):
+def launch_windows_desktop(executable, *, cancelled=None, require_environment=False, **options):
     """Preserve direct-launch environments, falling back for protected Store apps."""
     def check_cancelled():
         if cancelled is not None and cancelled.is_set():
             raise ValueError('已取消桌面程序启动')
     check_cancelled()
+    if require_environment:
+        launcher = executable
+        if any((folder/'AppxManifest.xml').is_file() for folder in Path(executable).parents):
+            launcher = application_execution_alias(executable)
+            if launcher is None:
+                raise ValueError('无法核验应用启动别名，尚未启动；请检查应用安装与执行别名设置')
+        check_cancelled()
+        # Activate through the alias without making it argv[0]: the native shell
+        # uses that name for its window profile and single-instance identity.
+        return subprocess.Popen([str(executable)], executable=str(launcher), **options)
     try:
         return subprocess.Popen([str(executable)], **options)
     except OSError as exc:

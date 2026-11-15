@@ -2,13 +2,54 @@
 """Private stdio interface used by the desktop application."""
 import argparse
 import json
+import os
 import sys
+if sys.platform == 'win32' and os.environ.get('CMB_CODEX_DESKTOP_CONFIGURATION'):
+    from bridge.clients.codex.desktop_runtime_windows import run as windows_runtime_main
+    raise SystemExit(windows_runtime_main(os.environ['CMB_CODEX_DESKTOP_CONFIGURATION'], sys.argv[1:]))
+if sys.argv[1:2] == ['codex-desktop-runtime']:
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--configuration', required=True)
+    parser.add_argument('arguments', nargs=argparse.REMAINDER)
+    options = parser.parse_args(sys.argv[2:])
+    from bridge.clients.codex.desktop_runtime_host import run as runtime_main
+    arguments = options.arguments[1:] if options.arguments[:1] == ['--'] else options.arguments
+    raise SystemExit(runtime_main(options.configuration, arguments))
+
 if len(sys.argv) == 3 and sys.argv[1] == '--terminal-child':
     if sys.platform == 'win32':
         from bridge.platforms.windows.terminal import child_main
     else:
         from bridge.platforms.posix.terminal import child_main
     child_main(sys.argv[2])
+
+if sys.argv[1:2] == ['zcode-pipe-host']:
+    if sys.platform == 'darwin' and not getattr(sys, 'frozen', False):
+        raise SystemExit('The private ZCode host requires the installed macOS gateway')
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data-dir', required=True)
+    parser.add_argument('--application', required=True)
+    options = parser.parse_args(sys.argv[2:])
+    if sys.platform == 'darwin':
+        from bridge.clients.zcode.pipe_host import serve
+    else:
+        from bridge.clients.zcode.local_pipe_host import serve
+    serve(options.data_dir, options.application)
+    raise SystemExit(0)
+
+if sys.argv[1:2] == ['local-service-host']:
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data-dir', required=True)
+    parser.add_argument('--name', choices=['zcode-official'], required=True)
+    parser.add_argument('--parent-pid', type=int, required=True)
+    options = parser.parse_args(sys.argv[2:])
+    from bridge.clients.local_rpc_host import serve
+    serve(options.data_dir, options.name, options.parent_pid)
+    raise SystemExit(0)
+
+if sys.argv[1:2] == ['antigravity-hook']:
+    from bridge.clients.antigravity.hook_client import main as hook_main
+    raise SystemExit(hook_main(sys.argv[2:]))
 
 from bridge.app.desktop import Desktop
 
@@ -17,7 +58,7 @@ def main():
     sys.stdout.reconfigure(encoding='utf-8')
     sys.stdin.reconfigure(encoding='utf-8')
     parser = argparse.ArgumentParser()
-    parser.add_argument('action', choices=['management-stream', 'tailscale-setup', 'read-credentials', 'server-setup', 'connection-credentials', 'snapshot-stream', 'snapshot', 'save', 'start', 'stop', 'logs', 'test-notification', 'deployment', 'export-deployment', 'check-entry', 'devices', 'pairing', 'account', 'accounts', 'harness', 'desktop-sessions', 'notification-watches', 'transfer-settings', 'serve', 'update-prepare', 'update-apply'])
+    parser.add_argument('action', choices=['management-stream', 'tailscale-setup', 'read-credentials', 'server-setup', 'connection-credentials', 'snapshot-stream', 'snapshot', 'save', 'start', 'stop', 'logs', 'test-notification', 'webhook-endpoint', 'deployment', 'export-deployment', 'check-entry', 'devices', 'pairing', 'account', 'accounts', 'cli-access', 'harness', 'desktop-sessions', 'notification-watches', 'transfer-settings', 'network-adaptation', 'serve', 'update-preflight', 'update-prepare', 'update-apply'])
     parser.add_argument('--data-dir', required=True)
     parser.add_argument('--plan')
     parser.add_argument('--connection-secrets-stdin', action='store_true')
@@ -31,7 +72,7 @@ def main():
                 try:
                     value = json.loads(line)
                     action = value.get('action')
-                    if action not in ('accounts', 'account', 'desktop-sessions', 'start', 'stop', 'save'):
+                    if action not in ('accounts', 'account', 'cli-access', 'desktop-sessions', 'start', 'stop', 'save'):
                         raise ValueError('不支持的本机管理操作')
                     method = getattr(desktop, action.replace('-', '_'))
                     result = method() if action == 'stop' else method(value.get('payload') or {})
@@ -59,7 +100,10 @@ def main():
         run.main(connections=desktop.preferences()['connections'], connection_secrets=json.loads(sys.stdin.read(1000000) or '{}') if args.connection_secrets_stdin else {})
         return
     try:
-        if args.action == 'update-prepare':
+        if args.action == 'update-preflight':
+            from bridge.features.updates.gateway import preflight
+            result = preflight(json.loads(sys.stdin.read(100000) or '{}')['target'])
+        elif args.action == 'update-prepare':
             from bridge.features.updates.gateway import prepare
             result = prepare(args.data_dir, json.loads(sys.stdin.read(100000) or '{}'))
         elif args.action == 'update-apply':
@@ -67,7 +111,7 @@ def main():
             result = apply(args.plan)
         elif args.action == 'test-notification':
             result = desktop.test_notification(json.loads(sys.stdin.read(100000) or '{}'))
-        elif args.action in ('start', 'tailscale-setup', 'read-credentials', 'server-setup', 'connection-credentials', 'save', 'deployment', 'export-deployment', 'check-entry', 'devices', 'pairing', 'account', 'accounts', 'harness', 'desktop-sessions', 'notification-watches', 'transfer-settings'):
+        elif args.action in ('start', 'tailscale-setup', 'read-credentials', 'server-setup', 'connection-credentials', 'save', 'webhook-endpoint', 'deployment', 'export-deployment', 'check-entry', 'devices', 'pairing', 'account', 'accounts', 'cli-access', 'harness', 'desktop-sessions', 'notification-watches', 'transfer-settings', 'network-adaptation'):
             result = getattr(desktop, args.action.replace('-', '_'))(json.loads(sys.stdin.read(100000) or '{}'))
         else:
             method = getattr(desktop, args.action.replace('-', '_'))

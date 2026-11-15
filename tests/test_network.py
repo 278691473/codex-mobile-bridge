@@ -17,14 +17,14 @@ import bridge.features.network.addresses as network
 from bridge.app.desktop import Desktop
 from bridge.api.httpd import GatewayServer
 from bridge.app.lifecycle import request_stop
-import run
+import bridge.features.network.interfaces as interfaces
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class SelectionTests(unittest.TestCase):
     def test_all_selected_empty_and_disabled_have_distinct_bindings(self):
-        self.assertEqual(network.bindings({'lan': True}), ['0.0.0.0'])
+        self.assertEqual(network.bindings({'lan': True}), ['127.0.0.1'])
         self.assertEqual(network.bindings({'lan': True, 'lanAddresses': []}), ['127.0.0.1'])
         self.assertEqual(network.bindings({'lan': True, 'lanAddresses': ['192.168.1.5', '172.20.0.1']}), ['127.0.0.1', '192.168.1.5', '172.20.0.1'])
         self.assertEqual(network.bindings({'lan': False, 'lanAddresses': ['192.168.1.5']}), ['127.0.0.1'])
@@ -51,14 +51,22 @@ class SelectionTests(unittest.TestCase):
             value = desktop.snapshot()
             value['preferences'].update(codexHome=folder, lanAddresses=['192.0.2.7'], localAccess=False)
             saved = desktop.save(value)
-            self.assertEqual(saved['urls'], ['http://192.0.2.7:8787/'])
+            self.assertEqual(saved['urls'], [])
             self.assertEqual(desktop.config()['lanAddresses'], ['192.0.2.7'])
+            self.assertEqual(desktop.config()['lanInterfaces'], [])
             self.assertFalse(desktop.config()['localAccess'])
-            with patch('bridge.app.desktop.socket.socket') as sock, patch('bridge.app.desktop.subprocess.Popen') as spawn:
+            with patch('bridge.app.desktop.interfaces.enumerate_interfaces', return_value=[]), \
+                    patch('bridge.app.desktop.socket.socket') as sock, \
+                    patch('bridge.app.desktop.subprocess.Popen') as spawn:
                 sock.return_value.bind.side_effect = OSError('address unavailable')
                 with self.assertRaisesRegex(ValueError, '不会自动开放'):
                     desktop.start()
                 spawn.assert_not_called()
+            with patch('bridge.app.desktop.interfaces.enumerate_interfaces', return_value=[]), \
+                    patch('bridge.app.desktop.socket.socket'), \
+                    patch('bridge.app.desktop.subprocess.Popen') as spawn:
+                desktop.start()
+                spawn.assert_called_once()
             invalid = copy.deepcopy(value)
             invalid['preferences']['lanAddresses'] = ['0.0.0.0']
             with self.assertRaises(ValueError):
@@ -115,7 +123,7 @@ class LocalAccessTests(unittest.TestCase):
                 server.harness.close();server.desktop_sessions.close()
 
     def test_real_gateway_binds_only_selected_address_and_stops_every_listener(self):
-        lan = next((ip for ip in run.addresses() if ip not in ('127.0.0.1', 'localhost')), None)
+        lan = next((ip for ip in interfaces.eligible_lan_addresses() if ip not in ('127.0.0.1', 'localhost')), None)
         if not lan:
             self.skipTest('No non-loopback IPv4 adapter available')
         for selected in ([], [lan]):
@@ -123,11 +131,17 @@ class LocalAccessTests(unittest.TestCase):
                 data = Path(folder)
                 config = data/'config.json'
                 config.write_text(json.dumps({'auth': {'mode': 'none'}, 'origins': [], 'lanAddresses': selected, 'localAccess': False}), encoding='utf8')
+                clients = data/'desktop-sessions'
+                clients.mkdir()
+                (clients/'settings.json').write_text(json.dumps({'enabled': {'codex': False, 'claude': False, 'deepseek': False}}), encoding='utf8')
                 with socket.socket() as probe:
                     probe.bind(('0.0.0.0', 0));port = probe.getsockname()[1]
                 (data/'desktop.json').write_text(json.dumps({'port': port}), encoding='utf8')
                 with (data/'log').open('wb') as log:
-                    child = subprocess.Popen([sys.executable, '-B', str(ROOT/'run.py'), '--lan', '--config', str(config), '--codex-home', folder, '--port', str(port)], stdout=log, stderr=log)
+                    # Listener lifecycle does not need a discovered native account runtime.
+                    child = subprocess.Popen([sys.executable, '-B', str(ROOT/'run.py'), '--lan', '--config', str(config),
+                                              '--codex-home', folder, '--codex-bin', str(data/'absent-codex'),
+                                              '--port', str(port)], stdout=log, stderr=log)
                     try:
                         desktop = Desktop(data)
                         end = time.monotonic() + 15
@@ -151,6 +165,7 @@ class LocalAccessTests(unittest.TestCase):
                         request_stop(data)
                         child.wait(timeout=10)
                         self.assertEqual(child.returncode, 0)
+                        self.assertFalse((data/'state_5.sqlite').exists())
                         for address in ['127.0.0.1'] + selected:
                             with socket.socket() as probe:
                                 probe.settimeout(1)

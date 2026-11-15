@@ -25,13 +25,13 @@
 #model-button{display:flex;align-items:center;gap:4px;flex:0 1 auto;min-width:0;max-width:55%;color:var(--text)}
 #model-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #model-effort{flex:none;white-space:nowrap}
-.model-current{overflow-wrap:anywhere;font-size:12px;line-height:1.6;color:var(--muted)}
 .composer-toggle{flex:none;margin-left:auto;display:grid;place-items:center;width:36px;height:36px;border:0;background:transparent;color:var(--muted);border-radius:10px;padding:6px}
 .composer-toggle svg{width:20px;height:20px;transition:transform .15s}
 .composer-toggle[aria-expanded=false] svg{transform:rotate(180deg)}
 .composer.is-collapsed .composer-tools{margin-bottom:0}
 .composer textarea{display:block;background:var(--surface);border:1px solid var(--line);border-radius:16px;resize:none;min-height:48px;height:48px;max-height:160px;line-height:1.6;font-size:16px;padding:10px 14px}
 .compose-bottom{display:grid;grid-template-columns:30px minmax(0,1fr) minmax(0,1fr) auto;align-items:center;padding-top:6px;gap:8px}
+.compose-bottom>.attach-button{grid-column:1}.compose-bottom>select:not(.work-mode-select):not(#work-mode){grid-column:2}.compose-bottom>#work-mode,.compose-bottom>.work-mode-select{grid-column:3}.compose-bottom>.compose-actions{grid-column:4}
 .compose-bottom select{width:100%;font-size:11px;max-width:100%;min-width:0;padding:8px 0;color:var(--muted);text-overflow:ellipsis}
 .compose-actions{flex:none;gap:6px}
 .goal-toggle{display:flex;align-items:center;justify-content:center;gap:5px;flex:none;min-height:36px;padding:8px 10px;border:1px solid var(--line);border-radius:10px;background:transparent;color:var(--green);font-size:11px;white-space:nowrap}
@@ -73,3 +73,5 @@
 .appearance-note{color:var(--muted);margin:16px 0 0;font-size:11px!important}
 .appearance-actions{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:18px}
 .appearance-actions .primary{width:auto;min-width:92px}
+
+.chat-detail-execution{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}.chat-detail-execution #copy-session-link{flex:none}

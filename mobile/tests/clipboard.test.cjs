@@ -5,23 +5,48 @@ const vm = require('node:vm');
 const path = require('node:path');
 const root = path.resolve(__dirname, '../..');
 const script = fs.readFileSync(path.join(root, 'mobile/shared/web/mobile-clipboard.js'), 'utf8');
-function fixture({ reply = 'copied', late = false, frame = false } = {}) {
-  const events = {}, writes = [], errors = [], timers = [];
+const html = fs.readFileSync(path.join(root, 'web/index.html'), 'utf8');
+function fixture({ reply = 'copied', late = false, frame = false, domReadyBeforeNative = false } = {}) {
+  const events = {}, listeners = {}, writes = [], errors = [], timers = [];
   const context = { navigator: {}, setTimeout: fn => timers.push(fn),
     CustomEvent: class { constructor(type, init) { this.type = type; this.detail = init.detail; } },
-    document: { addEventListener: (name, fn) => { events[name] = fn; }, dispatchEvent: e => errors.push(e.detail) },
+    document: { readyState: 'loading', addEventListener: (name, fn) => { events[name] = fn; listeners[name] = (listeners[name] || 0) + 1; }, dispatchEvent: e => errors.push(e.detail) },
     prompt: (command, text) => { writes.push({ command, text }); return reply; }
   };
   context.window = context; context.top = frame ? {} : context;
   vm.createContext(context);
   const loadWeb = () => vm.runInContext(fs.readFileSync(path.join(root, 'web/features/chat/message-actions.js'), 'utf8'), context);
   if (!late) loadWeb();
+  if (domReadyBeforeNative) { context.document.readyState = 'complete'; events.DOMContentLoaded?.(); }
   vm.runInContext(script.replace('__BRIDGE_CLIPBOARD_TOKEN__', 'test-token'), context);
   if (late) { loadWeb(); events.DOMContentLoaded(); }
   const button = { disabled: false, textContent: '复制' };
   const click = (trusted = true) => events.click({ isTrusted: trusted, target: { closest: () => button } });
-  return { context, events, button, click, writes, errors, timers };
+  return { context, events, listeners, button, click, writes, errors, timers };
 }
+test('repeated native injection retains one set of handlers and one-click authorization', async () => {
+  const f = fixture(); f.click();
+  vm.runInContext(script.replaceAll('__BRIDGE_CLIPBOARD_TOKEN__', 'test-token'), f.context);
+  assert.deepEqual(f.listeners, { 'bridge-language': 1, click: 1, DOMContentLoaded: 1 });
+  await f.context.BridgeClipboard.copy(() => 'once', f.button);
+  await f.context.BridgeClipboard.copy(() => 'twice', f.button);
+  assert.equal(f.writes.length, 1);
+});
+test('language sync skips unchanged values and retries a rejected native save', () => {
+  let language = 'zh', accepted = false;
+  const events = {}, writes = [], context = { BridgeI18n: { language: () => language },
+    prompt: (command, value) => { writes.push(value); return accepted ? 'saved' : null; },
+    document: { addEventListener: (name, fn) => events[name] = fn } };
+  context.window = context; context.top = context;
+  vm.createContext(context);
+  vm.runInContext(script.replace("'__BRIDGE_NATIVE_LANGUAGE__'", "'zh'"), context);
+  assert.deepEqual(writes, []);
+  events['bridge-language'](); assert.deepEqual(writes, []);
+  language = 'en'; events['bridge-language'](); accepted = true; events['bridge-language'](); events['bridge-language']();
+  assert.deepEqual(writes, ['en', 'en']);
+  language = 'zh'; events['bridge-language'](); events['bridge-language']();
+  assert.deepEqual(writes, ['en', 'en', 'zh']);
+});
 test('copies async full message exactly without browser clipboard or manual dialog', async () => {
   const f = fixture(); f.click();
   const text = '中文🙂\n```js\nconst value = "quotes\\slashes";\n```\n';
@@ -34,6 +59,16 @@ test('code-copy path uses the same async writer and handles deferred page script
   const f = fixture({ late: true }); f.button.textContent = '复制代码'; f.click();
   await f.context.BridgeClipboard.copy(async () => 'a\n b\t', f.button);
   assert.equal(f.writes[0].text, 'a\n b\t'); assert.equal(f.button.textContent, '已复制');
+});
+test('published native shells can install after DOMContentLoaded with the eager clipboard definition', async () => {
+  assert.match(html, /<script src="\/message-actions\.js\?[^\"]+" defer id="bridge-clipboard-script"><\/script>/);
+  assert.doesNotMatch(html, /<script data-bridge-src="\/message-actions\.js/);
+  const eager = [...html.matchAll(/<script src="([^"]+)" defer id="bridge-clipboard-script"><\/script>/g)].map(match => match[1]);
+  assert.deepEqual(eager.map(url => url.split('?')[0]), ['/message-actions.js']);
+  const f = fixture({ domReadyBeforeNative: true });
+  f.click();
+  await f.context.BridgeClipboard.copy(() => 'late native copy', f.button);
+  assert.equal(f.writes.at(-1).text, 'late native copy');
 });
 test('native rejection does not report copied or open the manual-copy dialog', async () => {
   const f = fixture({ reply: null }); f.click();

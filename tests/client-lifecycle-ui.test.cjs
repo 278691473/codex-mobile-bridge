@@ -5,7 +5,7 @@ function fixture(language='zh'){
  function element(tag){
   const listeners={};return {tag,children:[],dataset:{},attributes:{},open:false,_text:'',
    get textContent(){return this._text+this.children.map(child=>child.textContent).join('');},set textContent(value){this._text=value;},
-   append(...children){for(const child of children){child.parent=this;this.children.push(child);}},
+   append(...children){for(const child of children){child.parent=this;this.children.push(child);}},replaceChildren(...children){this.children=[];this.append(...children);},
    setAttribute(key,value){this.attributes[key]=value;},addEventListener(type,handler){listeners[type]=handler;},
    emit(type,event={}){listeners[type]?.(event);},showModal(){this.open=true;},close(){this.open=false;this.emit('close');},
    remove(){this.parent.children=this.parent.children.filter(child=>child!==this);},focus(){document.activeElement=this;}
@@ -16,6 +16,18 @@ function fixture(language='zh'){
  for(const file of ['web/shared/i18n.js','web/features/clients/client-lifecycle.js'])vm.runInContext(fs.readFileSync(path.join(__dirname,'..',file),'utf8'),context);
  return {context,document,choose:client=>vm.runInContext('ClientLifecycle',context).chooseDisable(client),initialize:client=>vm.runInContext('ClientLifecycle',context).chooseInitialize(client),dialog:()=>document.body.children[0]};
 }
+test('WSL clients distinguish a stopped environment, a pending CLI connection and unknown status',()=>{
+ const lifecycle=require('../web/features/clients/client-lifecycle.js');
+ for(const kind of ['wsl-cli','wsl-claude-cli']){
+  const client={kind,enabled:true,installed:true,setupStatus:'ready',connected:false};
+  assert.equal(lifecycle.connection({...client,distributionRunning:false,running:false}).label,'WSL 未启动');
+  assert.equal(lifecycle.connection({...client,distributionRunning:true,running:true}).label,'WSL 已启动，待连接');
+  const unknown=lifecycle.connection({...client,distributionRunning:null,running:null});
+  assert.equal(unknown.label,'WSL 状态暂未确认');assert.match(unknown.reason,/刷新/);assert.equal(unknown.error,false);
+  assert.equal(lifecycle.connection({...client,distributionRunning:null,connected:true}).label,'已连接');
+ }
+ assert.equal(lifecycle.connection({installed:true,running:false}).label,'应用未运行');
+});
 test('a real close dialog presents three distinct choices and defaults focus to cancel',async()=>{
  for(const expected of [false,true,null]){
   const ui=fixture(),result=ui.choose({id:'deepseek',name:'DSH'}),dialog=ui.dialog();
@@ -24,6 +36,22 @@ test('a real close dialog presents three distinct choices and defaults focus to 
   assert.equal(ui.document.activeElement,buttons[2]);assert.equal(dialog.attributes['aria-labelledby'],dialog.children[0].id);
   buttons[expected===null?2:expected?1:0].onclick();assert.equal(await result,expected);assert.equal(ui.document.body.children.length,0);
  }
+});
+test('manual DSH binding only offers disabling access and cancellation',async()=>{
+ const ui=fixture(),pending=ui.choose({id:'deepseek',name:'DSH',bindingMode:'manual',canForceQuit:false});
+ const buttons=ui.dialog().children.at(-1).children;
+ assert.equal(buttons.length,2);assert.match(buttons[0].textContent,/仅停用手机接入/);
+ assert.equal(ui.document.activeElement,buttons[1]);buttons[0].onclick();assert.equal(await pending,false);
+});
+
+test('manual plugin controls use selected local paths and cancellation submits nothing',async()=>{
+ const ui=fixture();vm.runInContext(fs.readFileSync('desktop/features/clients/desktop-sessions.js','utf8'),ui.context);
+ const Panel=vm.runInContext('DesktopConnectionsPanel',ui.context),controller=Object.create(Panel.prototype),calls=[],messages=[];
+ let selected='/local/plugin',confirmed=true;ui.context.window={confirm:()=>confirmed};
+ Object.assign(controller,{clientsRevision:0,statusRevision:0,renderClients(){},renderScan(){},refreshClients:async()=>{},refresh:async()=>{},feedback:(...args)=>messages.push(args),api:{choose:async kind=>{calls.push(kind);return selected;},desktopSessions:async value=>{calls.push(JSON.parse(JSON.stringify(value)));return {bound:true,profile:'web',home:'/local/home',instanceId:'fixture',plugin:{version:'0.2.0'}};}}});
+ await controller.manualDeepseek('bind-deepseek-plugin');assert.deepEqual(calls,['file',{action:'preview-deepseek-plugin',file:'/local/plugin'},{action:'bind-deepseek-plugin',file:'/local/plugin',instanceId:'fixture'}]);
+ calls.length=0;confirmed=false;await controller.manualDeepseek('bind-deepseek-plugin');assert.deepEqual(calls,['file',{action:'preview-deepseek-plugin',file:'/local/plugin'}]);
+ calls.length=0;selected=null;await controller.manualDeepseek('export-deepseek-plugin');assert.deepEqual(calls,['folder']);assert.equal(controller.busy,false);
 });
 
 test('background force quit requires an explicit capability and fresh choice with a translated warning',async()=>{
@@ -88,6 +116,64 @@ test('an uncertain force quit needs a stopped app as well as disabled access bef
  }
 });
 
+test('ZCode initialization uses only private pipes and keeps restart consent separate',async()=>{
+ for(const surface of ['desktop','web'])for(const scenario of ['cancel','cold','restart','keep-running']){
+  const ui=fixture('en'),desktop=surface==='desktop',file=desktop?'desktop/features/clients/desktop-sessions.js':'web/features/clients/client-navigation.js';
+  vm.runInContext(fs.readFileSync(path.join(__dirname,'..',file),'utf8'),ui.context);
+  const Controller=vm.runInContext(desktop?'DesktopConnectionsPanel':'ClientNavigation',ui.context),panel=Object.create(Controller.prototype),writes=[];
+  const client={id:'zcode',name:'ZCode',enabled:true,installed:true,configured:true,running:scenario!=='cold',confirmTaskState:true,
+    setupStatus:'needs-initialization',canInitializeDesktop:true,pipeSupported:true,compatibilitySupported:true};
+  const save=async body=>{writes.push(JSON.parse(JSON.stringify(body)));return {clients:[client]};};
+  Object.assign(panel,{clients:[client],clientsRevision:0,statusRevision:0,revision:0,pending:new Set(),provider:'zcode',
+    renderClients(){},renderScan(){},paint(){},refreshClients:async()=>{},applyClients(){},api:{desktopSessions:save},request:(url,body)=>save(body)});
+  const result=desktop?panel.toggleClient('zcode',true,{initializeDesktop:true}):panel.initialize('zcode');
+  const first=ui.dialog();assert.ok(first);assert.match(first.textContent,/private local pipe/);assert.doesNotMatch(first.textContent,/17742|compatibility|Claude|[一-鿿]/);assert.equal(writes.length,0);
+  assert.equal(first.children.at(-1).children.length,2);first.children.at(-1).children[scenario==='cancel'?1:0].onclick();await Promise.resolve();
+  if(['restart','keep-running'].includes(scenario)){
+   const second=ui.dialog();assert.match(second.textContent,/Some tasks could not be checked/);assert.equal(writes.length,0);
+   second.children.at(-1).children[scenario==='restart'?0:1].onclick();
+  }
+  await result;
+  assert.deepEqual(writes,['cold','restart'].includes(scenario)?[{...(desktop?{action:'toggle-client'}:{}),provider:'zcode',enabled:true,initializeDesktop:true,connectionMode:'private-pipe',...(scenario==='restart'?{acknowledgeUnavailable:true}:{})}]:[]);
+ }
+ const lifecycle=require('../web/features/clients/client-lifecycle.js');
+ assert.equal(lifecycle.connection({id:'zcode',canInitializeDesktop:true,compatibilitySupported:true}).canInitialize,false);
+ const ready={id:'zcode',pipeSupported:true,pipeReady:true,enabled:true,canInitializeDesktop:true,retryable:true};
+ assert.equal(lifecycle.connection(ready).canInitialize,false);assert.equal(lifecycle.connection(ready).label,'已连接');assert.equal(lifecycle.connection(ready).retryable,false);
+ const failed=new Map([['zcode',{action:'initialize',uncertain:true,connectionMode:'private-pipe'}]]);lifecycle.reconcile(failed,[ready]);assert.equal(failed.size,0);
+});
+
+test('shared inline connection methods show both options and never open another chooser',()=>{
+ for(const language of ['zh','en']){
+  const ui=fixture(language),lifecycle=vm.runInContext('ClientLifecycle',ui.context),root=ui.document.createElement('div'),selected=[];
+  const client={id:'zcode',name:'ZCode',connected:true,connectionMode:'private-pipe',connectionModes:[{id:'private-pipe',label:'本机连接',configured:true,available:true},{id:'official-remote',label:'官方远控',configured:true,available:true},{id:'future',label:'Other',configured:false,available:true}]};
+  const methods=lifecycle.mountConnectionModes(root);methods.update(client,{select:mode=>selected.push(mode)});const buttons=root.children[0].children[1].children;
+  assert.equal(buttons.length,3);assert.equal(buttons[0].attributes['aria-pressed'],'true');assert.equal(buttons[0].disabled,true);assert.equal(buttons[2].disabled,true);buttons[2].onclick();assert.equal(selected.length,0);buttons[1].onclick();assert.deepEqual(selected,['official-remote']);assert.equal(ui.document.body.children.length,0);
+  methods.update({...client,connectionMode:'official-remote'},{select:mode=>selected.push(mode)});assert.equal(root.children[0].children[1].children[0],buttons[0]);assert.equal(buttons[1].attributes['aria-pressed'],'true');
+  if(language==='en')assert.doesNotMatch(root.textContent,/[一-鿿]/);
+ }
+});
+
+test('desktop and remote mode selection submit the same explicit connectionMode without restarting the app',async()=>{
+ for(const surface of ['desktop','web'])for(const choice of ['official-remote',null]){
+  const ui=fixture(),desktop=surface==='desktop';vm.runInContext(fs.readFileSync(desktop?'desktop/features/clients/desktop-sessions.js':'web/features/clients/client-navigation.js','utf8'),ui.context);
+  const Controller=vm.runInContext(desktop?'DesktopConnectionsPanel':'ClientNavigation',ui.context),panel=Object.create(Controller.prototype),calls=[];
+  const client={id:'zcode',name:'ZCode',enabled:true,configured:true,running:true,connectionMode:'private-pipe',connectionModes:[{id:'private-pipe',label:'本机连接',configured:true,available:true},{id:'official-remote',label:'官方远控',configured:true,available:true}]};
+  const save=async body=>{calls.push(JSON.parse(JSON.stringify(body)));return {clients:[{...client,connectionMode:body.connectionMode}]};};
+  Object.assign(panel,{clients:[client],clientsRevision:0,statusRevision:0,revision:0,pending:new Set(),provider:'zcode',renderClients(){},renderScan(){},paint(){},notify(){},refreshClients:async()=>{},applyClients(data){this.clients=data.clients;},api:{desktopSessions:save},request:(url,body)=>save(body)});
+  const result=panel.selectConnectionMode('zcode','official-remote'),dialog=ui.dialog(),buttons=dialog.children.at(-1).children;assert.equal(calls.length,0);assert.match(dialog.textContent,/切换应用接入方式/);assert.match(dialog.textContent,/不会退出或重启电脑 App/);buttons[choice?0:1].onclick();await result;
+  assert.deepEqual(calls,choice?[{...(desktop?{action:'toggle-client'}:{}),provider:'zcode',enabled:true,connectionMode:'official-remote'}]:[]);
+ }
+});
+
+test('ready session access does not show retry and unknown switches reconcile only the selected mode',()=>{
+ const lifecycle=require('../web/features/clients/client-lifecycle.js'),client={id:'zcode',enabled:true,running:true,setupStatus:'session-access',retryable:true,connectionMode:'official-remote',connectionModes:[{id:'official-remote',label:'官方远控'}]};
+ assert.equal(lifecycle.connection(client).label,'已连接');assert.equal(lifecycle.connection(client).modeLabel,'官方远控');assert.equal(lifecycle.connection(client).retryable,false);
+ for(const connectionMode of ['official-remote','private-pipe']){
+  const failures=new Map([['zcode',{action:'enable',uncertain:true,connectionMode}]]);lifecycle.reconcile(failures,[client]);assert.equal(failures.has('zcode'),connectionMode!=='official-remote');
+ }
+});
+
 test('initialization distinguishes background attempts from interactive foreground setup and defaults to cancel',async()=>{
  for(const language of ['zh','en'])for(const accepted of [false,true])for(const initializationMode of ['background','foreground']){
   const ui=fixture(language),result=ui.initialize({id:'claude',name:'Claude',initializationMode}),dialog=ui.dialog(),buttons=dialog.children.at(-1).children;
@@ -103,11 +189,13 @@ test('connection labels distinguish startup, required action, failure and actual
  for(const running of [false,true])for(const configured of [false,true]){
   assert.equal(connection({...base,running,configured,connectionState:'starting'}).label,'正在启动应用…');assert.equal(connection({...base,running,configured,connectionState:'connecting'}).label,'正在连接，请稍候…');
  }
- for(const [setupStatus,label] of [['needs-initialization','需要初始化连接'],['needs-permission','等待授权'],['failed','连接失败']])assert.equal(connection({...base,running:false,setupStatus}).label,label);
+ for(const [setupStatus,label] of [['needs-initialization','需要初始化连接'],['needs-permission','等待授权'],['failed','连接失败'],['history-only','本机历史（只读）']])assert.equal(connection({...base,running:false,setupStatus}).label,label);
  assert.equal(connection({...base,connected:true,connectionState:'connecting'}).label,'已连接');assert.equal(connection({...base,connected:true,connectionState:'connecting'}).waiting,false);
  assert.equal(connection({...base,connectionState:'timeout',retryable:true}).retryable,true);assert.equal(connection({...base,connectionState:'connecting',retryable:true}).retryable,false);
  assert.equal(connection({...base,setupStatus:'recovery-required',connectionState:'connecting',backgroundRunning:true,mainRunning:false}).label,'后台运行，桌面未打开');
  assert.equal(connection({...base,pendingEnable:true,reason:'请手动连接 Claude'}).reason,'正在等待客户端连接，完成后会自动显示聊天。');
+ const restarting=connection({...base,pendingEnable:true,setupStatus:'failed',connectionState:'error'});
+ assert.equal(restarting.label,'正在启动应用…');assert.equal(restarting.error,false);
  for(const setupStatus of ['needs-initialization','needs-retry','needs-developer-mode','needs-trust','needs-permission','failed'])assert.equal(connection({...base,id:'claude',setupStatus}).canInitialize,true);
  const prepared={...base,id:'claude',setupStatus:'needs-initialization',reconnectSupported:true,canReconnect:true};
  assert.equal(connection(prepared).canReconnect,true);assert.equal(connection(prepared).canInitialize,true);
@@ -174,4 +262,56 @@ test('Claude explains its native quit menu while other clients retain the idle r
   if(language==='en')assert.doesNotMatch(dialog.textContent,/[\u4e00-\u9fff]/);
   dialog.close();assert.equal(await result,null);
  }
+});
+
+
+function toggleFixture(ui,surface,client,calls){
+  const file=surface==='desktop'?'desktop/features/clients/desktop-sessions.js':'web/features/clients/client-navigation.js';
+  vm.runInContext(fs.readFileSync(path.join(__dirname,'..',file),'utf8'),ui.context);
+  const Class=vm.runInContext(surface==='desktop'?'DesktopConnectionsPanel':'ClientNavigation',ui.context),controller=Object.create(Class.prototype);
+  Object.assign(controller,{clients:[client],clientsRevision:0,statusRevision:0,revision:0,pending:new Set(),provider:client.id,renderClients(){},renderScan(){},paint(){},refreshClients:async()=>{},applyClients(value){this.clients=value.clients;},api:{desktopSessions:async body=>{calls.push(body);return {clients:[{...client,enabled:false,running:false}]};}},request:async(url,body)=>{calls.push(body);return {clients:[{...client,enabled:false,running:false}]};}});
+  return surface==='desktop'?controller.toggleClient(client.id,false):controller.toggle(client.id,false);
+}
+
+test('failed Codex rebuild exposes a cancellable normal-exit risk confirmation on both surfaces',async()=>{
+ for(const surface of ['web','desktop'])for(const language of ['zh','en'])for(const accepted of [false,true]){
+  const ui=fixture(language),client={id:'codex',name:'Codex',enabled:true,running:true,desktopRestartRecommended:true},calls=[];
+  const pending=toggleFixture(ui,surface,client,calls);
+  ui.dialog().children.at(-1).children[1].onclick();await Promise.resolve();
+  const confirmation=ui.dialog(),buttons=confirmation.children.at(-1).children;
+  assert.equal(calls.length,0);assert.equal(ui.document.activeElement,buttons[1]);
+  assert.match(confirmation.textContent,language==='zh'?/正常退出仍可能中断.*已知运行任务会阻止退出/:/Normal exit may interrupt.*known active tasks will still block exit/);
+  if(language==='en')assert.doesNotMatch(confirmation.textContent,/[\u4e00-\u9fff]/);
+  buttons[accepted?0:1].onclick();await pending;
+  assert.equal(calls.length,accepted?1:0);
+  if(accepted){assert.equal(calls[0].quitDesktop,true);assert.equal(calls[0].acknowledgeUnavailable,true);assert.equal(calls[0].forceDesktop,undefined);}
+ }
+});
+
+
+test('ZCode phone disconnect, unknown-state quit and force are independent choices on both surfaces',async()=>{
+ for(const surface of ['desktop','web'])for(const selection of ['disconnect','cancel','quit','force']){
+  const ui=fixture('en'),client={id:'zcode',name:'ZCode',enabled:true,running:true,canForceQuit:true,confirmTaskState:true};
+  const calls=[],pending=toggleFixture(ui,surface,client,calls);
+  ui.dialog().children.at(-1).children[selection==='disconnect'?0:selection==='force'?2:1].onclick();await Promise.resolve();
+  if(selection!=='disconnect'){
+   const confirm=ui.dialog(),buttons=confirm.children.at(-1).children;
+   assert.equal(calls.length,0);assert.equal(ui.document.activeElement,buttons[1]);
+   assert.match(confirm.textContent,selection==='force'?/Force quit/i:/running task or pending approval/i);
+   buttons[selection==='cancel'?1:0].onclick();
+  }
+  await pending;assert.equal(calls.length,selection==='cancel'?0:1);
+  if(calls.length){assert.equal(calls[0].quitDesktop,selection!=='disconnect');assert.equal(!!calls[0].acknowledgeUnavailable,selection==='quit');assert.equal(!!calls[0].forceConfirmed,selection==='force');}
+ }
+});
+
+
+test('Antigravity shares desktop identity and only disables phone access',async()=>{
+ const ui=fixture();ui.context.URLSearchParams=URLSearchParams;const identity=vm.runInContext('ClientIdentity',ui.context);
+ assert.equal(identity.desktop('antigravity'),true);
+ assert.equal(identity.path('antigravity','detail','scoped'),'/api/desktop-sessions/antigravity/detail?sessionId=scoped');
+ const result=ui.choose({id:'antigravity',name:'Antigravity',canQuitDesktop:false,canForceQuit:false});
+ const buttons=ui.dialog().children.at(-1).children;
+ assert.equal(buttons.length,2);assert.doesNotMatch(ui.dialog().textContent,/正常退出电脑 App|强制关闭 App/);
+ buttons[0].onclick();assert.equal(await result,false);
 });

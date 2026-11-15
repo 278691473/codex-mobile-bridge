@@ -2,6 +2,8 @@ import copy
 import io
 import json
 import os
+import socket
+import ssl
 import tempfile
 import threading
 import unittest
@@ -81,13 +83,27 @@ class AccessTests(unittest.TestCase):
         before = self.desktop.config()
         for changes in [dict(publicUrl='https://a.example/path'), dict(publicUrl='https://x;evil'),
                         dict(publicUrl='https://user:password@a.example'), dict(publicUrl='http://a.example'),
-                        dict(publicUrl='https://example.com:8443'), dict(sshTarget='-oProxyCommand=evil'),
+                        dict(publicUrl='https://example.com:65536'), dict(publicUrl='https://example.com:0'),
+                        dict(sshTarget='-oProxyCommand=evil'),
                         dict(sshTarget='a; echo bad'), dict(sshRemotePort=True), dict(sshRemotePort=22)]:
             value = self.server()
             value['preferences']['connections'][0].update(changes)
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 self.desktop.save(value)
             self.assertEqual(self.desktop.config(), before)
+
+    def test_server_custom_https_port_survives_save_and_export(self):
+        for url in ('https://93.184.216.34:8443', 'https://bridge.example.com:8443',
+                    'https://[2606:4700:4700::1111]:8443'):
+            with self.subTest(url=url):
+                value = self.server()
+                value['preferences']['connections'][0]['publicUrl'] = url
+                self.desktop.save(value)
+                self.assertEqual(self.desktop.config()['origins'], [url])
+                files = self.desktop.deployment({'id': 'server'})['files']
+                self.assertIn(url + ' {', files['Caddyfile'])
+                for name in ('部署说明.md', 'DEPLOYMENT_EN.md'):
+                    self.assertIn('TCP 8443', files[name])
 
     def test_default_https_port_matches_browser_origin_serialization(self):
         value = self.server()
@@ -109,6 +125,70 @@ class AccessTests(unittest.TestCase):
             (invalid['preferences'] if 'lan' in changes else invalid['preferences']['connections'][0]).update(changes)
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 self.desktop.save(invalid)
+
+    def test_external_https_entry_uses_loopback_without_lan_or_local_browser(self):
+        value = copy.deepcopy(self.value)
+        value['preferences'].update(lan=False, localAccess=False, connections=[{
+            'id': 'external', 'name': 'External', 'enabled': True,
+            'accessMode': 'external', 'publicUrl': 'https://PHONE.example.com:8443/',
+        }])
+        self.desktop.save(value)
+        state = self.desktop.snapshot()
+        self.assertEqual(state['urls'], ['https://phone.example.com:8443/'])
+        self.assertEqual(state['notificationUrls'], [])  # The gateway is stopped.
+        self.assertEqual(self.desktop.config()['origins'], ['https://phone.example.com:8443'])
+        self.assertEqual(self.desktop.config()['publicUrl'], 'https://phone.example.com:8443')
+        self.assertEqual(self.desktop.preferences()['connections'][0]['proxyUpstream'], '')
+        with patch('bridge.app.desktop.interfaces.enumerate_interfaces', return_value=[]), \
+                patch('bridge.app.desktop.socket.socket'), patch('bridge.app.desktop.subprocess.Popen') as spawn:
+            self.assertTrue(self.desktop.start()['started'])
+        self.assertEqual(spawn.return_value.stdin.write.call_args.args[0], b'{}')
+        with self.assertRaisesRegex(ValueError, '自有服务器或 NAS'):
+            self.desktop.deployment({'id': 'external'})
+        self.assertEqual(access.public_urls(self.desktop.preferences()), ['https://phone.example.com:8443'])
+        from bridge.features.notifications.addresses import entry_urls
+        self.assertEqual(entry_urls(self.desktop.preferences(), ['127.0.0.1']), ['https://phone.example.com:8443'])
+
+    def test_external_rejects_non_https_and_subpaths_without_saving(self):
+        value = copy.deepcopy(self.value)
+        value['preferences']['connections'] = [{'id': 'external', 'enabled': True, 'accessMode': 'external', 'publicUrl': ''}]
+        before = self.desktop.config()
+        for url in ('', 'http://phone.example.com', 'https://phone.example.com/path',
+                    'https://phone.example.com:99999', 'https://phone.example.com:',
+                    'https://phone.example.com/?token=x', 'https://phone.example.com?',
+                    'https://phone.example.com#'):
+            value['preferences']['connections'][0]['publicUrl'] = url
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                self.desktop.save(value)
+            self.assertEqual(self.desktop.config(), before)
+
+    def test_external_probe_classifies_tls_network_redirect_and_wrong_target(self):
+        preferences = {'port': 8787, 'connections': [{
+            'id': 'external', 'enabled': True, 'accessMode': 'external',
+            'publicUrl': 'https://phone.example.com:8443'}]}
+        selected = access.select_connection({**preferences, 'lan': False}, {'id': 'external'})
+        cases = [(ssl.SSLError('certificate failed'), 'TLS'),
+                 (socket.gaierror('DNS failed'), '无法连接'),
+                 (ValueError('入口返回 HTTP 302 重定向'), '重定向')]
+        for error, message in cases:
+            with self.subTest(error=error), patch.object(access, 'read_auth', side_effect=error):
+                with self.assertRaisesRegex(ValueError, message):
+                    access.check_entry(selected, instance_id='current')
+        with patch.object(access, 'read_auth', return_value={'instanceId': 'other'}) as probe:
+            with self.assertRaisesRegex(ValueError, '当前网关'):
+                access.check_entry(selected, instance_id='current')
+            probe.assert_called_once_with('https://phone.example.com:8443')
+
+    def test_external_probe_never_sends_credentials_or_follows_redirect(self):
+        response = MagicMock(status=302)
+        connection = MagicMock()
+        connection.getresponse.return_value = response
+        with patch.object(access.http.client, 'HTTPSConnection', return_value=connection) as create:
+            with self.assertRaisesRegex(ValueError, '重定向'):
+                access.read_auth('https://phone.example.com:8443')
+        self.assertEqual(create.call_args.args, ('phone.example.com', 8443))
+        connection.request.assert_called_once_with('GET', '/api/auth', headers={'Cache-Control': 'no-cache'})
+        connection.close.assert_called_once()
 
     def test_running_configuration_cannot_change_external_access(self):
         self.desktop.save(self.value)
@@ -247,12 +327,14 @@ class ConcurrentRuntimeTests(unittest.TestCase):
             tunnels = [MagicMock(), MagicMock()]
             with patch.object(run.sys, 'argv', ['run.py', '--config', str(config), '--lan']), \
                  patch.object(run.sys, 'stdout', MagicMock()), patch.object(run.sys, 'stderr', MagicMock()), \
-                 patch.object(run, 'addresses', return_value=['127.0.0.1']), \
+                 patch('bridge.features.network.interfaces.enumerate_interfaces', return_value=[]), \
+                 patch('bridge.features.network.runtime.network_signature', return_value={'fixture': True}), \
                  patch.object(run, 'Bridge'), patch.object(run, 'Notifications'), \
                  patch.object(run, 'GatewayControl'), patch.object(run.signal, 'signal'), \
                  patch.object(run, 'GatewayServer', return_value=server) as make_server, \
                  patch.object(run, 'SSHTunnel', side_effect=tunnels) as make_ssh, \
-                 patch.object(run, 'QuickTunnel', return_value=quick):
+                 patch.object(run, 'QuickTunnel', return_value=quick), \
+                 patch('bridge.features.network.server_connection.Path.home', return_value=data):
                 run.main(connections=rows)
             self.assertEqual([call.args[-1] for call in make_ssh.call_args_list], ['a', 'b'])
             for tunnel in tunnels:
@@ -382,3 +464,68 @@ class ConcurrentRuntimeTests(unittest.TestCase):
                     starter.join(3)
                 old_process.terminate.assert_called_once()
                 new_process.terminate.assert_called_once()
+
+    def test_quick_tunnel_replaces_session_after_repeated_local_readiness_failure(self):
+        with tempfile.TemporaryDirectory(dir=ROOT/'.tmp') as directory:
+            data = Path(directory)
+            executable = data/'cloudflared';executable.touch()
+            old_gate, new_gate = threading.Event(), threading.Event()
+            old_process = MagicMock(stdout=LineStream([
+                'Starting metrics server on 127.0.0.1:43210/metrics',
+                'https://old-network.trycloudflare.com',
+                'Registered tunnel connection',
+            ], old_gate))
+            old_process.poll.return_value = None
+            old_process.terminate.side_effect = old_gate.set
+            new_process = MagicMock(stdout=LineStream([
+                'https://new-network.trycloudflare.com',
+                'Registered tunnel connection',
+            ], new_gate))
+            new_process.poll.return_value = None
+            new_process.terminate.side_effect = new_gate.set
+            tunnel = QuickTunnel(executable, 8787, data, MagicMock())
+            tunnel.RESTART_DELAY = 0
+            tunnel.NETWORK_GRACE = 0
+            tunnel.NETWORK_RECHECK = 0
+            tunnel._local_readiness = lambda port: False
+
+            old_origin = threading.Event()
+            new_origin = threading.Event()
+            tunnel.on_origin.side_effect = lambda url: (
+                old_origin.set() if url.endswith('old-network.trycloudflare.com') else new_origin.set()
+            )
+            with patch('bridge.features.network.tunnel.subprocess.Popen',
+                       side_effect=[old_process, new_process]):
+                starter = threading.Thread(target=tunnel.start)
+                try:
+                    starter.start()
+                    self.assertTrue(old_origin.wait(5), 'First Quick Tunnel was not established')
+                    self.assertTrue(tunnel.ready.wait(1))
+                    self.assertTrue(tunnel.network_changed())
+                    self.assertTrue(new_origin.wait(5), 'Network change did not replace Quick Tunnel')
+                    starter.join(3)
+                    self.assertFalse(starter.is_alive())
+                    self.assertEqual(tunnel.url, 'https://new-network.trycloudflare.com')
+                finally:
+                    tunnel.close()
+                    starter.join(3)
+                self.assertFalse(starter.is_alive())
+                old_process.terminate.assert_called_once()
+                new_process.terminate.assert_called_once()
+
+    def test_quick_tunnel_suppresses_transient_entry_updates(self):
+        tunnel = QuickTunnel(Path('.tmp')/'unused-cloudflared', 8787, Path('.tmp'), MagicMock())
+        try:
+            self.assertFalse(tunnel.entry_stable())
+            self.assertTrue(tunnel.network_changed())
+            self.assertFalse(tunnel.entry_stable())
+            tunnel.broken.clear()
+            tunnel.finished.clear()
+            tunnel.ready.set()
+            self.assertTrue(tunnel.entry_stable())
+            tunnel.network_changed()
+            self.assertTrue(tunnel.entry_stable())
+            tunnel.finished.set()
+            self.assertFalse(tunnel.entry_stable())
+        finally:
+            tunnel.close()

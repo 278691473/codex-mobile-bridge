@@ -42,7 +42,8 @@ class AccountRPC:
             # Use the account's home, not a chat's project/configuration layer.
             self.process = subprocess.Popen(
                 [str(self.executable), 'app-server', '--listen', 'stdio://'], cwd=self.home,
-                env={**os.environ, 'CODEX_HOME': str(self.home)}, stdin=subprocess.PIPE,
+                env={**{key: value for key, value in os.environ.items() if key != 'CODEX_SQLITE_HOME'},
+                     'CODEX_HOME': str(self.home)}, stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding='utf-8', **options)
             def read():
                 try:
@@ -165,14 +166,37 @@ class Account:
         return AccountRPC(self.home, executable)
 
     @staticmethod
+    def login_context(rpc, auth=None, config=None):
+        if auth is None:
+            auth = rpc.request('account/read', {'refreshToken': False})
+        account = auth.get('account') or {}
+        # The routing origin proves this is the native login, not proxy-shaped metadata.
+        if (account.get('type') != 'chatgpt' or auth.get('requiresOpenaiAuth') is not True or
+                (auth.get('workspaceRouting') or {}).get('backendOrigin') != 'https://chatgpt.com'):
+            return None
+        identity = json.dumps([account, auth.get('workspaceRouting')], sort_keys=True, separators=(',', ':'))
+        account_key = hashlib.sha256(identity.encode()).hexdigest()
+        if config is None:
+            config = rpc.request('config/read', {'includeLayers': False}).get('config', {})
+        profile = (config.get('profiles') or {}).get(config.get('profile'), {})
+        effective = {**config, **profile}
+        return {'loginType': 'chatgpt', 'accountKey': account_key,
+                '_routeCacheKey': Account.route_cache_key(account_key, effective),
+                'email': account.get('email'), 'planType': account.get('planType'), 'canReset': True}
+
+    @staticmethod
+    def route_cache_key(account_key, effective):
+        route = effective.get('openai_base_url') or os.environ.get('OPENAI_BASE_URL')
+        cache_identity = json.dumps([account_key, route], separators=(',', ':'))
+        return hashlib.sha256(cache_identity.encode()).hexdigest()
+
+    @staticmethod
     def context(rpc):
         config = rpc.request('config/read', {'includeLayers': False}).get('config', {})
         profile = (config.get('profiles') or {}).get(config.get('profile'), {})
-        provider = profile.get('model_provider', config.get('model_provider')) or 'openai'
-        definition = (config.get('model_providers') or {}).get(provider) or {}
+        effective = {**config, **profile}
         # A custom provider can use ChatGPT-shaped credentials. It is not native login.
-        if provider != 'openai' or profile.get('openai_base_url', config.get('openai_base_url')) or any(definition.get(key) for key in
-                ('base_url', 'env_key', 'experimental_bearer_token', 'http_headers', 'env_http_headers', 'auth', 'gateway_oauth')):
+        if Catalog.custom_provider(effective):
             return {'loginType': 'api'}
         auth = rpc.request('account/read', {'refreshToken': False})
         account = auth.get('account') or {}
@@ -183,13 +207,15 @@ class Account:
         if account.get('type') != 'chatgpt' or auth.get('requiresOpenaiAuth') is not True:
             return {'loginType': 'unknown'}
         identity = json.dumps([account, auth.get('workspaceRouting')], sort_keys=True, separators=(',', ':'))
-        return {'loginType': 'chatgpt', 'accountKey': hashlib.sha256(identity.encode()).hexdigest(),
+        account_key = hashlib.sha256(identity.encode()).hexdigest()
+        return {'loginType': 'chatgpt', 'accountKey': account_key,
+                '_routeCacheKey': Account.route_cache_key(account_key, effective),
                 'email': account.get('email'), 'planType': account.get('planType'),
                 'canReset': True}
 
     def limits(self, rpc, context, refresh=False):
         # Called under the shared account lock by both account views.
-        key = context['accountKey']
+        key = context.get('_routeCacheKey', context['accountKey'])
         cached = self.usage_cache.get(key)
         if not refresh and cached and time.time()-cached['checkedAt'] < 300:
             return copy.deepcopy(cached['value'])
@@ -199,7 +225,7 @@ class Account:
         return copy.deepcopy(value)
 
     def subscription(self, home, context, refresh=False):
-        key = context['accountKey']
+        key = context.get('_routeCacheKey', context['accountKey'])
         cached = self.subscription_cache.get(key)
         if not refresh and cached and time.time()-cached['observedAt'] < 300:
             return copy.deepcopy(cached)
@@ -210,14 +236,16 @@ class Account:
     def _status(self, rpc, context, refresh=False):
         if not context.get('accountKey'):
             return {'visible': False, 'loginType': context['loginType']}
-        result = {'visible': True, **context, 'limits': [], 'resetCredits': None, 'error': None}
+        result = {'visible': True, **{key: value for key, value in context.items() if key != '_routeCacheKey'},
+                  'limits': [], 'resetCredits': None, 'error': None}
         try:
             result.update(self.limits(rpc, context, refresh=refresh))
         except AccountError as exc:
-            result.update(copy.deepcopy(self.usage_cache.get(context['accountKey'], {}).get('value', {})))
+            result.update(copy.deepcopy(self.usage_cache.get(context.get('_routeCacheKey', context['accountKey']), {}).get('value', {})))
             result['error'] = str(exc)
         current = self.context(rpc)
-        if current.get('accountKey') != context['accountKey']:
+        if (current.get('accountKey') != context['accountKey'] or
+                current.get('_routeCacheKey') != context.get('_routeCacheKey')):
             return {'visible': False, 'loginType': current['loginType'] if not current.get('accountKey') else 'unknown'}
         result['canReset'] = current['canReset']
         ledger = read_json(self.path, {})
@@ -226,6 +254,10 @@ class Account:
                                       if row['accountKey'] == context['accountKey'] and not row.get('outcome')), None)
         result.setdefault('updatedAt', None)
         result['subscription'] = self.subscription(self.home, context, refresh=refresh)
+        current = self.context(rpc)
+        if (current.get('accountKey') != context['accountKey'] or
+                current.get('_routeCacheKey') != context.get('_routeCacheKey')):
+            return {'visible': False, 'loginType': current['loginType'] if not current.get('accountKey') else 'unknown'}
         return result
 
     def read(self, refresh=True):
@@ -272,7 +304,8 @@ class Account:
                         for row in cards['credits'] or []):
                     raise ValueError('此重置卡已不可用，请刷新后重新选择')
             current = self.context(rpc)
-            if current.get('accountKey') != account_key or not current['canReset']:
+            if (current.get('accountKey') != account_key or
+                    current.get('_routeCacheKey') != context.get('_routeCacheKey') or not current['canReset']):
                 raise PermissionError('电脑端账号或重置权限已变化，请刷新后重新确认')
             if not previous:
                 ledger[request_id] = {'accountKey': account_key, 'creditId': credit_id, 'at': time.time()}
@@ -287,7 +320,7 @@ class Account:
                 raise AccountError('重置结果尚未确认，请刷新并重试原请求')
             ledger[request_id]['outcome'] = outcome
             write_json(self.path, ledger)
-            self.usage_cache.pop(account_key, None)
+            self.usage_cache.pop(context.get('_routeCacheKey', account_key), None)
             return {'outcome': outcome, 'account': self._status(rpc, context)}
 
     def control(self, value):

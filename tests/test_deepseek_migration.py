@@ -11,6 +11,56 @@ from bridge.clients.errors import BridgeUnavailable
 from bridge.clients.deepseek.setup import insertion, legacy_account_configured
 
 
+class DeepSeekInsertionTests(unittest.TestCase):
+    def test_flow_folding_preserves_scalar_values(self):
+        """Match Harness's quoted YAML folding without loading user YAML."""
+        cases = [
+            ('Application\n    Support', 'Application Support'),
+            ('Application \t\n \tSupport', 'Application Support'),
+            ('Application\n \t\n    Support', 'Application\nSupport'),
+            ('Application\n\n\n    Support', 'Application\n\nSupport'),
+            ('Application\\\n    Support', 'ApplicationSupport'),
+            ('Application  \\\n    Support', 'Application  Support'),
+            (r'Application\nSupport', 'Application\nSupport'),
+            ('Application'+'\\'*2+'\n    Support', 'Application\\ Support'),
+            (r'应用 \"quoted\" \\path'+'\n    Support', '应用 "quoted" \\path Support'),
+        ]
+        for newline in ('\n', '\r\n'):
+            for raw, expected in cases:
+                with self.subTest(newline=newline, raw=raw):
+                    text = MARKER+newline+'- {"value": "'+raw.replace('\n', newline)+'"}'+newline
+                    self.assertEqual(insertion(text)[0], {'value': expected})
+
+    def test_folded_paths_preserve_original_block_offsets(self):
+        """Keep path characters and unrelated patch bytes across both line endings."""
+        paths = ['/Users/example/Library/Application Support/bridge/connection.json',
+                 r'C:\Users\example\Application Support\bridge\connection.json',
+                 '/Users/示例/Application Support/引号"与反斜线\\/connection.json']
+        for newline in ('\n', '\r\n'):
+            for path in paths:
+                with self.subTest(newline=newline, path=path):
+                    expected = {'insert': [{'id': 'codex-mobile-desktop',
+                                           'name': 'file:///tmp/mobile-host.mjs',
+                                           'config': {'configPath': path}}]}
+                    scalar = json.dumps(path, ensure_ascii=False)
+                    flow = json.dumps(expected, ensure_ascii=False).replace(
+                        scalar, scalar.replace(' ', newline+'    ', 1))
+                    prefix = '- id: user-setting'+newline+'  config: !!js "never execute"'+newline
+                    suffix = '- id: later-user-setting'+newline+'  config: true'+newline
+                    text = prefix+MARKER+newline+'- '+flow+newline+suffix
+                    entry, start, end = insertion(text)
+                    self.assertEqual(entry, expected)
+                    self.assertEqual(text[:start]+text[end:], prefix+suffix)
+
+    def test_folded_duplicate_keys_and_unknown_forms_are_rejected(self):
+        """Preserve duplicate-key checks and the accepted flow subset."""
+        for flow in ['{"config Path": 1, "config\n    Path": 2}',
+                     "{'insert': []}", '{"insert": *alias}', '{"insert": []']:
+            with self.subTest(flow=flow):
+                with self.assertRaises(ValueError):
+                    insertion(MARKER+'\n- '+flow+'\n')
+
+
 class DeepSeekMigrationTests(unittest.TestCase):
     def setUp(self):
         root = Path(__file__).resolve().parents[1]/'.tmp'
@@ -22,7 +72,7 @@ class DeepSeekMigrationTests(unittest.TestCase):
         self.profile = self.home/'profiles/desktop/cordis.patch.yml'
         self.profile.parent.mkdir(parents=True)
         self.profile.write_text('- id: user-setting\n  config: !!js "do not evaluate"\n')
-        self.old = DeepSeek(self.root/'desktop-lab/desktop-sessions/deepseek', self.home)
+        self.old = DeepSeek(self.root/'Application Support/desktop-lab/desktop-sessions/deepseek', self.home)
         self.old.ensure_installed()
         self.new_path = self.root/'new-preview/desktop-sessions/deepseek'
         self.new = DeepSeek(self.new_path, self.home)
@@ -63,6 +113,25 @@ class DeepSeekMigrationTests(unittest.TestCase):
         self.assertIn('config: !!js "do not evaluate"', after)
         self.assertIn('- id: later-user-setting\n  config: true', after)
 
+    def test_folded_config_path_reuses_connector_without_rewriting(self):
+        """A Harness save must not invalidate or replace the owned connector."""
+        self.normalize()
+        self.profile.write_text(self.profile.read_text().replace(
+            'Application Support', 'Application\n              Support'))
+        paths = [*self.old.directory.iterdir(), self.profile]
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths}
+        self.assertTrue(self.old.installation_status()['installed'])
+        self.assertFalse(self.old.ensure_installed()['changed'])
+        self.assertTrue(self.new.discover_existing()['reused'])
+        self.assertEqual(self.new.directory, self.old.directory)
+        self.assertFalse(self.new_path.exists())
+        self.assertEqual(before, {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in paths})
+        self.old.uninstall()
+        after = self.profile.read_text()
+        self.assertNotIn(MARKER, after)
+        self.assertIn('config: !!js "do not evaluate"', after)
+        self.assertIn('- id: later-user-setting\n  config: true', after)
+
     def test_known_old_adapter_reuses_endpoint_and_shared_ledger_without_any_write(self):
         self.legacy()
         self.normalize()
@@ -97,6 +166,147 @@ class DeepSeekMigrationTests(unittest.TestCase):
         self.assertTrue(result['reused']); self.assertTrue(result['updateRequired'])
         self.assertEqual(self.new.directory, self.old.directory)
         self.assertEqual(before, {path: path.read_bytes() for path in before})
+
+    def test_previous_history_source_is_recognized_for_reuse(self):
+        from bridge.clients.deepseek import setup
+        original_sha = hashlib.sha256
+        source = self.old.directory/'mobile-host.mjs'
+        content = b'// fixture for the prior revision 4 source'
+        source.write_bytes(content)
+        before = {path: path.read_bytes() for path in self.old.directory.iterdir()}
+        def digest(value):
+            if value == content:
+                return Mock(hexdigest=lambda: setup.PREVIOUS_HISTORY_SOURCES[0])
+            return original_sha(value)
+        with patch.object(setup.hashlib, 'sha256', side_effect=digest):
+            result = self.new.discover_existing()
+        self.assertTrue(result['reused'])
+        self.assertTrue(result['updateRequired'])
+        self.assertEqual(before, {path: path.read_bytes() for path in before})
+
+    def test_previous_project_sources_reuse_original_credentials_and_require_explicit_update(self):
+        from bridge.clients.deepseek import setup
+        original_sha = hashlib.sha256
+        source = self.old.directory/'mobile-host.mjs'
+        content = b'// fixture for source before new-directory support'
+        source.write_bytes(content)
+        before = {path: path.read_bytes() for path in self.old.directory.iterdir()}
+        for predecessor in setup.PREVIOUS_PROJECT_SOURCES:
+            def digest(value):
+                return Mock(hexdigest=lambda: predecessor) if value == content else original_sha(value)
+            with patch.object(setup.hashlib, 'sha256', side_effect=digest):
+                result = self.new.discover_existing()
+            self.assertTrue(result['reused'])
+            self.assertTrue(result['updateRequired'])
+            self.assertEqual(self.new.directory, self.old.directory)
+            self.assertEqual(before, {path: path.read_bytes() for path in before})
+
+    def test_previous_workspace_preview_reuses_owned_source_and_updates_only_explicitly(self):
+        from bridge.clients.deepseek import setup
+        source = self.old.directory/'mobile-host.mjs'
+        content = b'// verified workspace preview fixture'
+        source.write_bytes(content)
+        original_sha = hashlib.sha256
+        for predecessor in (*setup.PREVIOUS_WORKSPACE_SOURCES, *setup.PREVIOUS_ARCHIVE_SOURCES,
+                            *setup.PREVIOUS_DISCONNECT_SOURCES, *setup.PREVIOUS_MESSAGE_MODEL_SOURCES,
+                            *setup.PREVIOUS_SESSION_METADATA_SOURCES):
+            source.write_bytes(content)
+            before = {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                      for path in (*self.old.directory.iterdir(), self.profile)}
+            def digest(value):
+                return Mock(hexdigest=lambda: predecessor) if value == content else original_sha(value)
+            with patch.object(setup.hashlib, 'sha256', side_effect=digest):
+                adapter = DeepSeek(self.new_path, self.home)
+                self.assertTrue(adapter.discover_existing()['updateRequired'])
+                self.assertEqual(adapter.directory, self.old.directory)
+                self.assertEqual(before, {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in before})
+                adapter.update_existing()
+            self.assertEqual(source.read_bytes(), Path(setup.__file__).with_name('host.mjs').read_bytes())
+            self.assertEqual({p: value for p, value in before.items() if p != source},
+                             {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in before if p != source})
+            self.assertFalse(self.new_path.exists())
+
+    def test_compatible_predecessors_remain_usable_without_silent_source_updates(self):
+        from bridge.clients.deepseek import setup
+        source = self.old.directory/'mobile-host.mjs'
+        content = b'// fixture for a verified compatible predecessor'
+        source.write_bytes(content)
+        original_sha = hashlib.sha256
+        for predecessor in setup.COMPATIBLE_OFFICIAL_SOURCES:
+            before = source.read_bytes()
+            def digest(value):
+                return Mock(hexdigest=lambda: predecessor) if value == content else original_sha(value)
+            with patch.object(setup.hashlib, 'sha256', side_effect=digest):
+                adapter = DeepSeek(self.new_path, self.home)
+                self.assertTrue(adapter.discover_existing()['reused'])
+                self.assertFalse(adapter.discover_existing()['updateRequired'])
+                self.assertEqual(source.read_bytes(), before)
+
+    def test_shipped_revision11_predecessor_remains_recognized(self):
+        from bridge.clients.deepseek import setup
+        source = self.old.directory/'mobile-host.mjs'
+        content = b'// shipped revision 11 connector before record-path reads'
+        source.write_bytes(content)
+        original_sha = hashlib.sha256
+        for predecessor in ('0c6a9586ecb2e52c6392f576dda7c1bddb1629ceb41e757bef27c905869db228',
+                            'bdc236e7f02cc59a9a23b917683849d1a14473e8145dad14af6e7ae2934c2c71'):
+            before = {path: path.read_bytes() for path in (*self.old.directory.iterdir(), self.profile)}
+            def digest(value):
+                return Mock(hexdigest=lambda: predecessor) if value == content else original_sha(value)
+            with patch.object(setup.hashlib, 'sha256', side_effect=digest):
+                adapter = DeepSeek(self.new_path, self.home)
+                self.assertTrue(adapter.discover_existing()['reused'])
+                self.assertFalse(adapter.legacy_protocol)
+            self.assertEqual({path: path.read_bytes() for path in before}, before)
+            self.assertFalse(self.new_path.exists())
+
+    def test_current_source_lf_and_crlf_are_reused_as_current_without_writes(self):
+        source = self.old.directory/'mobile-host.mjs'
+        current = Path(__file__).resolve().parents[1]/'bridge/clients/deepseek/host.mjs'
+        lf = current.read_bytes().replace(b'\r\n', b'\n')
+        self.assertIn(b'\n', lf)
+        for content in (lf, lf.replace(b'\n', b'\r\n')):
+            with self.subTest(line_ending='CRLF' if b'\r\n' in content else 'LF'):
+                source.write_bytes(content)
+                before = {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                          for path in (*self.old.directory.iterdir(), self.profile)}
+                adapter = DeepSeek(self.new_path, self.home)
+                discovered = adapter.discover_existing()
+                self.assertTrue(discovered['reused'])
+                self.assertFalse(discovered['legacyProtocol'])
+                self.assertFalse(discovered['updateRequired'])
+                self.assertFalse(discovered['restartRequired'])
+                self.assertTrue(adapter.ensure_installed()['reused'])
+                self.assertEqual(adapter.directory, self.old.directory)
+                self.assertEqual(before, {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                                          for path in before})
+                self.assertFalse(self.new_path.exists())
+
+        source.write_bytes(lf)
+        original_read_bytes = Path.read_bytes
+        def packaged_crlf(path):
+            return lf.replace(b'\n', b'\r\n') if path == current else original_read_bytes(path)
+        before = {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                  for path in (*self.old.directory.iterdir(), self.profile)}
+        with patch.object(Path, 'read_bytes', autospec=True, side_effect=packaged_crlf):
+            discovered = DeepSeek(self.new_path, self.home).discover_existing()
+        self.assertTrue(discovered['reused'])
+        self.assertFalse(discovered['legacyProtocol'])
+        self.assertFalse(discovered['updateRequired'])
+        self.assertEqual(before, {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                                  for path in before})
+
+        for content in (lf.replace(b'\n', b'\r\n')+b'// modified code\r\n',
+                        lf.replace(b'\n', b'\r\n', 1)):
+            with self.subTest(modification='code' if b'modified code' in content else 'mixed endings'):
+                source.write_bytes(content)
+                before = {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                          for path in (*self.old.directory.iterdir(), self.profile)}
+                with self.assertRaisesRegex(ValueError, '无法验证'):
+                    self.new.ensure_installed()
+                self.assertEqual(before, {path: (path.read_bytes(), path.stat().st_mtime_ns)
+                                          for path in before})
+                self.assertFalse(self.new_path.exists())
 
     def test_restore_saved_directory_is_checked_against_actual_insertion(self):
         self.assertTrue(self.new.use_existing(self.old.directory)['reused'])
@@ -222,19 +432,18 @@ class DeepSeekMigrationTests(unittest.TestCase):
                                         'deepseekAdapterDirectory': str(self.root/'unrelated-directory')}))
         manager = DesktopSessions(data)
         try:
-            self.assertEqual(manager.adapters['deepseek'].directory, settings.parent/'deepseek')
-            self.assertFalse(manager.adapters['deepseek'].reused)
-            self.assertEqual(manager.config['setup']['deepseek']['setupStatus'], 'failed')
+            self.assertIsNone(manager.adapters.get('deepseek'))
             manager.config['enabled'] = {'deepseek': True}
-            manager.adapters['deepseek'].call = Mock(return_value={'connected': True, 'configured': True})
-            with self.assertRaisesRegex(ValueError, '请重新扫描'):
-                manager.call('deepseek', 'list')
-            with self.assertRaisesRegex(ValueError, '请重新扫描'):
-                manager.require_enabled('deepseek')
-            row = next(row for row in manager.clients()['clients'] if row['id'] == 'deepseek')
-            self.assertFalse(row['configured'])
-            self.assertFalse(row['connected'])
-            manager.adapters['deepseek'].call.assert_not_called()
+            with patch.object(DeepSeek, 'call') as native:
+                with self.assertRaisesRegex(ValueError, '请重新扫描'):
+                    manager.call('deepseek', 'list')
+                self.assertEqual(manager.config['setup']['deepseek']['setupStatus'], 'failed')
+                with self.assertRaisesRegex(ValueError, '请重新扫描'):
+                    manager.require_enabled('deepseek')
+                row = next(row for row in manager.clients()['clients'] if row['id'] == 'deepseek')
+                self.assertFalse(row['configured'])
+                self.assertFalse(row['connected'])
+                native.assert_not_called()
         finally:
             manager.close()
 
@@ -347,9 +556,28 @@ class DeepSeekMigrationTests(unittest.TestCase):
             launch.assert_not_called()
         self.assertEqual((self.old.directory/'mobile-host.mjs').read_bytes(), before)
 
+    def test_reconnect_keeps_running_legacy_host_and_source_until_explicit_restart(self):
+        self.legacy()
+        manager = self.migration_manager()
+        before = {p: (p.read_bytes(), p.stat().st_mtime_ns)
+                  for p in (*self.old.directory.iterdir(), self.profile)}
+        with patch.object(DeepSeek, 'call', return_value={'connected': True, 'configured': True,
+                                                        'updateRequired': True, 'bridgeRevision': 6}), \
+                patch.object(manager, '_stop_client') as stop, \
+                patch('bridge.clients.lifecycle.launch_deepseek') as launch:
+            manager.scan()
+            manager.connect_deepseek()
+            stop.assert_not_called()
+            launch.assert_not_called()
+            self.assertEqual(before, {p: (p.read_bytes(), p.stat().st_mtime_ns) for p in before})
+            row = next(row for row in manager.clients(refresh=True)['clients'] if row['id'] == 'deepseek')
+            self.assertEqual(row['setupStatus'], 'restart-required')
+            self.assertFalse(row['configured'])
+
     def test_confirmed_restart_updates_source_and_waits_for_new_loaded_revision(self):
         self.legacy()
         manager = self.migration_manager()
+        manager.config['enabled'] = {'deepseek': True}
         live = {'connected': True, 'configured': True, 'updateRequired': True, 'bridgeRevision': 3}
         def call(adapter, action, *args):
             return dict(live) if action == 'status' else {'complete': True, 'bridgeRevision': 3, 'sessions': []}

@@ -2,6 +2,7 @@
 import tempfile
 import json
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,11 +10,77 @@ from unittest.mock import Mock, patch
 
 from bridge.clients.manager import DesktopSessions, DesktopWorkspace
 from bridge.clients.errors import BridgeUnavailable
+from bridge.features.accounts.operation_gate import OperationGate
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class ClientLifecycleTests(unittest.TestCase):
+    def test_wsl_is_a_codex_entry_and_never_uses_native_desktop_lifecycle(self):
+        from bridge.features.endpoints.registry import Entries
+        from bridge.platforms.windows import wsl
+        entries = self.bridge.entries = Entries(self.root)
+        entries.wsl = wsl
+        self.addCleanup(entries.close)
+        # The shared lifecycle fixture is macOS; supply both Windows registries.
+        from bridge.clients.claude.wsl import WslClaudeEntries
+        self.manager.claude_wsl = WslClaudeEntries(self.root)
+        self.manager.claude_wsl.scan = Mock(return_value={'errors': []})
+        self.manager.config.setdefault('enabled', {})['codex'] = False
+        info = {'user': 'fixture', 'homes': [{'home': '/home/fixture/.codex'}]}
+        with patch.object(wsl, 'running_distributions', return_value=['Ubuntu']), patch.object(wsl, 'probe', return_value=info), \
+                patch('bridge.clients.lifecycle.inspect_clients', return_value={}) as inspect, \
+                patch('bridge.clients.lifecycle.launch_client') as launch, patch('bridge.clients.lifecycle.stop_client') as stop:
+            result = self.manager.scan_wsl()
+            self.assertEqual([row['id'] for row in result['clients']], ['codex', 'claude', 'deepseek'])
+            codex = result['clients'][0]
+            self.assertEqual(codex['entries'][0]['id'], 'desktop')
+            row = next(row for row in codex['entries'] if row.get('kind') == 'wsl-cli')
+            self.assertFalse(row['enabled'])
+            enabled = self.manager.control({'action': 'toggle-client', 'provider': row['id'], 'enabled': True})
+            self.assertTrue(next(item for item in enabled['clients'][0]['entries'] if item['id'] == row['id'])['enabled'])
+            self.assertTrue(enabled['clients'][0]['enabled'])
+            self.assertFalse(enabled['clients'][0]['desktopEnabled'])
+            self.manager.require_enabled(row['id'])
+            with self.assertRaises(ValueError):
+                self.manager.require_enabled('codex')
+            with self.assertRaisesRegex(ValueError, '原 WSL 终端'):
+                self.manager.toggle_client({'provider': row['id'], 'enabled': False, 'quitDesktop': True})
+            self.assertTrue(entries.enabled(row['id']))
+            self.manager.toggle_client({'provider': row['id'], 'enabled': False, 'quitDesktop': False})
+            self.assertFalse(entries.enabled(row['id']))
+            self.assertTrue(all(not descriptor['id'].startswith('wsl:') for args in inspect.call_args_list for descriptor in args.args[0]))
+            launch.assert_not_called()
+            stop.assert_not_called()
+
+    def test_wsl_only_installation_keeps_codex_available_without_enabling_native_access(self):
+        from bridge.features.endpoints.registry import Entries, entry_id
+        from bridge.platforms.windows import wsl
+        entries = self.bridge.entries = Entries(self.root)
+        entries.wsl = wsl
+        self.addCleanup(entries.close)
+        identifier = entry_id('Ubuntu', 'fixture', '/home/fixture/.codex')
+        entries.entries = [{'id': identifier, 'distribution': 'Ubuntu', 'user': 'fixture',
+            'home': '/home/fixture/.codex', 'label': 'Ubuntu fixture', 'enabled': True}]
+        self.manager.config['enabled']['codex'] = False
+        self.manager.config['discovered']['codex']['installed'] = False
+        self.accounts.index.clear()
+        self.manager._codex_executable = Mock(return_value=None)
+        with patch.object(wsl, 'running_distributions', return_value=['Ubuntu']):
+            codex = self.manager.clients(refresh=True)['clients'][0]
+        for field in ('enabled', 'installed', 'configured', 'selectable'):
+            self.assertTrue(codex[field], field)
+        for field in ('desktopEnabled', 'nativeInstalled', 'nativeConfigured', 'nativeSelectable'):
+            self.assertFalse(codex[field], field)
+        self.assertEqual([row['id'] for row in codex['entries']], ['desktop', identifier])
+        self.manager.require_enabled(identifier)
+        with self.assertRaises(ValueError):
+            self.manager.require_enabled('codex')
+        with self.assertRaisesRegex(ValueError, '安装 Codex'):
+            self.manager.toggle_client({'provider': 'codex', 'enabled': True})
+        self.launch.assert_not_called()
+        self.assertTrue(entries.enabled(identifier))
+
     def setUp(self):
         platform = patch('bridge.clients.manager.sys', SimpleNamespace(platform='darwin'))
         platform.start(); self.addCleanup(platform.stop)
@@ -22,8 +89,12 @@ class ClientLifecycleTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.claude, self.dsh = Mock(), Mock()
         self.claude.status.return_value = {'connected': True}
+        self.claude.desktop_listing.return_value = {'connected': True, 'complete': True, 'coverage': {'code': True, 'cowork': True}, 'sessions': [
+            {'id': 'one', 'status': 'idle', 'runtimeKnown': True, 'requests': []}]}
         self.claude.call.side_effect = lambda action, *args: ({'connected': True, 'complete': True,
             'sessions': [{'id': 'one', 'status': 'idle', 'runtimeKnown': True, 'requests': []}]} if action == 'list' else {'models': [{'id': 'model'}]})
+        self.claude.configure.return_value = {'setupState': 'discovered'}
+        self.dsh.discover_existing.return_value = {'installed': False}
         self.dsh.reused = False
         self.dsh.home = self.root
         profile = self.root/'profiles/desktop/cordis.patch.yml'
@@ -33,15 +104,17 @@ class ClientLifecycleTests(unittest.TestCase):
         self.dsh.call.side_effect = lambda action, *args: ({'connected': True, 'configured': True, 'bridgeRevision': 3}
             if action == 'status' else {'connected': True, 'complete': True, 'bridgeRevision': 3, 'sessions': []})
         self.accounts = SimpleNamespace(gate=threading.RLock(), lock=threading.RLock(),
-            assert_editable=Mock(), idle=Mock(), index={}, runtime=None,
+            assert_editable=Mock(), idle=Mock(), prepare_desktop_runtime=Mock(return_value=False), index={}, runtime=None,
             info=SimpleNamespace(current=lambda: {'status': 'ready', 'kind': 'chatgpt'}), home=self.root)
-        self.bridge = SimpleNamespace(accounts=self.accounts, assert_desktop_idle=Mock())
+        self.bridge = SimpleNamespace(accounts=self.accounts, assert_desktop_idle=Mock(), suspend_observation=Mock())
         self.bridge.for_host = lambda _: self.bridge
         for name, value in [('Claude', self.claude), ('DeepSeek', self.dsh)]:
-            patcher = patch('bridge.clients.manager.'+name, return_value=value)
+            patcher = patch(('bridge.clients.claude.adapter.' if name == 'Claude' else 'bridge.clients.manager.')+name, return_value=value)
             patcher.start(); self.addCleanup(patcher.stop)
         self.manager = DesktopSessions(self.root, self.bridge, gateway_running=True)
         self.addCleanup(self.manager.close)
+        # Lifecycle store mocks do not model credential files or their locks.
+        self.manager._account_model_identity = Mock(return_value='fixture-account')
         discovered = {}
         for provider in ('codex', 'claude', 'deepseek'):
             executable = self.root/provider; executable.write_bytes(b'fixture'); executable.chmod(0o700)
@@ -71,19 +144,111 @@ class ClientLifecycleTests(unittest.TestCase):
     def finish(self, descriptor, **kwargs):
         self.running = False
 
+    def test_client_status_returns_pending_without_waiting_for_startup_lock(self):
+        manager = self.manager
+        previous = manager.client_snapshot
+        manager.client_cache = None
+        entered, release = threading.Event(), threading.Event()
+        def hold_startup():
+            with manager.client_lock:
+                entered.set()
+                release.wait(3)
+        holder = threading.Thread(target=hold_startup)
+        holder.start(); self.assertTrue(entered.wait(1))
+        with patch.object(manager, 'clients', wraps=manager.clients) as refresh:
+            try:
+                started = time.monotonic()
+                first = manager.clients_status()
+                self.assertLess(time.monotonic() - started, 0.2)
+                self.assertTrue(first['pending'])
+                self.assertEqual(first['clients'], previous['clients'])
+                self.assertTrue(manager.client_refreshing)
+                manager.client_snapshot = None
+                cold = manager.clients_status()
+                self.assertEqual(cold, {'clients': [], 'pending': True})
+                self.assertTrue(manager.client_refreshing)
+            finally:
+                release.set(); holder.join(2)
+            deadline = time.monotonic() + 3
+            while manager.client_refreshing and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(refresh.call_count, 1)
+            self.assertTrue(refresh.call_args.kwargs['refresh'])
+        ready = manager.clients_status()
+        self.assertFalse(ready['pending'])
+        self.assertEqual(len(ready['clients']), 3)
+
+    def test_client_status_failed_refresh_is_visible_and_can_retry(self):
+        manager = self.manager
+        manager.client_cache = None
+        manager.client_snapshot = None
+        original = manager.clients
+        with patch.object(manager, 'clients', side_effect=RuntimeError('fixture failure')):
+            self.assertTrue(manager.clients_status()['pending'])
+            deadline = time.monotonic() + 2
+            while manager.client_refreshing and time.monotonic() < deadline:
+                time.sleep(0.01)
+            failed = manager.clients_status()
+            self.assertFalse(failed['pending'])
+            self.assertIn('refreshError', failed)
+        manager.client_refresh_retry_at = 0
+        with patch.object(manager, 'clients', wraps=original) as refresh:
+            self.assertTrue(manager.clients_status()['pending'])
+            deadline = time.monotonic() + 3
+            while manager.client_refreshing and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(refresh.call_count, 1)
+        self.assertFalse(manager.clients_status()['pending'])
+        manager.closed.set()
+        with self.assertRaises(BridgeUnavailable):
+            manager.clients_status()
+
+    def test_client_status_does_not_publish_a_refresh_after_close(self):
+        manager = self.manager
+        manager.client_cache = None
+        manager.client_snapshot = None
+        entered, release = threading.Event(), threading.Event()
+        original = manager.clients
+        def delayed_refresh(refresh=False):
+            entered.set()
+            release.wait(2)
+            return original(refresh=refresh)
+        with patch.object(manager, 'clients', side_effect=delayed_refresh):
+            self.assertTrue(manager.clients_status()['pending'])
+            self.assertTrue(entered.wait(1))
+            manager.closed.set()
+            release.set()
+            deadline = time.monotonic() + 3
+            while manager.client_refreshing and time.monotonic() < deadline:
+                time.sleep(0.01)
+        self.assertIsNone(manager.client_snapshot)
+        with self.assertRaises(BridgeUnavailable):
+            manager.clients_status()
+
+    def test_client_status_cache_never_decides_enable_write(self):
+        manager = self.manager
+        manager.gateway_running = False
+        manager.client_cache = (time.monotonic(), {'clients': [{'id': 'claude', 'selectable': False}]})
+        with patch.object(manager, 'clients', wraps=manager.clients) as read:
+            value = manager.toggle_client({'provider': 'claude', 'enabled': True})
+        self.assertTrue(any(call.kwargs.get('refresh') is True for call in read.call_args_list))
+        self.assertTrue(next(row for row in value['clients'] if row['id'] == 'claude')['enabled'])
+
     def test_codex_cached_runtime_reuses_scanned_gui_for_readiness_and_launch(self):
         self.accounts.index['desktopExecutable'] = ''
         self.accounts.runtime = self.root/'cache/hash/codex.exe'
         self.running = False
-        with patch('bridge.clients.desktop_app.DesktopApp.discover', return_value=''):
+        with patch('bridge.clients.desktop_app.DesktopApp.discover', return_value=''), \
+             patch.object(self.manager, '_prepare_codex_runtime') as prepare:
             rows = self.manager.toggle_client({'provider': 'codex', 'enabled': True})['clients']
-        descriptor = self.launch.call_args.args[0]
+        descriptor = prepare.call_args.args[0]
         self.assertEqual(descriptor['executable'], self.manager.config['discovered']['codex']['executable'])
         self.assertTrue(descriptor['installed'])
         self.assertEqual(descriptor['dataDirectory'], str(self.accounts.home))
         codex = next(row for row in rows if row['id'] == 'codex')
         self.assertTrue(codex['configured'])
-        self.assertTrue(codex['connected'])
+        self.assertFalse(codex['connected'])
+        self.launch.assert_not_called()
 
     def test_explicit_codex_gui_keeps_precedence_even_when_missing(self):
         selected = self.root/'selected.exe'
@@ -105,6 +270,13 @@ class ClientLifecycleTests(unittest.TestCase):
             codex = next(row for row in self.manager.clients(refresh=True)['clients'] if row['id'] == 'codex')
         self.assertFalse(codex['configured'])
         self.assertFalse(codex['connected'])
+
+    def test_unconfigured_codex_switch_matches_default_enabled_preference(self):
+        self.manager.config['enabled'].pop('codex')
+        self.accounts.info.current = lambda: {'status': 'signedOut'}
+        codex = next(row for row in self.manager.clients(refresh=True)['clients'] if row['id'] == 'codex')
+        self.assertFalse(codex['configured'])
+        self.assertEqual(codex['enabled'], self.manager.enabled('codex'))
 
     def toggle(self, provider, enabled):
         return self.manager.toggle_client({'provider': provider, 'enabled': enabled})
@@ -137,8 +309,44 @@ class ClientLifecycleTests(unittest.TestCase):
         saved = json.loads(self.manager.config_path.read_text())
         self.assertEqual(saved['enabled'], dict.fromkeys(('codex', 'claude', 'deepseek'), False))
 
+    def test_all_disabled_preferences_survive_restart_without_launching_a_client(self):
+        for provider in ('codex', 'claude', 'deepseek'):
+            self.manager.toggle_client({'provider': provider, 'enabled': False, 'quitDesktop': False})
+        reopened = DesktopSessions(self.root, self.bridge, gateway_running=True)
+        try:
+            with patch.object(reopened, 'scan') as scan, patch.object(reopened, 'toggle_client') as toggle:
+                reopened.start_enabled()
+            scan.assert_called_once_with(scan_wsl=False, inventory_only=True)
+            toggle.assert_not_called()
+            self.assertEqual([row['enabled'] for row in reopened.clients(refresh=True)['clients']], [False] * 3)
+            self.assertTrue(self.running)
+        finally:
+            reopened.close()
+
+    def test_disabled_running_apps_do_not_receive_periodic_status_or_catalog_reads(self):
+        self.manager.clients(refresh=True)
+        self.manager.config['enabled'].update(codex=False, claude=False, deepseek=False)
+        self.accounts.info.current = Mock(return_value={'status': 'ready', 'kind': 'chatgpt'})
+        self.claude.reset_mock(); self.dsh.reset_mock()
+        for _ in range(5):
+            rows = self.manager.clients(refresh=True)['clients']
+            for row in rows:
+                if row['id'] in ('claude', 'deepseek'):
+                    self.assertTrue(row['running'])
+                    self.assertFalse(row['connected'])
+        self.claude.status.assert_not_called()
+        self.claude.desktop_listing.assert_not_called()
+        self.claude.call.assert_not_called()
+        self.dsh.call.assert_not_called()
+        self.accounts.info.current.assert_not_called()
+        self.stop.assert_not_called()
+        self.manager.config['enabled'].update(claude=True, deepseek=True)
+        self.manager.clients(refresh=True)
+        self.claude.status.assert_called_once_with()
+        self.dsh.call.assert_called_once_with('status')
+
     def test_explicit_quit_keeps_busy_guard_and_enabled_preference(self):
-        self.claude.call.side_effect = lambda *args: {'complete': True, 'sessions': [
+        self.claude.desktop_listing.return_value = {'complete': True, 'sessions': [
             {'id': 'one', 'status': 'running', 'runtimeKnown': True, 'requests': []}]}
         with self.assertRaisesRegex(ValueError, '任务运行或等待'):
             self.manager.toggle_client({'provider': 'claude', 'enabled': False, 'quitDesktop': True})
@@ -187,7 +395,7 @@ class ClientLifecycleTests(unittest.TestCase):
             finally:
                 disabled.set()
 
-        with patch('bridge.features.workspace.workspace.operate', side_effect=lambda *_: mutate()):
+        with patch('bridge.features.workspace.workspace.operate', side_effect=lambda *_, **kwargs: mutate()):
             writer = threading.Thread(target=run_write)
             toggler = threading.Thread(target=disable)
             writer.start()
@@ -347,6 +555,36 @@ class ClientLifecycleTests(unittest.TestCase):
         self.claude.reconnect.assert_called_once_with()
         self.claude.connect.assert_not_called()
 
+    def test_codex_background_preparation_waits_for_enabled_selection(self):
+        self.manager.config['enabled']['codex'] = False
+        self.manager.toggle_client({'provider': 'codex', 'enabled': True})
+        self.manager.runtime_preparation_thread.join(3)
+        self.assertFalse(self.manager.runtime_preparation_thread.is_alive())
+        self.accounts.prepare_desktop_runtime.assert_called_once()
+        app = self.accounts.prepare_desktop_runtime.call_args.args[0]
+        self.assertEqual(str(app.executable), self.manager.config['discovered']['codex']['executable'])
+        self.assertEqual(app.home, self.accounts.home)
+        self.launch.assert_not_called()
+
+    def test_codex_disable_cancels_preparation_before_waiting_for_its_gate(self):
+        entered, cancelled = threading.Event(), threading.Event()
+        # Hold the preparation gate until the disable request cancels it.
+        def held_prepare(app, **options):
+            with self.accounts.gate:
+                entered.set()
+                if self.manager.runtime_preparation_cancel.wait(3):
+                    self.assertTrue(options['cancelled']())
+                    cancelled.set()
+            return False
+        self.accounts.prepare_desktop_runtime.side_effect = held_prepare
+        self.manager.toggle_client({'provider': 'codex', 'enabled': True})
+        self.assertTrue(entered.wait(2))
+        self.manager.toggle_client({'provider': 'codex', 'enabled': False, 'quitDesktop': False})
+        self.manager.runtime_preparation_thread.join(3)
+        self.assertTrue(cancelled.is_set())
+        self.assertFalse(self.manager.enabled('codex'))
+        self.launch.assert_not_called()
+
     def test_offline_selection_never_launches_or_quits_clients(self):
         self.manager.gateway_running = False
         for provider in ('codex', 'claude', 'deepseek'):
@@ -384,6 +622,114 @@ class ClientLifecycleTests(unittest.TestCase):
         scan.assert_not_called()
         self.launch.assert_not_called()
         self.launch_dsh.assert_not_called()
+
+    def test_broken_lazy_connector_cannot_block_recovery_identity_preview(self):
+        factory = Mock(side_effect=BridgeUnavailable('existing connector cannot be verified'))
+        self.manager.adapters.defer('deepseek', factory)
+        recovery = Mock()
+        recovery.preview.return_value = {'token': 'identity-preview', 'unknown': True, 'canRecover': False}
+        self.manager.deepseek_recovery = recovery
+        result = self.manager.control({'action': 'deepseek-recovery-preview', 'restart': False})
+        self.assertEqual(result['token'], 'identity-preview')
+        adapter = recovery.preview.call_args.args[1]
+        self.assertEqual(adapter.directory, (self.manager.directory/'deepseek').resolve())
+        self.assertEqual(str(adapter.home), recovery.preview.call_args.args[0]['dataDirectory'])
+        self.assertEqual(recovery.preview.call_args.args[0]['id'], 'deepseek')
+        factory.assert_called_once()
+        recovery.confirm.assert_not_called()
+        self.launch_dsh.assert_not_called()
+        self.stop_dsh.assert_not_called()
+
+    def test_windows_stopped_recovery_can_exit_or_restart_without_native_quit(self):
+        from test_deepseek_recovery import snapshot
+        self.dsh.discover_existing.return_value = {'installed': True}
+        with patch('bridge.clients.manager.sys.platform', 'win32'), \
+             patch('bridge.clients.deepseek.recovery.sys.platform', 'win32'), \
+             patch('bridge.clients.deepseek.recovery._snapshot', side_effect=lambda _: snapshot(gui=False, hosts=())), \
+             patch('bridge.clients.deepseek.recovery._query', side_effect=AssertionError('stopped scope has no endpoint')) as query, \
+             patch('bridge.clients.lifecycle.stop_deepseek') as native, \
+             patch.object(self.manager, '_start_deepseek') as start, \
+             patch.object(self.manager, 'clients', return_value={'clients': []}):
+            for restart in (False, True):
+                with self.subTest(restart=restart):
+                    preview = self.manager.control({'action': 'deepseek-recovery-preview', 'restart': restart})
+                    self.assertTrue(preview['canRecover'])
+                    self.manager.control({'action': 'deepseek-recovery-confirm', 'token': preview['token'],
+                                          'confirmed': True})
+                    self.assertEqual(self.manager.enabled('deepseek'), restart)
+                    self.assertEqual(start.call_count, int(restart))
+        query.assert_not_called()
+        native.assert_not_called()
+        self.stop_dsh.assert_not_called()
+        self.launch_dsh.assert_not_called()
+
+    def test_missing_connector_recovery_rebinds_the_persistent_adapter_before_launch(self):
+        from bridge.clients.deepseek.adapter import DeepSeek
+        from bridge.clients.deepseek.setup import MARKER
+        from test_deepseek_recovery import snapshot
+        descriptor=self.manager._descriptor('deepseek')
+        home=Path(descriptor['dataDirectory']).resolve()
+        file=home/'profiles/desktop/cordis.patch.yml';file.parent.mkdir(parents=True,exist_ok=True)
+        old=DeepSeek(self.root/'gone/desktop-sessions/deepseek',home)
+        file.write_text(MARKER+'\n'+old._line()+'\n')
+        self.manager.adapters.defer('deepseek',Mock(side_effect=BridgeUnavailable('old connector missing')))
+        state=snapshot(gui=False,hosts=());state['home']=str(home)
+        def launch():
+            adapter=self.manager.adapters['deepseek']
+            self.assertTrue(adapter.discover_existing()['installed'])
+            self.assertEqual(self.manager.config['deepseekAdapterDirectory'],str(adapter.directory))
+            saved=json.loads(self.manager.config_path.read_text())
+            self.assertEqual(saved['deepseekAdapterDirectory'],str(adapter.directory))
+        with patch('bridge.clients.manager.DeepSeek',DeepSeek), \
+                patch('bridge.clients.deepseek.recovery._snapshot',return_value=state), \
+                patch.object(self.manager,'_start_deepseek',side_effect=launch) as start, \
+                patch.object(self.manager,'clients',return_value={'clients':[]}):
+            preview=self.manager.control({'action':'deepseek-recovery-preview','restart':True})
+            self.assertTrue(preview['configurationRepair'])
+            self.manager.control({'action':'deepseek-recovery-confirm','token':preview['token'],
+                                  'confirmed':True,'confirmConfigurationRepair':True})
+        start.assert_called_once()
+        self.assertIsNone(self.manager.deepseek_restore_error)
+
+    def test_unverified_connector_normal_confirmation_has_no_native_or_setting_effect(self):
+        from test_deepseek_recovery import snapshot
+        self.manager.adapters.defer('deepseek', Mock(side_effect=BridgeUnavailable('broken connector')))
+        with patch('bridge.clients.deepseek.recovery._snapshot', side_effect=lambda _: snapshot()), \
+             patch('bridge.clients.deepseek.recovery._query', side_effect=AssertionError('untrusted connector query')) as query, \
+             patch('bridge.clients.deepseek.recovery._quit') as native, \
+             patch('bridge.clients.manager.private_json') as save:
+            preview = self.manager.control({'action': 'deepseek-recovery-preview', 'restart': False})
+            self.assertTrue(preview['unknown'])
+            self.assertFalse(preview['canRecover'])
+            with self.assertRaisesRegex(ValueError, '尚未提交退出'):
+                self.manager.control({'action': 'deepseek-recovery-confirm', 'token': preview['token'],
+                                      'confirmed': True, 'acknowledgeUnknown': True})
+        query.assert_not_called()
+        native.assert_not_called()
+        save.assert_not_called()
+        self.stop_dsh.assert_not_called()
+        self.launch_dsh.assert_not_called()
+        self.assertTrue(self.manager.enabled('deepseek'))
+
+    def test_explicit_force_does_not_load_broken_connector_or_query_tasks(self):
+        factory = Mock(side_effect=BridgeUnavailable('existing connector cannot be verified'))
+        self.manager.adapters.defer('deepseek', factory)
+        self.manager.config['deepseekAdapterDirectory'] = str(self.root/'absent-old-connector')
+        native = Mock(side_effect=self.finish)
+        with patch('bridge.clients.lifecycle.force_stop_client', native), \
+             patch('bridge.clients.manager.sys.platform', 'win32'), \
+             patch.object(self.manager, 'clients', return_value={'clients': []}), \
+             patch.object(self.manager, '_assert_idle', side_effect=AssertionError('explicit force bypasses task uncertainty')) as idle:
+            self.manager.toggle_client({'provider': 'deepseek', 'enabled': False, 'quitDesktop': True,
+                                        'forceDesktop': True, 'forceConfirmed': True})
+        native.assert_called_once()
+        self.assertEqual(native.call_args.args[0]['id'], 'deepseek')
+        self.assertTrue(native.call_args.kwargs['state']['running'])
+        factory.assert_not_called()
+        idle.assert_not_called()
+        self.stop_dsh.assert_not_called()
+        self.launch_dsh.assert_not_called()
+        self.assertFalse(self.manager.enabled('deepseek'))
 
     def test_desktop_recovery_full_exit_and_restart_only_persist_after_success(self):
         recovery = Mock()
@@ -437,7 +783,7 @@ class ClientLifecycleTests(unittest.TestCase):
     def test_account_switch_checks_idle_before_touching_credentials(self):
         store = Mock()
         self.manager._account_store = Mock(return_value=store)
-        self.claude.call.side_effect = lambda action, *args: {'complete': True, 'sessions': [
+        self.claude.desktop_listing.return_value = {'complete': True, 'sessions': [
             {'id': 'busy', 'status': 'active', 'runtimeKnown': True}]}
         with self.assertRaisesRegex(ValueError, '运行或等待'):
             self.manager.client_accounts('claude', {'operation': 'switch', 'id': 'other'})
@@ -456,7 +802,43 @@ class ClientLifecycleTests(unittest.TestCase):
         result = self.manager.client_accounts('claude', {'operation': 'switch', 'id': 'other'})
         self.assertEqual(calls, ['stop', 'restore', 'launch'])
         self.assertTrue(result['canSwitch'])
+        self.assertEqual(result['modelCatalogIdentity'], 'fixture-account')
         store.commit.assert_called_once_with('transaction')
+
+    def test_optional_claude_cli_sync_reports_partial_failure_after_desktop_verified(self):
+        store = Mock()
+        store.restore.return_value = 'transaction'
+        store.public.return_value = {'accounts': [{'id': 'other', 'kind': 'api', 'saved': True}],
+                                     'activeId': 'other'}
+        self.manager._account_store = Mock(return_value=store)
+        self.bridge.cli_access = Mock()
+        self.bridge.cli_access.change.side_effect = ValueError('CLI profile rejected')
+        with patch('bridge.features.accounts.cli_sync.LocalCliSync.preflight',
+                   return_value={'sharedWithDesktop': False}):
+            result = self.manager.client_accounts('claude', {'operation': 'switch', 'id': 'other',
+                                                              'syncLocalCli': True})
+        self.assertEqual(result['activeId'], 'other')
+        self.assertEqual(result['cliSync']['status'], 'failed')
+        self.assertEqual(result['cliSync']['desktopStatus'], 'verified')
+        store.rollback.assert_not_called()
+        store.commit.assert_called_once_with('transaction')
+
+    def test_optional_claude_cli_sync_reports_both_targets_verified(self):
+        store = Mock()
+        store.restore.return_value = 'transaction'
+        store.public.return_value = {'accounts': [{'id': 'other', 'kind': 'api', 'saved': True}],
+                                     'activeId': 'other'}
+        self.manager._account_store = Mock(return_value=store)
+        self.bridge.cli_access = Mock()
+        self.bridge.cli_access.change.side_effect = [
+            {'savedId': 'cli-profile'}, {'claude': {'activeId': 'cli-profile'}}]
+        with patch('bridge.features.accounts.cli_sync.LocalCliSync.preflight',
+                   return_value={'sharedWithDesktop': False}):
+            result = self.manager.client_accounts('claude', {'operation': 'switch', 'id': 'other',
+                                                              'syncLocalCli': True})
+        self.assertEqual(result['activeId'], 'other')
+        self.assertEqual(result['cliSync']['status'], 'verified')
+        self.assertEqual(self.bridge.cli_access.change.call_args_list[1].args[0]['id'], 'cli-profile')
 
     def test_failed_account_launch_restores_previous_profile(self):
         store = Mock()
@@ -540,6 +922,42 @@ class ClientLifecycleTests(unittest.TestCase):
         self.stop.assert_called_once()
         self.assertFalse(self.manager.enabled('codex'))
 
+    def test_codex_close_does_not_queue_behind_an_unresponsive_connection(self):
+        from concurrent.futures import Future
+        self.accounts.gate = OperationGate()
+        entered, release = threading.Event(), threading.Event()
+        result = Future()
+        def connection():
+            with self.accounts.gate.host('local'):
+                entered.set()
+                release.wait(3)
+        def close():
+            try:
+                result.set_result(self.manager.toggle_client(
+                    {'provider': 'codex', 'enabled': False, 'quitDesktop': True}))
+            except BaseException as error:
+                result.set_exception(error)
+        owner = threading.Thread(target=connection)
+        closer = threading.Thread(target=close)
+        owner.start()
+        try:
+            self.assertTrue(entered.wait(1))
+            with patch('bridge.clients.manager.LIFECYCLE_GATE_WAIT', .05):
+                closer.start()
+                with self.assertRaisesRegex(ValueError, '操作正在进行'):
+                    result.result(timeout=.5)
+            self.stop.assert_not_called()
+            self.bridge.assert_desktop_idle.assert_not_called()
+            self.assertTrue(self.manager.config['enabled']['codex'])
+        finally:
+            release.set()
+            owner.join(1)
+            closer.join(1)
+        # Explicit retry obtains the gate and still performs the full fresh audit.
+        self.manager.toggle_client({'provider': 'codex', 'enabled': False, 'quitDesktop': True})
+        self.bridge.assert_desktop_idle.assert_called_once()
+        self.stop.assert_called_once()
+
     def test_claude_toggle_cancels_autoconnect_and_stops_actual_app(self):
         self.toggle('claude', False)
         self.assertEqual(self.claude.cancel.call_count, 2)
@@ -573,6 +991,95 @@ class ClientLifecycleTests(unittest.TestCase):
         self.launch.assert_called_once()
         self.claude.connect.assert_not_called()
         self.claude.reconnect.assert_called_once_with()
+
+    def test_cli_only_cold_status_does_not_start_desktop(self):
+        self.claude.status.return_value = {'connected': False, 'cliAvailable': True,
+                                           'cliAuthReady': False}
+        for platform in ('darwin', 'win32'):
+            with self.subTest(platform=platform), patch('bridge.clients.manager.sys.platform', platform):
+                row = next(row for row in self.manager.toggle_client(
+                    {'provider': 'claude', 'enabled': True})['clients'] if row['id'] == 'claude')
+                self.assertTrue(row['selectable'])
+                self.launch.assert_not_called()
+                self.claude.connect.assert_not_called()
+                self.claude.reconnect.assert_not_called()
+
+    def test_cli_available_gateway_start_recovers_prepared_desktop_without_launch(self):
+        self.claude.directory = self.root/'prepared-claude'
+        self.claude.directory.mkdir()
+        (self.claude.directory/'connection.json').write_text('{"token":"fixture"}')
+        self.claude.discovery = {'installed': True, 'automaticConnection': 'native-console',
+                                 'autoConnect': True}
+        self.claude.status.return_value = {'connected': False, 'cliAvailable': True,
+                                           'cliAuthReady': False, **self.claude.discovery}
+        self.manager.config['enabled'] = {'codex': False, 'claude': True, 'deepseek': False}
+        for platform in ('darwin', 'win32'):
+            with self.subTest(platform=platform), patch('bridge.clients.manager.sys.platform', platform), \
+                    patch.object(self.manager, 'scan'):
+                self.manager.start_enabled()
+                self.claude.reconnect.assert_called_once_with()
+                self.claude.connect.assert_not_called()
+                self.launch.assert_not_called()
+                self.stop.assert_not_called()
+                self.claude.reconnect.reset_mock()
+
+    def test_cli_available_does_not_recover_missing_disabled_or_connected_desktop(self):
+        self.claude.directory = self.root/'prepared-claude'
+        self.claude.directory.mkdir()
+        (self.claude.directory/'connection.json').write_text('{"token":"fixture"}')
+        for values in ({'installed': False}, {'autoConnect': False}, {'connected': True}):
+            with self.subTest(values=values):
+                self.claude.discovery = {'installed': True, 'automaticConnection': 'native-console',
+                                         'autoConnect': True, **values}
+                self.claude.status.return_value = {'connected': False, 'cliAvailable': True,
+                                                   **self.claude.discovery}
+                self.manager.toggle_client({'provider': 'claude', 'enabled': True})
+                self.claude.reconnect.assert_not_called()
+                self.claude.connect.assert_not_called()
+                self.launch.assert_not_called()
+                self.stop.assert_not_called()
+
+    def test_claude_desktop_launch_capability_requires_confirmed_stopped_supported_app(self):
+        self.running = False
+        self.claude.discovery = {'automaticConnection': 'native-console'}
+        self.claude.status.return_value = {'connected': False, 'installed': True,
+                                           'automaticConnection': 'native-console', 'cliAvailable': True}
+        row = next(row for row in self.manager.clients(refresh=True)['clients'] if row['id'] == 'claude')
+        self.assertTrue(row['canStartDesktop'])
+        self.assertFalse(row['canInitializeDesktop'])
+        self.manager.config['enabled']['claude'] = False
+        row = next(row for row in self.manager.clients(refresh=True)['clients'] if row['id'] == 'claude')
+        self.assertTrue(row['canStartDesktop'])
+        self.manager.config['enabled']['claude'] = True
+        self.manager.gateway_running = False
+        row = next(row for row in self.manager.clients(refresh=True)['clients'] if row['id'] == 'claude')
+        self.assertFalse(row['canStartDesktop'])
+        self.manager.gateway_running = True
+        self.running = True
+        row = next(row for row in self.manager.clients(refresh=True)['clients'] if row['id'] == 'claude')
+        self.assertFalse(row['canStartDesktop'])
+        self.assertTrue(row['canInitializeDesktop'])
+        self.running = False
+        self.inspect.side_effect = lambda _: {'running': False, 'mainPids': [], 'runtimePids': [], 'unknown': True}
+        row = next(row for row in self.manager.clients(refresh=True)['clients'] if row['id'] == 'claude')
+        self.assertFalse(row['canStartDesktop'])
+        self.assertFalse(row['canInitializeDesktop'])
+        self.inspect.side_effect = lambda _: {'running': False, 'mainPids': [], 'runtimePids': [], 'unknown': False}
+        self.claude.status.return_value['automaticConnection'] = 'unavailable'
+        row = next(row for row in self.manager.clients(refresh=True)['clients'] if row['id'] == 'claude')
+        self.assertFalse(row['canStartDesktop'])
+        self.manager.config['discovered']['claude']['installed'] = False
+        row = next(row for row in self.manager.clients(refresh=True)['clients'] if row['id'] == 'claude')
+        self.assertFalse(row['canStartDesktop'])
+
+    def test_missing_native_claude_state_hides_desktop_actions(self):
+        self.claude.status.return_value = {'connected': False, 'installed': True,
+                                           'automaticConnection': 'native-console', 'cliAvailable': True}
+        self.inspect_batch.side_effect = lambda _: {}
+        row = next(row for row in self.manager.clients(refresh=True)['clients'] if row['id'] == 'claude')
+        self.assertFalse(row['canStartDesktop'])
+        self.assertFalse(row['canInitializeDesktop'])
+        self.assertFalse(row['canReconnect'])
 
     def test_macos_account_recovery_only_restores_existing_connection(self):
         self.manager._launch_account_client('claude', self.manager._descriptor('claude'))
@@ -645,6 +1152,36 @@ class ClientLifecycleTests(unittest.TestCase):
         self.assertEqual(row['connectionState'], 'error')
         self.assertTrue(row['retryable'])
 
+    def test_claude_launch_waits_for_process_and_does_not_cache_false_failure(self):
+        for platform in ('darwin', 'win32'):
+            with self.subTest(platform=platform), patch('bridge.clients.manager.sys.platform', platform):
+                self.running = False
+                self.claude.status.return_value = {'connected': False, 'setupState': 'connecting',
+                                                   'reason': '正在连接 Claude'}
+                with patch('bridge.clients.manager.time.monotonic', return_value=10):
+                    first = self.manager.clients(refresh=True)
+                row = next(r for r in first['clients'] if r['id'] == 'claude')
+                self.assertEqual(row['connectionState'], 'starting')
+                self.assertFalse(row['retryable'])
+                self.assertFalse(row['connected'])
+                self.running = True
+                self.claude.status.return_value = {'connected': True, 'setupState': 'connected'}
+                # A launch must retain the short pending cache instead of the
+                # 15-second idle/error cache hiding its signed connection.
+                with patch('bridge.clients.manager.time.monotonic', return_value=12):
+                    ready = next(r for r in self.manager.clients()['clients'] if r['id'] == 'claude')
+                self.assertEqual(ready['connectionState'], 'connected')
+                self.assertTrue(ready['connected'])
+
+    def test_claude_launch_failure_remains_terminal_without_a_process(self):
+        self.running = False
+        self.claude.status.return_value = {'connected': False, 'setupState': 'failed',
+                                           'reason': 'native launch failed'}
+        row = next(r for r in self.manager.clients(refresh=True)['clients'] if r['id'] == 'claude')
+        self.assertEqual(row['connectionState'], 'error')
+        self.assertEqual(row['reason'], 'native launch failed')
+        self.assertTrue(row['retryable'])
+
     def test_explicit_claude_connect_button_may_launch_and_initialize(self):
         self.running = False
         self.claude.status.return_value = {'connected': False, 'setupState': 'needs-initialization'}
@@ -654,8 +1191,8 @@ class ClientLifecycleTests(unittest.TestCase):
         self.claude.reconnect.assert_not_called()
 
     def test_pending_interaction_blocks_stop_and_preserves_preference(self):
-        self.claude.call.side_effect = lambda action, *args: ({'connected': True, 'complete': True,
-            'sessions': [{'id': 'one', 'status': 'idle', 'runtimeKnown': True, 'requests': [{'id': 'question'}]}]} if action == 'list' else {'models': [{'id': 'model'}]})
+        self.claude.desktop_listing.return_value = {'complete': True,
+            'sessions': [{'id': 'one', 'status': 'idle', 'runtimeKnown': True, 'requests': [{'id': 'question'}]}]}
         with self.assertRaisesRegex(ValueError, '任务运行或等待'):
             self.toggle('claude', False)
         self.stop.assert_not_called(); self.claude.cancel.assert_not_called()
@@ -664,10 +1201,21 @@ class ClientLifecycleTests(unittest.TestCase):
     def test_missing_surface_or_missing_runtime_state_cannot_prove_idle(self):
         for payload in ({'connected': True, 'complete': False, 'sessions': []},
                         {'connected': True, 'complete': True, 'sessions': [{'id': 'one', 'status': 'idle', 'runtimeKnown': False}]}):
-            self.claude.call.side_effect = lambda *args: payload
+            self.claude.desktop_listing.return_value = payload
             with self.assertRaisesRegex(ValueError, '无法确认'):
                 self.toggle('claude', False)
         self.stop.assert_not_called()
+
+    def test_mac_claude_quit_uses_fresh_desktop_inventory_not_incomplete_cli_history(self):
+        self.claude.call.side_effect = lambda action, *args: ({'complete': False, 'sessions': [
+            {'id': 'unrelated-cli-history', 'backend': 'cli', 'status': 'idle', 'runtimeKnown': False}]} if action == 'list' else {'models': [{'id': 'model'}]})
+        self.claude.desktop_listing.reset_mock()
+        with patch.object(self.manager, 'clients', return_value={'clients': []}):
+            self.manager.toggle_client({'provider': 'claude', 'enabled': False, 'quitDesktop': True})
+        self.claude.desktop_listing.assert_called_once_with()
+        self.assertFalse(any(call.args[0] == 'list' for call in self.claude.call.call_args_list))
+        self.stop.assert_called_once()
+        self.assertFalse(self.manager.enabled('claude'))
 
     def test_unavailable_adapter_never_means_idle(self):
         self.dsh.call.side_effect = BridgeUnavailable('disconnected')
@@ -682,8 +1230,8 @@ class ClientLifecycleTests(unittest.TestCase):
         self.assertTrue(self.manager.enabled('deepseek'))
 
     def test_restart_claude_uses_same_busy_guard(self):
-        self.claude.call.side_effect = lambda action, *args: ({'connected': True, 'complete': True,
-            'sessions': [{'id': 'one', 'status': 'active', 'runtimeKnown': True, 'requests': []}]} if action == 'list' else {'models': [{'id': 'model'}]})
+        self.claude.desktop_listing.return_value = {'complete': True,
+            'sessions': [{'id': 'one', 'status': 'active', 'runtimeKnown': True, 'requests': []}]}
         with self.assertRaisesRegex(ValueError, '任务运行或等待'):
             self.manager.control({'action': 'restart-claude'})
         self.stop.assert_not_called(); self.claude.connect.assert_not_called()
@@ -715,6 +1263,31 @@ class ClientLifecycleTests(unittest.TestCase):
             'runtimePids': [12, 13], 'unknown': False}
         with self.assertRaisesRegex(ValueError, '无法确认'):
             self.toggle('deepseek', False)
+        self.stop.assert_not_called()
+
+    def test_recovery_normal_exit_requires_server_rebuild_failure_and_explicit_ack(self):
+        from bridge.clients.errors import TaskStateUnavailable
+        self.bridge.desktop_restart_recommended = Mock(return_value=True)
+        self.bridge.assert_desktop_idle.side_effect = TaskStateUnavailable('无法确认')
+        with patch('bridge.clients.manager.sys.platform', 'darwin'):
+            with self.assertRaises(TaskStateUnavailable):
+                self.manager.toggle_client({'provider': 'codex', 'enabled': False, 'quitDesktop': True})
+            self.stop.assert_not_called()
+            self.manager.toggle_client({'provider': 'codex', 'enabled': False, 'quitDesktop': True,
+                                        'acknowledgeUnavailable': True})
+        self.stop.assert_called_once()
+
+    def test_recovery_confirmation_never_bypasses_known_busy_or_unrelated_exit(self):
+        self.bridge.desktop_restart_recommended = Mock(return_value=True)
+        self.bridge.assert_desktop_idle.side_effect = ValueError('有任务运行')
+        with patch('bridge.clients.manager.sys.platform', 'darwin'):
+            with self.assertRaisesRegex(ValueError, '任务运行'):
+                self.manager.toggle_client({'provider': 'codex', 'enabled': False, 'quitDesktop': True,
+                                            'acknowledgeUnavailable': True})
+            self.bridge.desktop_restart_recommended.return_value = False
+            with self.assertRaisesRegex(ValueError, '退出确认无效'):
+                self.manager.toggle_client({'provider': 'codex', 'enabled': False, 'quitDesktop': True,
+                                            'acknowledgeUnavailable': True})
         self.stop.assert_not_called()
 
     def test_busy_codex_not_currently_followed_blocks_exit(self):

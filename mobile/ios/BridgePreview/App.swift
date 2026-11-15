@@ -1,4 +1,6 @@
+import Network
 import UIKit
+import PhotosUI
 @preconcurrency import WebKit
 import AVFoundation
 import UserNotifications
@@ -53,12 +55,11 @@ final class BridgeNavigationController: UINavigationController {
 
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationCenterDelegate {
-    var window: UIWindow?
     let controller = BridgeController()
+    private var pendingNotification: UNNotificationResponse?
+    private var lastNotificationRoute: (response: UNNotificationResponse, fromScene: Bool)?
     func application(_ application: UIApplication, didFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         UNUserNotificationCenter.current().delegate = self
-        let window = UIWindow(frame: UIScreen.main.bounds); window.rootViewController = BridgeNavigationController(rootViewController: controller); window.makeKeyAndVisible(); self.window = window
-        if let url = options?[.url] as? URL { DispatchQueue.main.async { self.controller.openLink(url) } }
         return true
     }
     func application(_ application: UIApplication, didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
@@ -66,12 +67,58 @@ final class AppDelegate: UIResponder, UIApplicationDelegate, UNUserNotificationC
         controller.registerNativePush()
     }
     func application(_ application: UIApplication, didFailToRegisterForRemoteNotificationsWithError error: Error) { controller.info(MobileStrings.text("系统推送注册失败，请检查推送签名与网络。")) }
-    func application(_ app: UIApplication, open url: URL, options: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool { controller.openLink(url); return true }
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse, withCompletionHandler completion: @escaping () -> Void) {
-        let data = response.notification.request.content.userInfo
-        if let origin = data["origin"] as? String { controller.openNotification(origin, thread: data["thread"] as? String, host: data["host"] as? String ?? "local") }; completion()
+        DispatchQueue.main.async { self.receiveNotification(response, fromScene: false) }
+        completion()
     }
-    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completion: @escaping (UNNotificationPresentationOptions) -> Void) { completion([.banner, .sound]) }
+    func receiveNotification(_ response: UNNotificationResponse, fromScene: Bool) {
+        if let last = lastNotificationRoute,
+           last.response === response, last.fromScene != fromScene {
+            lastNotificationRoute = nil
+            return
+        }
+        lastNotificationRoute = (response, fromScene)
+        pendingNotification = response
+        openPendingNotification()
+    }
+    func openPendingNotification() {
+        guard controller.viewIfLoaded?.window != nil, let response = pendingNotification else { return }
+        pendingNotification = nil
+        let data = response.notification.request.content.userInfo
+        if let origin = data["origin"] as? String { controller.openNotification(origin, thread: data["thread"] as? String, host: data["host"] as? String ?? "local") }
+    }
+    func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification, withCompletionHandler completion: @escaping (UNNotificationPresentationOptions) -> Void) {
+        if let address = notification.request.content.userInfo["origin"] as? String, !controller.notificationSourceEnabled(address) { completion([]); return }
+        completion([.banner, .sound])
+    }
+}
+
+final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
+    var window: UIWindow?
+    func scene(_ scene: UIScene, willConnectTo session: UISceneSession, options connectionOptions: UIScene.ConnectionOptions) {
+        guard let windowScene = scene as? UIWindowScene,
+              let app = UIApplication.shared.delegate as? AppDelegate else { return }
+        let window = UIWindow(windowScene: windowScene)
+        window.rootViewController = BridgeNavigationController(rootViewController: app.controller)
+        self.window = window
+        window.overrideUserInterfaceStyle = app.controller.themeStyle
+        window.makeKeyAndVisible()
+        DispatchQueue.main.async {
+            if let response = connectionOptions.notificationResponse { app.receiveNotification(response, fromScene: true) }
+            app.openPendingNotification()
+            if let url = connectionOptions.urlContexts.first?.url { app.controller.openLink(url) }
+        }
+    }
+    // A cold-launch tap can arrive before the first layout attaches the
+    // controller; activation is the next point where its window is ready.
+    func sceneDidBecomeActive(_ scene: UIScene) {
+        (UIApplication.shared.delegate as? AppDelegate)?.openPendingNotification()
+    }
+    func scene(_ scene: UIScene, openURLContexts URLContexts: Set<UIOpenURLContext>) {
+        guard let url = URLContexts.first?.url,
+              let app = UIApplication.shared.delegate as? AppDelegate else { return }
+        app.controller.openLink(url)
+    }
 }
 
 final class NoRedirect: NSObject, URLSessionTaskDelegate {
@@ -112,13 +159,440 @@ final class GatewayReachability: NSObject, URLSessionDataDelegate {
     }
 }
 
-final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelegate, UIDocumentPickerDelegate, UIDocumentInteractionControllerDelegate {
+final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelegate, UIDocumentPickerDelegate, UIDocumentInteractionControllerDelegate, PHPickerViewControllerDelegate, UIAdaptivePresentationControllerDelegate {
     private var web: WKWebView?
+    private var nativeMainNavigation: (web: WKWebView, generation: Int, url: String)?
     private var origin = ""
+    private var channelCatalogTimer:Timer?
+    private var channelMonitor: NWPathMonitor?
+    private var channelTicket = 0
+    private var channelCookieOwners=[String:UUID]()
+    private var channelSignature = ""
+    private var channelWiFi = false
+    private func watchChannels() {
+        guard channelMonitor == nil else { return }
+        channelCatalogTimer=Timer.scheduledTimer(withTimeInterval:30,repeats:true){[weak self] _ in
+            guard let self,self.web != nil else{return};self.checkChannels(failure:false,reason:"tick")
+        }
+        let monitor = NWPathMonitor()
+        channelMonitor = monitor
+        monitor.pathUpdateHandler = { [weak self, weak monitor] path in
+            guard let self, self.channelMonitor === monitor else { return }
+            let signature=path.availableInterfaces.filter{path.usesInterfaceType($0.type)}.map{$0.name}.sorted().joined(separator:"|")
+            guard signature != self.channelSignature else{return}
+            self.channelSignature=signature
+            self.channelWiFi = path.status == .satisfied && (path.usesInterfaceType(.wifi) || path.usesInterfaceType(.wiredEthernet))
+            if self.web==nil{self.checkComputers()}else{self.checkChannels(failure:false,reason:"network")}
+        }
+        monitor.start(queue: .main)
+    }
+    private func channelRecord(_ address: String) -> [String: Any]? {
+        defaults.dictionary(forKey: "channels:" + address)
+    }
+    private var lastChannelProbe: (key: String, time: TimeInterval)?
+    private func clearChannels(_ address: String) {
+        uu.remove(channelRecord(address)?["deviceId"] as? String ?? UURemote.device(cookieName(address)))
+        defaults.removeObject(forKey:preferenceKey("disabled-channels",address));defaults.removeObject(forKey:preferenceKey("channel-mode",address))
+        guard let id=channelRecord(address)?["deviceId"] as? String else { return }
+        channelTicket += 1; lastChannelProbe=nil
+        DeviceBinding.clear(GatewayChannels.vault(id));defaults.removeObject(forKey:"name:"+id)
+        defaults.removeObject(forKey:"channel-anchor:"+id)
+        let store=WKWebsiteDataStore.default().httpCookieStore
+        for key in defaults.dictionaryRepresentation().keys where key.hasPrefix("channels:") {
+            let alias=String(key.dropFirst(9))
+            guard channelRecord(alias)?["deviceId"] as? String == id else { continue }
+            let name=defaults.string(forKey:"cookieName:"+alias), host=URL(string:alias)?.host
+            DeviceBinding.clear(alias); defaults.removeObject(forKey:key); defaults.removeObject(forKey:"connection:"+alias)
+            store.getAllCookies { cookies in
+                for cookie in cookies where cookie.domain == host && cookie.name == name { store.delete(cookie) }
+            }
+        }
+    }
+    private func activeChannel(_ address: String) -> String {
+        guard let id = channelRecord(address)?["deviceId"] as? String else { return address }
+        return saved.first { channelRecord($0)?["deviceId"] as? String == id } ?? address
+    }
+    private func gatewayIdentity(_ address:String)->String? {
+        if let id=channelRecord(address)?["deviceId"] as? String{return id}
+        guard let binding=DeviceBinding.load(address),binding.name.range(of:"^codex_mobile_session_[a-f0-9]{24}$",options:.regularExpression) != nil else{return nil}
+        return String(ConnectionDiscovery.hash(binding.name).prefix(32))
+    }
+    private func enrollChannels(_ auth: [String: Any], address: String, cookie: HTTPCookie, ticket: Int) {
+        guard auth["authenticated"] as? Bool == true,auth["trustedDevice"] as? Bool == true,var d=auth["mobileRoutes"] as? [String:Any],
+              let id=d["deviceId"] as? String,id.range(of:"^[a-f0-9]{32}$",options:.regularExpression) != nil,
+              GatewayChannels.endpoints(d).contains(address) else{return}
+        let vault=GatewayChannels.vault(id),previous=DeviceBinding.load(vault),revision=bindingRevision
+        var anchor=defaults.string(forKey:"channel-anchor:"+id) ?? address
+        Task { @MainActor in
+            var root=previous
+            if root == nil || root?.name != cookie.name || GatewayChannels.token(root!.token,anchor:anchor,target:address) != cookie.value {
+                // Reauthentication may rotate an existing route, never let a new origin claim an old identity.
+                if previous != nil && address != anchor {
+                    let known=defaults.dictionaryRepresentation().contains{key,value in
+                        guard key.hasPrefix("channels:"),let prior=value as? [String:Any],prior["deviceId"] as? String==id else{return false}
+                        return GatewayChannels.endpoints(prior).contains(address)
+                    }
+                    guard known else{return}
+                }
+                guard !cookie.value.hasPrefix("cmbroute1_"),await GatewayChannels.proves(id,target:address,token:cookie.value) else{return}
+                root = .init(name:cookie.name,token:cookie.value);anchor=address
+            }
+            let current:HTTPCookie?=await withCheckedContinuation{continuation in self.binding(address){continuation.resume(returning:$0)}}
+            guard ticket==generation,revision==bindingRevision,origin==address,saved.contains(address),current?.name==cookie.name,current?.value==cookie.value,
+                  DeviceBinding.load(vault)?.token==previous?.token,let root else{return}
+            let replaced=root.token != previous?.token || root.name != previous?.name
+            if replaced && !DeviceBinding.save(vault,root){return}
+            for other in saved.filter({$0 != address})+[address] where other==address || gatewayIdentity(other)==id {
+                for key in ["name:","channel-mode:","disabled-channels:"] where defaults.object(forKey:key+id)==nil {
+                    if let value=defaults.object(forKey:key+other){defaults.set(value,forKey:key+id)}
+                }
+            }
+            d["anchor"]=anchor;defaults.set(anchor,forKey:"channel-anchor:"+id)
+            defaults.set(d,forKey:"channels:"+address)
+            defaults.set(saved.filter{$0==address || gatewayIdentity($0) != id},forKey:"origins")
+            if replaced{manifestReads.removeValue(forKey:id);cancelSync()}
+            web?.evaluateJavaScript("window.BridgeMobileChannels?.bound()",completionHandler:nil)
+        }
+    }
+    private var routeTimes=[String:[String:Int]]()
+    private var routeTraffic=[String:TimeInterval]()
+    private var addressLists=[String:UIStackView]()
+    private var computerTitles=[String:UIButton]()
+    private var manifestReads=[String:TimeInterval]()
+    private var arrivingVia:String?
+    private var deferredRoute:(()->Void)?
+    private func preferenceKey(_ key:String,_ address:String)->String {key+":"+((channelRecord(address)?["deviceId"] as? String) ?? address)}
+    private func selectionId(_ url:String)->String {url.hasPrefix("https://") && url.hasSuffix(".trycloudflare.com") ? "quick-tunnel":url}
+    private func channelEnabled(_ address:String)->Bool {!(defaults.stringArray(forKey:preferenceKey("disabled-channels",address)) ?? []).contains(selectionId(address))}
+    private func addresses(_ address:String)->[String] {
+        let disabled=Set(defaults.stringArray(forKey:preferenceKey("disabled-channels",address)) ?? [])
+        return catalog(address).filter{!disabled.contains(selectionId($0))}
+    }
+    private func manageComputer(_ address:String){
+        let key=preferenceKey("disabled-channels",address), (sheet,content)=sheet(MobileStrings.text("管理这台电脑"))
+        var disabled=Set(defaults.stringArray(forKey:key) ?? [])
+        for url in catalog(address){
+            let id=selectionId(url)
+            content.addArrangedSubview(sourceSwitch(label(url),name:url,on:!disabled.contains(id)){enabled in
+                if enabled {disabled.remove(id)}else{disabled.insert(id)}
+            })
+        }
+        guard let controller=sheet.topViewController else{return}
+        controller.navigationItem.rightBarButtonItem=UIBarButtonItem(systemItem:.cancel,primaryAction:UIAction{[weak sheet] _ in sheet?.dismiss(animated:true)})
+        let remove=button(MobileStrings.text("移除此电脑")){[weak self,weak sheet] in sheet?.dismiss(animated:true){self?.confirmRemove(address)}}
+        remove.configuration?.baseForegroundColor = .systemRed
+        let save=button(MobileStrings.text("保存"),primary:true){[weak self,weak sheet] in
+            self?.cancelSync();self?.defaults.set(Array(disabled),forKey:key);self?.paintAddresses(address);self?.checkComputers();sheet?.dismiss(animated:true)
+        }
+        for control in [remove,save]{control.configuration?.contentInsets=NSDirectionalEdgeInsets(top:6,leading:14,bottom:6,trailing:14)}
+        controller.toolbarItems=[UIBarButtonItem(customView:remove),UIBarButtonItem.flexibleSpace(),UIBarButtonItem(customView:save)];sheet.setToolbarHidden(false,animated:false)
+    }
+    private func catalog(_ address:String)->[String] {
+        channelRecord(address).map(GatewayChannels.endpoints) ?? [address]
+    }
+    private func paintAddresses(_ address:String) {
+        guard let list=addressLists[address] else{return}
+        let id=channelRecord(address)?["deviceId"] as? String ?? "", urls=addresses(address)
+        if list.arrangedSubviews.map({$0.accessibilityIdentifier ?? ""})==urls {
+            for line in list.arrangedSubviews {
+                guard let url=line.accessibilityIdentifier,let dot=(line as? UIStackView)?.arrangedSubviews.first as? UILabel else{continue}
+                let ok=(routeTimes[id]?[url] ?? -1)>=0;dot.text=ok ? "●":"○";dot.textColor=ok ? .systemGreen:.secondaryLabel
+            }
+            return
+        }
+        list.arrangedSubviews.forEach{$0.removeFromSuperview()}
+        for url in urls {
+            let online=(routeTimes[id]?[url] ?? -1)>=0
+            let dot=label(online ? "●" : "○",size:14);dot.textColor=online ? .systemGreen : .secondaryLabel
+            dot.setContentHuggingPriority(.required,for:.horizontal)
+            let line=UIStackView(arrangedSubviews:[dot,label(url,size:13,secondary:true)]);line.accessibilityIdentifier=url;line.axis = .horizontal;line.spacing=7;list.addArrangedSubview(line)
+            if id.isEmpty {computerStates[address]=dot}
+        }
+    }
+    private var inspectionGeneration:Int?
+    private func channelMenu()->String {
+        guard let id=channelRecord(origin)?["deviceId"] as? String else{return "{}"}
+        let rows:[[String:Any]]=addresses(origin).map{["url":$0,"ms":routeTimes[id]?[$0] ?? -1]}
+        let value:[String:Any]=["localNetwork":channelWiFi,"probing":inspectionGeneration==generation,"current":origin,"rows":rows,"mode":defaults.string(forKey:preferenceKey("channel-mode",origin)) ?? "auto"]
+        return (try? JSONSerialization.data(withJSONObject:value)).flatMap{String(data:$0,encoding:.utf8)} ?? "{}"
+    }
+    private func routeNotice(_ text:String){
+        let note=label(text,size:14);note.textColor = .white;note.backgroundColor=UIColor.black.withAlphaComponent(0.83)
+        note.textAlignment = .center;note.numberOfLines=2;note.layer.cornerRadius=10;note.clipsToBounds=true
+        view.addSubview(note);note.translatesAutoresizingMaskIntoConstraints=false
+        NSLayoutConstraint.activate([note.centerXAnchor.constraint(equalTo:view.centerXAnchor),note.widthAnchor.constraint(lessThanOrEqualTo:view.widthAnchor,multiplier:0.94),note.bottomAnchor.constraint(equalTo:view.safeAreaLayoutGuide.bottomAnchor,constant:-18),note.heightAnchor.constraint(greaterThanOrEqualToConstant:40)])
+        DispatchQueue.main.asyncAfter(deadline:.now()+2.5){note.removeFromSuperview()}
+    }
+    private func refreshRoutes(_ address:String,_ d:[String:Any],via:String,root:DeviceBinding.Credential){
+        guard let id=d["deviceId"] as? String else{return}
+        let now=ProcessInfo.processInfo.systemUptime
+        guard now-(manifestReads[id] ?? -90)>=90 else{return}
+        manifestReads[id]=now
+        Task { @MainActor in
+            guard let updated=try? await GatewayChannels.refresh(d,reached:via,name:root.name,root:root.token) else{return}
+            let active=activeChannel(address)
+            guard saved.contains(active),channelRecord(active)?["deviceId"] as? String==id,
+                  DeviceBinding.load(GatewayChannels.vault(id))?.token==root.token else{return}
+            guard !(NSDictionary(dictionary:updated).isEqual(to:channelRecord(active) ?? [:])) else{return}
+            defaults.set(updated,forKey:"channels:"+active);paintAddresses(active)
+            computerTitles[active]?.setTitle(computerName(active),for:.normal)
+            if active==origin {web?.evaluateJavaScript("window.dispatchEvent(new Event('bridge-channel-sample'))",completionHandler:nil)}
+        }
+    }
+    private var channelJobs=[UUID:Task<Void,Never>]()
+    private func cancelChannelJobs(){inspectionGeneration=nil;channelJobs.values.forEach{$0.cancel()};channelJobs.removeAll()}
+    private func sweep(_ address:String,_ d:[String:Any],targets:[String],current:@escaping ()->Bool,
+                       sample:@escaping (String,Int?,Bool)->Void,exhausted:@escaping ()->Void,finished:@escaping ()->Void={}){
+        guard let id=d["deviceId"] as? String,let root=DeviceBinding.load(GatewayChannels.vault(id)) else{exhausted();finished();return}
+        let job=UUID()
+        channelJobs[job]=Task { @MainActor in
+            defer{channelJobs.removeValue(forKey:job);finished()}
+            var any=false
+            await GatewayChannels.probe(d,root:root.token,targets:targets){ url,ms in
+                guard current(),DeviceBinding.load(GatewayChannels.vault(id))?.cookie==root.cookie,
+                      self.channelRecord(address)?["anchor"] as? String==d["anchor"] as? String else{return}
+                let result=ms ?? (self.pageReady && url==self.origin && ProcessInfo.processInfo.systemUptime-(self.routeTraffic[url] ?? -30)<30 ? self.routeTimes[id]?[url]:nil)
+                self.routeTimes[id,default:[:]][url]=result ?? -1
+                let first=ms != nil && !any
+                if first {any=true;self.refreshRoutes(address,d,via:url,root:root)}
+                let rule=(d["race"] as? [String:Any])?["select"] as? String ?? "firstVerified"
+                sample(url,ms,first && rule=="firstVerified")
+            }
+            if current() && !any {exhausted()}
+        }
+    }
+    @discardableResult private func checkChannels(failure:Bool,forced:String?=nil,inspect:Bool=false,reason:String="signal")->Bool{
+        guard channelRecord(origin) != nil,let web else{return false}
+        if forced != nil || inspect {return raceChannels(failure:failure,forced:forced,inspect:inspect)}
+        if pageReady {web.evaluateJavaScript("window.BridgeChannelLink?.check('\(reason)')",completionHandler:nil)}
+        else if failure,defaults.string(forKey:preferenceKey("channel-mode",origin)) != "manual" {
+            let urls=addresses(origin).filter{$0 != origin && (origin.hasPrefix("http://") || (channelWiFi && $0.hasPrefix("http://")))}
+            if !urls.isEmpty{_ = raceChannels(failure:true,allowed:urls)}
+        }
+        return true
+    }
+    private func channelCommand(_ cmd:String)->String? {
+        guard let d=channelRecord(origin),let page=web else{return nil}
+        let address=origin,key=preferenceKey("channel-mode",address)
+        if ["mode:auto","mode:manual"].contains(cmd){channelTicket+=1;defaults.set(String(cmd.dropFirst(5)),forKey:key);return channelMenu()}
+        if cmd.hasPrefix("verify:"),let id=Int(cmd.dropFirst(7)),id>0 {
+            func valid()->Bool {web===page && origin==address && UIApplication.shared.applicationState == .active}
+            func result(_ ok:Bool){page.evaluateJavaScript("window.BridgeChannelLink?.result(\(id),\(ok))",completionHandler:nil)}
+            sweep(address,d,targets:[address],current:valid,sample:{_,ms,_ in if ms != nil{result(true)}},exhausted:{result(false)})
+            return "started"
+        }
+        if cmd.hasPrefix("traffic:"),let ms=Int(cmd.dropFirst(8)),(0...120000).contains(ms),let id=d["deviceId"] as? String {
+            routeTraffic[address]=ProcessInfo.processInfo.systemUptime;routeTimes[id,default:[:]][address]=ms;return "ok"
+        }
+        if cmd=="unreachable"{channelUnavailable();return "ok"}
+        if cmd.hasPrefix("prefer:") || cmd.hasPrefix("outage:") || cmd.hasPrefix("retry:"){
+            if defaults.string(forKey:key) != "manual",cmd.utf8.count<32768,let split=cmd.firstIndex(of:":"),
+               let urls=(try? JSONSerialization.jsonObject(with:Data(cmd[cmd.index(after:split)...].utf8))) as? [String] {
+                _ = raceChannels(failure:!cmd.hasPrefix("prefer:"),allowed:urls,notifyFailure:cmd.hasPrefix("outage:"))
+            }
+            return "ok"
+        }
+        if let peer=pendingPeer {
+            if cmd=="failed:"+peer.nonce {rollbackPeer();routeNotice(MobileStrings.text("信道暂不可达"));return "ok"}
+        }
+        return nil
+    }
+    private func channelUnavailable(){routeNotice(MobileStrings.text("当前信道不可达，请手动切换连接信道"))}
+    @discardableResult private func raceChannels(failure:Bool,forced:String?=nil,inspect:Bool=false,allowed:[String]?=nil,notifyFailure:Bool=false)->Bool{
+        let address=origin
+        guard let view=web, UIApplication.shared.applicationState == .active,let d=channelRecord(address) else{return false}
+        let targets=addresses(address).filter{allowed?.contains($0) ?? true}
+        guard !targets.isEmpty else{if notifyFailure{channelUnavailable()};return false}
+        if let forced,!targets.contains(forced){return false}
+        if inspect,inspectionGeneration==generation{return true}
+        if inspect{inspectionGeneration=generation}
+        let now=ProcessInfo.processInfo.systemUptime,key=address+"|"+String(channelWiFi)
+        if !inspect,!notifyFailure,forced==nil,let last=lastChannelProbe,last.key==key,now-last.time<3 {return true}
+        if !inspect {lastChannelProbe=(key,now);channelTicket+=1}
+        let ticket=channelTicket,screen=generation
+        func current()->Bool { channelTicket==ticket && generation==screen && web===view && saved.contains(address) && UIApplication.shared.applicationState == .active }
+        sweep(address,d,targets:forced.map{[$0]} ?? targets,current:current,sample:{url,ms,select in
+            view.evaluateJavaScript("window.dispatchEvent(new Event('bridge-channel-sample'))",completionHandler:nil)
+            guard !inspect,select else{return}
+            if url==address,self.pageReady {view.evaluateJavaScript("window.BridgeChannelLink?.check()",completionHandler:nil)}
+            if url != address,let requested=view.url ?? self.requestedRoute {self.moveChannel(address,d,to:url,requested:requested,view:view,failure:failure,current:current)}
+        },exhausted:{if notifyFailure{self.channelUnavailable()}else if forced != nil {self.routeNotice(MobileStrings.text("信道暂不可达"))}},finished:{
+            if inspect,self.inspectionGeneration==screen {self.inspectionGeneration=nil;view.evaluateJavaScript("window.dispatchEvent(new Event('bridge-channel-sample'))",completionHandler:nil)}
+        })
+        return true
+    }
+    private func openComputer(_ address:String,_ url:URL){
+        guard !addresses(address).isEmpty else{manageComputer(address);return}
+        guard let d=channelRecord(address) else{connect(url,address:address);return}
+        clear();navigation(home:false);origin=address;documentAddress=address;requestedRoute=url;subtitle.isHidden=false
+        pendingEntry=(address,url,UIApplication.shared.applicationState != .active)
+        let screen=generation,targets=addresses(address)
+        var progress=[String:String]()
+        subtitle.isHidden=true
+        let container=UIView(),panel=column(),title=label(MobileStrings.text("正在连接 · ")+computerName(address),size:20,weight:.semibold)
+        let rows=column(spacing:8);panel.addArrangedSubview(title);panel.addArrangedSubview(rows)
+        entryProgress=container;page.addArrangedSubview(container);container.addSubview(panel);panel.translatesAutoresizingMaskIntoConstraints=false
+        NSLayoutConstraint.activate([panel.centerYAnchor.constraint(equalTo:container.centerYAnchor),panel.leadingAnchor.constraint(equalTo:container.leadingAnchor,constant:24),panel.trailingAnchor.constraint(equalTo:container.trailingAnchor,constant:-24)])
+        var labels=[String:UILabel]()
+        for url in targets{
+            let time=label("",size:14,secondary:true);time.setContentCompressionResistancePriority(.required,for:.horizontal)
+            let row=UIStackView(arrangedSubviews:[label(url,size:14),time]);row.spacing=10;row.alignment = .center;rows.addArrangedSubview(row);labels[url]=time
+        }
+        func render(){for url in targets{labels[url]?.text=progress[url] ?? MobileStrings.text("连接中…")}}
+        func current()->Bool{generation==screen && web==nil && connectionError==nil && UIApplication.shared.applicationState == .active}
+        let deadline=DispatchWorkItem{[weak self] in
+            guard let self,self.generation==screen,self.web==nil,self.connectionError==nil,
+                  UIApplication.shared.applicationState == .active else{return}
+            self.cancelChannelJobs();self.showConnectionError(status:nil)
+        }
+        connectionDeadline=deadline;DispatchQueue.main.asyncAfter(deadline:.now()+10,execute:deadline)
+        render()
+        sweep(address,d,targets:targets,current:current,sample:{next,ms,select in
+            progress[next]=ms.map{"\($0) ms"} ?? "○";render()
+            guard select else{return}
+            if next==address{self.connect(url,address:address)}else{self.moveChannel(address,d,to:next,requested:url,view:nil,failure:false,current:current)}
+        },exhausted:{if targets.contains(address){self.connect(url,address:address)}else{self.routeNotice(MobileStrings.text("信道暂不可达"))}})
+    }
+    @discardableResult
+    private func moveChannel(_ address:String,_ d:[String:Any],to next:String,requested:URL,view:WKWebView?,failure:Bool,current:@escaping ()->Bool)->Task<Void,Never>?{
+        let document=view == nil ? address:documentAddress
+        guard current(),GatewayURL.same(requested,document),let url=URL(string:next+requested.absoluteString.dropFirst(document.count)),
+              let id=d["deviceId"] as? String,let anchor=d["anchor"] as? String,let root=DeviceBinding.load(GatewayChannels.vault(id)),
+              let host=URL(string:next)?.host,cookieName(address)==root.name else{return nil}
+        let ticket=channelTicket,revision=bindingRevision
+        func rooted()->Bool {
+            let live=DeviceBinding.load(GatewayChannels.vault(id)),record=channelRecord(address)
+            return bindingRevision==revision && live?.cookie==root.cookie && record?["deviceId"] as? String==id &&
+                record?["anchor"] as? String==anchor && (defaults.string(forKey:"channel-anchor:"+id) ?? anchor)==anchor
+        }
+        func valid()->Bool {current() && channelTicket==ticket && rooted() && addresses(address).contains(next)}
+        return Task { @MainActor in
+            let token=GatewayChannels.token(root.token,anchor:anchor,target:next),store=WKWebsiteDataStore.default().httpCookieStore
+            var properties:[HTTPCookiePropertyKey:Any]=[.name:root.name,.value:token,.domain:host,.path:"/",.expires:Date().addingTimeInterval(34560000),HTTPCookiePropertyKey("HttpOnly"):"TRUE",HTTPCookiePropertyKey("SameSite"):"Strict"]
+            if next.hasPrefix("https://"){properties[.secure]="TRUE"}
+            guard let cookie=HTTPCookie(properties:properties) else{return}
+            func slot(_ value:HTTPCookie)->Bool {
+                value.name==cookie.name && value.path==cookie.path &&
+                    value.domain.trimmingCharacters(in:CharacterSet(charactersIn:"."))==host
+            }
+            func same(_ first:HTTPCookie?,_ second:HTTPCookie?)->Bool {
+                first?.name==second?.name && first?.value==second?.value && first?.path==second?.path &&
+                    first?.domain.trimmingCharacters(in:CharacterSet(charactersIn:"."))==second?.domain.trimmingCharacters(in:CharacterSet(charactersIn:".")) && first?.isSecure==second?.isSecure
+            }
+            let cookies=await store.allCookies(),source=cookies.first(where:{cookieMatches($0,address:address)})
+            guard valid(),view==nil || source != nil else{return}
+            let before=cookies.filter(slot),retained=DeviceBinding.load(next),owner=UUID()
+            let targetKey=root.name+"\n"+host+"\n/",sourceKey=root.name+"\n"+(URL(string:address)?.host ?? "")+"\n"+GatewayURL.cookiePath(address)
+            @MainActor func release(){for key in [targetKey,sourceKey] where channelCookieOwners[key]==owner{channelCookieOwners.removeValue(forKey:key)}}
+            @MainActor func owned()->Bool{channelCookieOwners[targetKey]==owner && channelCookieOwners[sourceKey]==owner}
+            let aliases=Set(GatewayChannels.endpoints(d)+[address,next,anchor])
+            let known=Set(aliases.map{GatewayChannels.token(root.token,anchor:anchor,target:$0)} +
+                aliases.compactMap{alias -> String? in
+                    guard gatewayIdentity(alias)==id,let saved=DeviceBinding.load(alias),saved.name==root.name else{return nil}
+                    return saved.token
+                })
+            if (gatewayIdentity(next) != nil && gatewayIdentity(next) != id) ||
+                (retained != nil && retained?.name != root.name) || before.count>1 ||
+                before.contains(where:{!known.contains($0.value)}) || source.map({!known.contains($0.value)})==true {
+                if view==nil,addresses(address).contains(address) {connect(requested,address:address)}
+                routeNotice(MobileStrings.text("此地址的登录绑定已变化，请重新验证"));return
+            }
+            let shared=URL(string:address)?.host==host && GatewayURL.cookiePath(address)==cookie.path
+            let expectedSource=shared ? (cookieMatches(cookie,address:address) ? cookie:nil):source
+            @MainActor func written(_ values:[HTTPCookie])->Bool {
+                let target=values.filter(slot)
+                return target.count==1 && same(target.first,cookie) &&
+                    same(values.first(where:{cookieMatches($0,address:address)}),expectedSource)
+            }
+            @MainActor func rollback() async {
+                let latest=await store.allCookies()
+                await withCheckedContinuation{continuation in
+                    guard rooted(),channelCookieOwners[targetKey]==owner,written(latest),DeviceBinding.load(next)?.cookie==retained?.cookie else{
+                        release();continuation.resume();return
+                    }
+                    // Enqueue synchronously on MainActor before releasing ownership; a newer write follows it.
+                    if let previous=before.first {store.setCookie(previous){continuation.resume()}}
+                    else{store.delete(cookie){continuation.resume()}}
+                    release()
+                }
+            }
+            var dispatched=false
+            await withCheckedContinuation{continuation in
+                guard valid() else{continuation.resume();return}
+                channelCookieOwners[targetKey]=owner;channelCookieOwners[sourceKey]=owner;dispatched=true
+                store.setCookie(cookie){continuation.resume()}
+            }
+            guard dispatched else{return}
+            let fresh=await store.allCookies()
+            guard valid(),owned(),written(fresh) else{await rollback();return}
+            @MainActor func commit(_ eligible:@escaping ()->Bool) async -> Bool {
+                let latest=await store.allCookies()
+                guard eligible(),valid(),owned(),written(latest),DeviceBinding.load(next)?.cookie==retained?.cookie,
+                      DeviceBinding.save(next,.init(name:root.name,token:token)) else{await rollback();return false}
+                for prefix in ["notificationsMuted:","computer-name:","cursor:","stream:"] {
+                    if let value=defaults.object(forKey:prefix+address){defaults.set(value,forKey:prefix+next)}
+                }
+                if foregroundBaselines.contains(address){foregroundBaselines.insert(next)}
+                defaults.set(channelRecord(address) ?? d,forKey:"channels:"+next);defaults.set(root.name,forKey:"cookieName:"+next)
+                defaults.set(saved.filter{$0 != address && $0 != next}+[next],forKey:"origins")
+                release()
+                if view==nil || !pageReady {connect(url,address:next);arrivingVia=next}
+                else{origin=next;defaults.set(next,forKey:"active");routeNotice(MobileStrings.text("已切换连接信道")+" · "+next)}
+                return true
+            }
+            if view==nil || !pageReady {_ = await commit({true});return}
+            let peer=RoutePeer(next,id,commit:commit,rollback:rollback)
+            rollbackPeer();pendingPeer=peer
+            view?.evaluateJavaScript("window.BridgeChannelLink?.prepare("+peer.arguments([next,peer.nonce,id])+")",completionHandler:nil)
+        }
+    }
+    private final class RoutePeer {
+        let next:String,device:String,nonce=UUID().uuidString,commit:@MainActor (@escaping ()->Bool) async -> Bool,rollback:@MainActor () async -> Void
+        var document:String {next+"/mobile-channel#"+nonce}
+        init(_ next:String,_ device:String,commit:@escaping @MainActor (@escaping ()->Bool) async -> Bool,rollback:@escaping @MainActor () async -> Void){self.next=next;self.device=device;self.commit=commit;self.rollback=rollback}
+        func arguments(_ values:[String])->String {values.map{String(decoding:(try? JSONEncoder().encode($0)) ?? Data("null".utf8),as:UTF8.self)}.joined(separator:",")}
+    }
+    private func rollbackPeer(){
+        guard let peer=pendingPeer else{return};pendingPeer=nil
+        Task { @MainActor in await peer.rollback() }
+    }
+    private func commitPeer(_ peer:RoutePeer,eligible:@escaping ()->Bool,reply:@escaping (String)->Void){
+        pendingPeer=nil
+        var answered=false
+        func answer(_ accepted:Bool){guard !answered else{return};answered=true;reply(accepted ? "accepted":"expired")}
+        let deadline=DispatchWorkItem{answer(false)}
+        DispatchQueue.main.asyncAfter(deadline:.now()+4,execute:deadline)
+        Task { @MainActor in
+            let accepted=await peer.commit{!answered && eligible()}
+            deadline.cancel();answer(accepted)
+        }
+    }
+    private var routeScript=""
+    private var entryProgress:UIView?
+    private var pendingEntry:(address:String,url:URL,interrupted:Bool)?
+    private func hideEntryProgress(){entryProgress?.removeFromSuperview();entryProgress=nil}
+    private var documentAddress="",pageReady=false
+    private var pendingPeer:RoutePeer?
+    private var peerViews=[WKWebView:RoutePeer]()
+    func webView(_ parent:WKWebView,createWebViewWith configuration:WKWebViewConfiguration,for action:WKNavigationAction,windowFeatures:WKWindowFeatures)->WKWebView? {
+        guard parent===web,action.sourceFrame.isMainFrame,let source=parent.url,GatewayURL.same(source,documentAddress),
+              let peer=pendingPeer,action.request.url?.absoluteString==peer.document,!peerViews.values.contains(where:{$0===peer}) else{return nil}
+        configuration.userContentController=WKUserContentController()
+        let child=WKWebView(frame:CGRect(x:0,y:0,width:1,height:1),configuration:configuration)
+        child.navigationDelegate=self;child.uiDelegate=self;child.isUserInteractionEnabled=false;child.accessibilityElementsHidden=true;child.alpha=0.01
+        view.insertSubview(child,at:0);peerViews[child]=peer;return child
+    }
+    func webViewDidClose(_ child:WKWebView) {
+        guard peerViews.removeValue(forKey:child) != nil else{return};child.navigationDelegate=nil;child.uiDelegate=nil;child.removeFromSuperview()
+    }
     private var routeDiscovery: ConnectionDiscovery?
     private var routeAttempted = false
     private var requestedRoute: URL?
+    private var connectionError: UIView?
+    private var connectionDeadline: DispatchWorkItem?
     private var pendingStorage: String?
+    private lazy var uu = UURemote(defaults)
+    private var uuAvailability = "checking"
     private var clipboardToken = ""
     private var downloadState = DownloadManager.Snapshot()
     private let downloadPanel = DownloadPanel()
@@ -146,12 +620,16 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
     private var uploadPicker: UIDocumentPickerViewController?
     private var uploadCompletion: (([URL]?) -> Void)?
     private var uploadGeneration = 0
+    private var uploadSource: (name: String, at: Date)?
+    private var mediaPicker: UIViewController?
+    private var uploadTicket = UUID()
+    private var mediaUploadDirectory: URL?
     private var timer: Timer?
     private var activityTimer: Timer?
     private var foregroundBaselines = Set<String>()
-    private var loading = false
+    private var polling = Set<String>()
     private var pollGeneration = 0
-    private var pollTask: URLSessionDataTask?
+    private var pollTasks: [String: URLSessionDataTask] = [:]
     private var generation = 0
     private var authLossAttempted = false
     private var bindingRevision = 0
@@ -205,6 +683,8 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
         updateGatewayMenu()
         gatewayMenu.translatesAutoresizingMaskIntoConstraints = false; view.addSubview(gatewayMenu)
         NSLayoutConstraint.activate([gatewayMenu.trailingAnchor.constraint(equalTo: view.safeAreaLayoutGuide.trailingAnchor, constant: -8), gatewayMenu.widthAnchor.constraint(equalToConstant: 48), gatewayMenu.heightAnchor.constraint(equalToConstant: 48)])
+        let menuFallbackTop = gatewayMenu.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 4)
+        menuFallbackTop.priority = .defaultLow; menuFallbackTop.isActive = true
         downloadPanel.translatesAutoresizingMaskIntoConstraints = false; view.addSubview(downloadPanel)
         downloadPanel.onToggle = { [weak self] in
             guard let self else { return }
@@ -229,7 +709,30 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
     }
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
+        applyTheme()
         requestStartupNotifications()
+    }
+    private var theme: String {
+        let value = defaults.string(forKey: "settingsTheme") ?? "system"
+        return ["system", "light", "dark"].contains(value) ? value : "system"
+    }
+    var themeStyle: UIUserInterfaceStyle { theme == "dark" ? .dark : theme == "light" ? .light : .unspecified }
+    private func applyTheme() {
+        view.window?.overrideUserInterfaceStyle = themeStyle
+        syncWebTheme()
+    }
+    private func syncWebTheme() {
+        // UIKit propagates the window override through its children after the
+        // trait callback. Read the settled style, including when returning to system.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let web = self.web, let url = web.url, GatewayURL.same(url, self.documentAddress) else { return }
+            let dark = self.view.traitCollection.userInterfaceStyle == .dark
+            web.evaluateJavaScript("window.BridgeNativeTheme={theme:'" + self.theme + "',dark:" + String(dark) + "};document.dispatchEvent(new Event('bridge-native-theme'));")
+        }
+    }
+    override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
+        super.traitCollectionDidChange(previousTraitCollection)
+        if previousTraitCollection?.userInterfaceStyle != traitCollection.userInterfaceStyle { syncWebTheme() }
     }
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews(); updatePageBottom()
@@ -288,20 +791,42 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
         return content
     }
     private func openAccounts() {
-        guard let web, let current = web.url, GatewayURL.same(current, origin) else { return }
+        guard let web, let current = web.url, GatewayURL.same(current, documentAddress) else { return }
         web.evaluateJavaScript("(()=>{if(typeof window.BridgeNavigation?.accounts==='function')return window.BridgeNavigation.accounts();document.getElementById('accounts-button')?.click();return true;})()")
     }
     private func appIconsMenu() -> UIDeferredMenuElement {
         UIDeferredMenuElement.uncached { [weak self] completion in
-            guard let self, let web = self.web, let url = web.url, GatewayURL.same(url, self.origin) else { completion([]); return }
+            guard let self, let web = self.web, let url = web.url, GatewayURL.same(url, self.documentAddress) else { completion([]); return }
             let ticket = self.generation, address = self.origin
             web.evaluateJavaScript("(()=>{const button=document.getElementById('client-switch-toggle');return document.getElementById('app')?.hidden===false&&button&&!button.hidden?button.getAttribute('aria-expanded')==='false':null;})()") { [weak self, weak web] value, _ in
-                guard let self, let web, self.web === web, self.generation == ticket, let url = web.url, GatewayURL.same(url, address), let collapsed = value as? Bool else { completion([]); return }
+                guard let self, let web, self.web === web, self.generation == ticket, let url = web.url, GatewayURL.same(url, documentAddress), let collapsed = value as? Bool else { completion([]); return }
                 let action = UIAction(title: MobileStrings.text(collapsed ? "显示底部 APP 图标" : "隐藏底部 APP 图标"), image: UIImage(systemName: "square.grid.3x1.below.line.grid.1x2")) { [weak self, weak web] _ in
-                    guard let self, let web, self.web === web, self.generation == ticket, let url = web.url, GatewayURL.same(url, address) else { return }
+                    guard let self, let web, self.web === web, self.generation == ticket, let url = web.url, GatewayURL.same(url, documentAddress) else { return }
                     web.evaluateJavaScript("document.getElementById('client-switch-toggle')?.click()")
                 }
                 completion([action])
+            }
+        }
+    }
+    private func uuContext() -> Bool {
+        guard let current = web?.url, GatewayURL.same(current, documentAddress), saved.contains(origin),
+              connectionError == nil, !uu.scope.isEmpty else { return false }
+        return UURemote.device(cookieName(origin)) == uu.scope
+    }
+    private func uuMenu() -> UIDeferredMenuElement {
+        UIDeferredMenuElement.uncached { [weak self] complete in
+            guard let self, let web = self.web, self.uu.enabled, self.uuContext() else { complete([]); return }
+            let ticket = self.generation, device = self.uu.scope
+            web.evaluateJavaScript("window.BridgeUURemote?.menu(" + self.uu.settings("read") + ")||[]") { result, _ in
+                guard self.generation == ticket, self.web === web, self.uu.scope == device, self.uuContext(),
+                      let rows = result as? [[String:String]] else { complete([]); return }
+                complete(rows.compactMap { row -> UIAction? in
+                    guard let title = row["title"], let mode = row["mode"], ["pip","full"].contains(mode) else { return nil }
+                    return UIAction(title:title,image:UIImage(systemName:mode == "pip" ? "pip" : "desktopcomputer")) { [weak self] _ in
+                        guard let self, self.generation == ticket, self.web === web, self.uu.scope == device, self.uuContext() else { return }
+                        self.uu.open(mode) { self.routeNotice(MobileStrings.text($0)) }
+                    }
+                })
             }
         }
     }
@@ -315,6 +840,7 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
             UIAction(title: MobileStrings.text("通知收件箱"), image: UIImage(systemName: "bell")) { [weak self] _ in self?.inbox() },
             UIAction(title: MobileStrings.text("刷新页面"), image: UIImage(systemName: "arrow.clockwise")) { [weak self] _ in self?.refresh() },
             UIAction(title: MobileStrings.text("外观与显示"), image: UIImage(systemName: "paintpalette")) { [weak self] _ in self?.web?.evaluateJavaScript("document.querySelector('[data-open-appearance]')?.click()") },
+            uuMenu(),
             appIconsMenu(),
             UIAction(title: MobileStrings.text("手机设置"), image: UIImage(systemName: "gearshape")) { [weak self] _ in self?.settings() }
         ])
@@ -322,6 +848,7 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
     private func navigation(home: Bool) {
         navigationController?.setNavigationBarHidden(!home, animated: false)
         gatewayMenu.isHidden = home
+        gatewayMenu.isEnabled = true
         title = ""; navigationItem.largeTitleDisplayMode = .never
         let logo = UIImageView(image: UIImage(named: "AppIcon60x60@2x.png")); logo.contentMode = .scaleAspectFit
         logo.widthAnchor.constraint(equalToConstant: 30).isActive = true; logo.heightAnchor.constraint(equalToConstant: 30).isActive = true; logo.layer.cornerRadius = 7; logo.clipsToBounds = true
@@ -331,7 +858,7 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
         let inbox = UIBarButtonItem(image: UIImage(systemName: "bell"), style: .plain, target: self, action: #selector(self.inbox)); inbox.accessibilityLabel = MobileStrings.text("通知")
         navigationItem.rightBarButtonItems = [settings, inbox]
     }
-    private func clear() { updateSystemBars(reset: true); pendingStorage = nil; routeDiscovery?.cancel(); routeDiscovery = nil; cancelSync(); finishUpload(nil); stopComputerChecks(); computerStates.removeAll(); computerNotifications.removeAll(); gatewayMenuTop?.isActive = false; gatewayMenuTop = nil; generation += 1; web?.stopLoading(); web?.navigationDelegate = nil; web?.uiDelegate = nil; web = nil; for v in page.arrangedSubviews where v !== subtitle { page.removeArrangedSubview(v); v.removeFromSuperview() } }
+    private func clear() { pendingEntry=nil;routeTraffic.removeAll();uu.scope = ""; uuAvailability = "checking"; hideEntryProgress();pageReady=false;rollbackPeer();for child in Array(peerViews.keys){child.stopLoading();webViewDidClose(child)};cancelChannelJobs();connectionDeadline?.cancel(); connectionDeadline = nil; updateSystemBars(reset: true); connectionError = nil; pendingStorage = nil; nativeMainNavigation = nil; routeDiscovery?.cancel(); routeDiscovery = nil; cancelSync(); finishUpload(nil); if let folder = mediaUploadDirectory { try? FileManager.default.removeItem(at: folder); mediaUploadDirectory = nil }; stopComputerChecks(); computerStates.removeAll();addressLists.removeAll();computerTitles.removeAll();arrivingVia=nil;deferredRoute=nil; computerNotifications.removeAll(); gatewayMenuTop?.isActive = false; gatewayMenuTop = nil; generation += 1; web?.stopLoading(); web?.navigationDelegate = nil; web?.uiDelegate = nil; web = nil; for v in page.arrangedSubviews where v !== subtitle { page.removeArrangedSubview(v); v.removeFromSuperview() } }
     @objc func home() {
         clear(); navigation(home: true); subtitle.isHidden = true
         let container = UIView(); page.addArrangedSubview(container); let content = scrollContent(in: container)
@@ -340,29 +867,28 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
         let heading = label(MobileStrings.text("电脑上的工作，\n带在身边。"), size: 30, weight: .semibold); heading.textAlignment = .center; hero.addArrangedSubview(heading)
         let hint = label(MobileStrings.text("继续聊天、查看结果，让电脑替你运行。"), secondary: true); hint.textAlignment = .center; hero.addArrangedSubview(hint)
         hero.setCustomSpacing(24, after: visual); content.addArrangedSubview(hero)
-        content.addArrangedSubview(card([button(MobileStrings.text("扫码连接电脑"), symbol: "qrcode.viewfinder", primary: true) { [weak self] in self?.scan() }, button(MobileStrings.text("输入网关地址"), symbol: "link") { [weak self] in self?.manualAddress() }]))
+        content.addArrangedSubview(card([button(MobileStrings.text("扫码连接电脑"), symbol: "qrcode.viewfinder", primary: true) { [weak self] in self?.scan() }, button(MobileStrings.text("输入网关地址"), symbol: "link") { [weak self] in self?.manualAddress() }, button("DSH Mobile", symbol: "link") { [weak self] in self?.manualDsh() }]))
         let computersHeading = UIStackView(arrangedSubviews: [label(MobileStrings.text("我的电脑"), size: 19, weight: .semibold), button(MobileStrings.text("刷新状态"), symbol: "arrow.clockwise") { [weak self] in self?.checkComputers(); self?.sync() }])
         computersHeading.axis = .horizontal; computersHeading.alignment = .center; computersHeading.spacing = 8; content.addArrangedSubview(computersHeading)
-        if saved.isEmpty {
+        if saved.isEmpty && DshMobileStore.ids.isEmpty {
             content.addArrangedSubview(card([label(MobileStrings.text("还没有连接的电脑"), size: 17, weight: .medium), label(MobileStrings.text("在电脑网关中展开“扫码登录”，然后用上方按钮扫描。"), secondary: true)]))
         } else {
             for address in recentComputers {
+                if address.hasPrefix("dsh:") { content.addArrangedSubview(dshComputer(String(address.dropFirst(4)))); continue }
                 let row = button(computerName(address)) { [weak self] in self?.openSaved(address) }
                 row.contentHorizontalAlignment = .leading
                 row.titleLabel?.lineBreakMode = .byTruncatingTail; row.titleLabel?.numberOfLines = 1
                 row.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
                 row.configuration?.contentInsets = NSDirectionalEdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0)
-                let status = label(MobileStrings.text("检查中…"), size: 12, secondary: true)
-                status.setContentHuggingPriority(.required, for: .horizontal)
-                status.setContentCompressionResistancePriority(.required, for: .horizontal)
-                computerStates[address] = status
+                computerTitles[address]=row
+                let list=UIStackView();list.axis = .vertical;list.spacing=4;addressLists[address]=list;paintAddresses(address)
                 let apps = UIStackView(); apps.axis = .horizontal; apps.spacing = 0; apps.setContentHuggingPriority(.required, for: .horizontal); apps.setContentCompressionResistancePriority(.required, for: .horizontal); computerNotifications[address] = apps
-                let heading = UIStackView(arrangedSubviews: [status, row, apps]); heading.axis = .horizontal; heading.alignment = .center; heading.spacing = 10
+                let heading = UIStackView(arrangedSubviews: [row, apps]); heading.axis = .horizontal; heading.alignment = .center; heading.spacing = 10
                 let rename = button(MobileStrings.text("重命名"), symbol: "pencil") { [weak self] in self?.renameComputer(address) }
-                let remove = button(MobileStrings.text("移除这台电脑"), symbol: "trash") { [weak self] in self?.confirmRemove(address) }
-                remove.configuration?.baseForegroundColor = .systemRed
+                let remove = button(MobileStrings.text("管理这台电脑"), symbol: "slider.horizontal.3") { [weak self] in self?.manageComputer(address) }
+                remove.configuration?.contentInsets=NSDirectionalEdgeInsets(top:17,leading:8,bottom:17,trailing:8)
                 let actions = UIStackView(arrangedSubviews: [rename, remove]); actions.axis = .horizontal; actions.distribution = .fillEqually; actions.spacing = 8
-                content.addArrangedSubview(card([heading, label(address, size: 13, secondary: true), actions]))
+                content.addArrangedSubview(card([heading,list,actions]))
                 updateComputerNotifications(computerSnapshots[address], address: address)
             }
         }
@@ -370,13 +896,28 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
         checkComputers(); sync()
     }
     private var recentComputers: [String] {
-        saved.sorted { a, b in
+        (Array(saved) + DshMobileStore.ids.map { "dsh:" + $0 }).sorted { a, b in
             let left = defaults.double(forKey: "last-opened:" + a), right = defaults.double(forKey: "last-opened:" + b)
             return left == right ? a < b : left > right
         }
     }
+    private func dshComputer(_ id: String) -> UIView {
+        let url = DshMobileStore.load(id)
+        let open = button(MobileStrings.text("连接"), symbol: "link") { [weak self] in
+            guard let url else { self?.info(MobileStrings.text("连接凭据不可用，请移除后重新添加")); return }; self?.openDsh(url, id: id)
+        }
+        let remove = button(MobileStrings.text("移除这台电脑"), symbol: "trash") { [weak self] in
+            let alert = UIAlertController(title: MobileStrings.text("移除这台电脑") + "？", message: nil, preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: MobileStrings.text("取消"), style: .cancel))
+            alert.addAction(UIAlertAction(title: MobileStrings.text("移除"), style: .destructive) { _ in DshMobileStore.remove(id); self?.defaults.removeObject(forKey: "last-opened:dsh:" + id); self?.home() }); self?.present(alert, animated: true)
+        }
+        remove.configuration?.baseForegroundColor = .systemRed
+        let actions = UIStackView(arrangedSubviews: [open, remove]); actions.axis = .horizontal; actions.distribution = .fillEqually; actions.spacing = 8
+        return card([label("DSH Mobile", size: 17, weight: .semibold), label(url.map(DshMobileURL.display) ?? MobileStrings.text("连接凭据不可用"), size: 13, secondary: true), actions])
+    }
     private func computerName(_ address: String) -> String {
-        defaults.string(forKey: "name:" + address) ?? URL(string: address)?.host ?? address
+        let id=channelRecord(address)?["deviceId"] as? String ?? address
+        return defaults.string(forKey:"name:"+id) ?? defaults.string(forKey:"name:"+address) ?? channelRecord(address)?["name"] as? String ?? URL(string:address)?.host ?? address
     }
     private func renameComputer(_ address: String) {
         let alert = UIAlertController(title: MobileStrings.text("重命名电脑"), message: address + "\n" + MobileStrings.text("留空恢复默认名称"), preferredStyle: .alert)
@@ -386,7 +927,7 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
             guard let self else { return }
             let name = (alert?.textFields?.first?.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             guard name.count <= 80 else { self.info(MobileStrings.text("名称最多 80 个字符")); return }
-            if name.isEmpty { self.defaults.removeObject(forKey: "name:" + address) } else { self.defaults.set(name, forKey: "name:" + address) }
+            let id=self.channelRecord(address)?["deviceId"] as? String ?? address;self.defaults.removeObject(forKey:"name:"+address);if name.isEmpty {self.defaults.removeObject(forKey:"name:"+id)} else {self.defaults.set(name,forKey:"name:"+id)}
             self.home()
         })
         present(alert, animated: true)
@@ -399,7 +940,7 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
         apps.arrangedSubviews.forEach { apps.removeArrangedSubview($0); $0.removeFromSuperview() }
         for row in ComputerNotificationSummary.clients(data) {
             guard let provider = row["id"] as? String else { continue }
-            let name = ["codex": "Codex", "claude": "Claude", "deepseek": "DeepSeek Harness"][provider] ?? provider
+            let name = ["codex": "Codex", "claude": "Claude", "deepseek": "DeepSeek Harness", "zcode": "ZCode", "antigravity": "Antigravity"][provider] ?? provider
             let count = max(0, row["unread"] as? Int ?? 0)
             let button = UIButton(type: .custom); button.translatesAutoresizingMaskIntoConstraints = false
             button.alpha = row["connected"] as? Bool == false ? 0.5 : 1
@@ -420,14 +961,19 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
     }
     private func checkComputers() {
         stopComputerChecks()
-        guard web == nil, UIApplication.shared.applicationState == .active, !computerStates.isEmpty else { return }
+        guard web == nil, UIApplication.shared.applicationState == .active, !addressLists.isEmpty else { return }
         let revision = computerRevision
+        for address in addressLists.keys {
+            if let d=channelRecord(address){
+                sweep(address,d,targets:addresses(address),current:{self.computerRevision==revision && self.web==nil},sample:{_,_,_ in self.paintAddresses(address)},exhausted:{})
+            }
+        }
         for (address, label) in computerStates {
-            label.text = MobileStrings.text("检查中…"); label.textColor = .secondaryLabel
+            label.text = "○"; label.textColor = .secondaryLabel
             let probe = GatewayReachability(); computerProbes.append(probe)
             probe.start(address) { [weak self, weak label] online in
                 guard let self, self.computerRevision == revision, self.web == nil else { return }
-                label?.text = (online ? "● " : "○ ") + MobileStrings.text(online ? "在线" : "暂不可达")
+                label?.text = online ? "●" : "○"
                 label?.textColor = online ? .systemGreen : .secondaryLabel
             }
         }
@@ -438,17 +984,39 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
         a.addTextField { field in field.text = "https://"; field.keyboardType = .URL; field.autocapitalizationType = .none; field.autocorrectionType = .no; field.placeholder = "https://codex.try2love.com" }
         a.addAction(UIAlertAction(title: MobileStrings.text("取消"), style: .cancel)); a.addAction(UIAlertAction(title: MobileStrings.text("继续"), style: .default) { [weak self, weak a] _ in self?.choose(a?.textFields?.first?.text ?? "") }); present(a, animated: true)
     }
+    private func manualDsh() {
+        let alert = UIAlertController(title: "DSH Mobile", message: MobileStrings.text("粘贴 DSH 客户端 Mobile 功能提供的完整链接"), preferredStyle: .alert)
+        alert.addTextField { $0.placeholder = "https://…/?auth=…"; $0.keyboardType = .URL; $0.autocapitalizationType = .none; $0.autocorrectionType = .no }
+        alert.addAction(UIAlertAction(title: MobileStrings.text("取消"), style: .cancel))
+        alert.addAction(UIAlertAction(title: MobileStrings.text("继续"), style: .default) { [weak self, weak alert] _ in self?.chooseDsh(alert?.textFields?.first?.text ?? "") }); present(alert, animated: true)
+    }
+    private func chooseDsh(_ value: String) {
+        do {
+            let url = try DshMobileURL.connection(value)
+            let alert = UIAlertController(title: MobileStrings.text("连接 DSH Mobile？"), message: DshMobileURL.display(url) + MobileStrings.text("\n请确认这是你自己的 DSH 客户端。将打开它自带的手机界面。"), preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: MobileStrings.text("取消"), style: .cancel))
+            alert.addAction(UIAlertAction(title: MobileStrings.text("连接"), style: .default) { [weak self] _ in
+                do { let id = try DshMobileStore.save(url); self?.openDsh(url, id: id) } catch { self?.info(MobileStrings.text("无法保存 DSH Mobile 连接")) }
+            }); present(alert, animated: true)
+        } catch { info(error.localizedDescription) }
+    }
+    private func openDsh(_ url: URL, id: String) {
+        defaults.set(Date().timeIntervalSince1970, forKey: "last-opened:dsh:" + id); home()
+        let controller = UINavigationController(rootViewController: DshMobileController(url)); controller.modalPresentationStyle = .fullScreen
+        controller.overrideUserInterfaceStyle = overrideUserInterfaceStyle; present(controller, animated: true)
+    }
     func choose(_ value: String) {
         do { let url = try GatewayURL.connection(value); let address = try GatewayURL.origin(value)
             let alert = UIAlertController(title: MobileStrings.text("连接到这台电脑？"), message: address + MobileStrings.text("\n请确认这是你自己的网关。"), preferredStyle: .alert)
-            alert.addAction(UIAlertAction(title: MobileStrings.text("取消"), style: .cancel)); alert.addAction(UIAlertAction(title: MobileStrings.text("连接"), style: .default) { _ in self.connect(url, address: address) }); present(alert, animated: true)
-        } catch { info(error.localizedDescription) }
+            alert.addAction(UIAlertAction(title: MobileStrings.text("取消"), style: .cancel)); alert.addAction(UIAlertAction(title: MobileStrings.text("连接"), style: .default) { _ in self.connect(url, address: address) })
+            alert.addAction(UIAlertAction(title: "DSH Mobile", style: .default) { [weak self] _ in self?.chooseDsh(value) }); present(alert, animated: true)
+        } catch { chooseDsh(value) }
     }
     func openNotification(_ address: String, thread: String?, host: String) {
         guard saved.contains(address) else { info(MobileStrings.text("请先连接通知对应的电脑。")); return }
         if let thread, let target = try? GatewayURL.chat(address, thread: thread, host: host) { connect(target, address: address) } else { openSaved(address) }
     }
-    func openSaved(_ address: String, provider: String? = nil) { let suffix = provider.flatMap { ["codex", "claude", "deepseek"].contains($0) ? "?client=" + $0 : nil } ?? ""; guard saved.contains(address), let url = URL(string: address + "/" + suffix) else { info(MobileStrings.text("请先扫码保存通知对应的电脑。")); return }; connect(url, address: address) }
+    func openSaved(_ address: String, provider: String? = nil) { let suffix = provider.flatMap { ["codex", "claude", "deepseek", "zcode", "antigravity"].contains($0) ? "?client=" + $0 : nil } ?? ""; guard saved.contains(address), let url = URL(string: address + "/" + suffix) else { info(MobileStrings.text("请先扫码保存通知对应的电脑。")); return }; openComputer(address,url) }
     private func binding(_ address: String, done: @escaping (HTTPCookie?) -> Void) {
         WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
             done(cookies.first { self.cookieMatches($0, address: address) })
@@ -460,7 +1028,12 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
             let sent = sentCookies.filter { self.cookieMatches($0, address: address, discover: true) }
             guard !sent.isEmpty else { return }
         self.fetch(address: address, route: "/api/auth") { result in
-            guard ticket == self.generation, case .success(let auth) = result else { return }
+            guard ticket == self.generation else { return }
+            guard case .success(let auth) = result else {
+                self.uuAvailability = "unavailable"
+                self.web?.evaluateJavaScript("window.BridgeUURemote?.refresh()",completionHandler:nil)
+                return
+            }
             self.binding(address) { cookie in
                 guard let cookie, ticket == self.generation else { return }
                 self.binding(address) { current in
@@ -471,6 +1044,14 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
                        (auth["cookieName"] as? String ?? "codex_mobile_session") == cookie.name {
                         DeviceBinding.save(address, .init(name: cookie.name, token: cookie.value))
                     } else if auth["authenticated"] as? Bool == false { DeviceBinding.clear(address) }
+                    if auth["authenticated"] as? Bool==true && self.arrivingVia==address {self.arrivingVia=nil;self.routeNotice(MobileStrings.text("已切换连接信道")+" · "+address)}
+                    let platform = (auth["computer"] as? [String:Any])?["platform"] as? String ?? ""
+                    self.uu.scope = auth["authenticated"] as? Bool == true && ["Darwin","Windows"].contains(platform)
+                        ? UURemote.device(cookie.name) : ""
+                    self.uuAvailability = !self.uu.scope.isEmpty ? "ready"
+                        : auth["authenticated"] as? Bool == true && !platform.isEmpty ? "unsupported" : "unavailable"
+                    self.web?.evaluateJavaScript("window.BridgeUURemote?.refresh()",completionHandler:nil)
+                    self.enrollChannels(auth,address:address,cookie:cookie,ticket:ticket)
                     self.defaults.set(ConnectionDiscovery.descriptor(auth, secret: cookie.value), forKey: "connection:" + address)
                 }
             }
@@ -479,30 +1060,30 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
     }
     private func loadWithRecovery(_ web: WKWebView, url: URL, address: String, ticket: Int) {
         Task { @MainActor in
-            guard let backup = DeviceBinding.load(address) else { if ticket == generation && self.web === web { web.load(URLRequest(url: url)) }; return }
+            guard let backup = DeviceBinding.load(address) else { if ticket == generation && self.web === web { loadNative(web, URLRequest(url: url)) }; return }
             let store = WKWebsiteDataStore.default().httpCookieStore
             let cookies = await withCheckedContinuation { continuation in store.getAllCookies { continuation.resume(returning: $0) } }
             let before = cookies.first { cookieMatches($0, address: address) }
             if before?.name == backup.name && before?.value == backup.token {
-                if ticket == generation && self.web === web { web.load(URLRequest(url: url)) }; return
+                if ticket == generation && self.web === web { loadNative(web, URLRequest(url: url)) }; return
             }
             if let before {
                 let current = await DeviceBinding.verify(address, .init(name: before.name, token: before.value))
-                if current == true || current == nil { if ticket == generation && self.web === web { web.load(URLRequest(url: url)) }; return }
+                if current == true || current == nil { if ticket == generation && self.web === web { loadNative(web, URLRequest(url: url)) }; return }
             }
             let valid = await DeviceBinding.verify(address, backup)
             if valid == false, DeviceBinding.load(address)?.cookie == backup.cookie { DeviceBinding.clear(address) }
             guard ticket == generation, self.web === web, saved.contains(address) else { return }
             guard valid == true, DeviceBinding.load(address)?.cookie == backup.cookie,
-                  let host = URL(string: address)?.host else { web.load(URLRequest(url: url)); return }
+                  let host = URL(string: address)?.host else { loadNative(web, URLRequest(url: url)); return }
             var properties: [HTTPCookiePropertyKey: Any] = [.name: backup.name, .value: backup.token, .domain: host,
                 .path: GatewayURL.cookiePath(address), .expires: Date().addingTimeInterval(400 * 86400),
                 HTTPCookiePropertyKey("HttpOnly"): "TRUE", HTTPCookiePropertyKey("SameSite"): "Strict"]
             if address.hasPrefix("https://") { properties[.secure] = "TRUE" }
-            guard let restored = HTTPCookie(properties: properties) else { web.load(URLRequest(url: url)); return }
+            guard let restored = HTTPCookie(properties: properties) else { loadNative(web, URLRequest(url: url)); return }
             let latest = await withCheckedContinuation { continuation in store.getAllCookies { continuation.resume(returning: $0) } }
             guard latest.first(where: { cookieMatches($0, address: address) })?.value == before?.value,
-                  DeviceBinding.load(address)?.cookie == backup.cookie else { web.load(URLRequest(url: url)); return }
+                  DeviceBinding.load(address)?.cookie == backup.cookie else { loadNative(web, URLRequest(url: url)); return }
             await withCheckedContinuation { continuation in store.setCookie(restored) { continuation.resume() } }
             guard ticket == generation, self.web === web, saved.contains(address),
                   DeviceBinding.load(address)?.cookie == backup.cookie else {
@@ -511,10 +1092,16 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
                 return
             }
             defaults.set(backup.name, forKey: "cookieName:" + address)
-            web.load(URLRequest(url: url))
+            loadNative(web, URLRequest(url: url))
         }
     }
-    private func recoverConnection() {
+    private func loadNative(_ web: WKWebView, _ request: URLRequest) {
+        guard self.web === web, connectionError == nil else { return }
+        nativeMainNavigation = request.url.map { (web, generation, $0.absoluteString) }
+        web.load(request)
+    }
+    private func recoverConnection() { if !checkChannels(failure: true) { recoverLegacy() } }
+    private func recoverLegacy() {
         guard !routeAttempted, UIApplication.shared.applicationState == .active, let requested = requestedRoute,
               let descriptor = defaults.dictionary(forKey: "connection:" + origin) as? [String: String] else { return }
         routeAttempted = true
@@ -547,6 +1134,7 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
                 guard current() else { return }
                 store.delete(cookie) {
                 guard current() else { return }
+                if !self.saved.contains(next) { self.defaults.set(!self.notificationSourceEnabled(address), forKey: "notificationsMuted:" + next) }; self.defaults.removeObject(forKey: "notificationsMuted:" + address)
                 var all = self.saved.filter { $0 != address }; if !all.contains(next) { all.append(next) }; self.defaults.set(all, forKey: "origins")
                 self.defaults.set(descriptor, forKey: "connection:" + next); self.defaults.removeObject(forKey: "connection:" + address)
                 if let name = self.defaults.string(forKey: "cookieName:" + address) { self.defaults.set(name, forKey: "cookieName:" + next) }; self.defaults.removeObject(forKey: "cookieName:" + address)
@@ -555,11 +1143,11 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
                 for prefix in ["name:", "computer-name:", "cursor:", "stream:", "last-opened:"] {
                     if let value = self.defaults.object(forKey: prefix + address) { self.defaults.set(value, forKey: prefix + next) }; self.defaults.removeObject(forKey: prefix + address)
                 }
-                self.connect(target, address: next); self.pendingStorage = snapshot; self.routeAttempted = true
+                self.connect(target, address: next); self.pendingStorage = snapshot; self.routeAttempted = true; self.arrivingVia=next
                 }
             }
         }
-        if let web, let url = web.url, GatewayURL.same(url, address) {
+        if let web, let url = web.url, GatewayURL.same(url, documentAddress) {
             web.evaluateJavaScript("(()=>{if(typeof saveDraft==='function')saveDraft();return JSON.stringify(Object.fromEntries(Object.entries(localStorage)));})()") { value, _ in
                 guard ticket == self.generation else { return }
                 if let text = value as? String, text.utf8.count < 524288, let data = text.data(using: .utf8), (try? JSONSerialization.jsonObject(with: data)) is [String: String] { snapshot = text }
@@ -568,40 +1156,75 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
         } else { finish() }
     }
     private func connect(_ url: URL, address: String) {
+        if saved.contains(address),!channelEnabled(address){openComputer(address,url);return}
         routeAttempted = false; requestedRoute = url
         let scripts: WebScripts
         do { scripts = try WebScripts() }
         catch { info(error.localizedDescription); return }
         if origin != address, #available(iOS 16.2, *) { Task { await LiveActivityController.shared.stop() } }
-        clear(); navigation(home: false); subtitle.isHidden = false; origin = address; var all = saved; if !all.contains(address) { all.append(address) }; defaults.set(all, forKey: "origins"); defaults.set(address, forKey: "active"); defaults.set(Date().timeIntervalSince1970, forKey: "last-opened:" + address); subtitle.text = MobileStrings.text("正在连接 · ") + address
+        clear(); navigation(home: false); subtitle.isHidden = false; origin = address; documentAddress=address; var all = saved; if !all.contains(address) { all.append(address) }; defaults.set(all, forKey: "origins"); defaults.set(address, forKey: "active"); defaults.set(Date().timeIntervalSince1970, forKey: "last-opened:" + address); subtitle.text = MobileStrings.text("正在连接 · ") + computerName(address)
         let configuration = WKWebViewConfiguration(); configuration.websiteDataStore = .default(); configuration.applicationNameForUserAgent = "BridgeMobile/0.1-iOS"
+        configuration.preferences.javaScriptCanOpenWindowsAutomatically=true
         configuration.ignoresViewportScaleLimits = false
         configuration.userContentController.addUserScript(WKUserScript(source: WebScripts.fixedViewport, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        configuration.userContentController.addUserScript(WKUserScript(source: "window.BridgeMobileCapabilities = Object.freeze({ diagnosticsExport: true });", injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         clipboardToken = UUID().uuidString
-        let appearanceScript = scripts.appearance.replacingOccurrences(of: "__BRIDGE_CLIPBOARD_TOKEN__", with: clipboardToken) + "\ndocument.addEventListener('bridge-authenticated', () => window.prompt('codexbridge-session:" + clipboardToken + "', ''));document.addEventListener('bridge-logged-out', () => window.prompt('codexbridge-logout:" + clipboardToken + "', ''));document.addEventListener('bridge-auth-lost', () => window.prompt('codexbridge-auth-lost:" + clipboardToken + "', ''));"
+        let connectionName = String(decoding: (try? JSONEncoder().encode(computerName(address))) ?? Data("null".utf8), as: UTF8.self)
+        let nativeLanguage = (defaults.string(forKey: "bridge-language") ?? Locale.preferredLanguages.first ?? "zh").hasPrefix("en") ? "en" : "zh"
+        routeScript=scripts.route
+        let appearanceScript = (scripts.route+"\n"+scripts.appearance).replacingOccurrences(of: "__BRIDGE_CLIPBOARD_TOKEN__", with: clipboardToken).replacingOccurrences(of:"__BRIDGE_ROUTE_BOUND__",with:channelRecord(address)==nil ? "no":"yes").replacingOccurrences(of: "'__BRIDGE_CONNECTION_NAME__'", with: connectionName) + "\ndocument.addEventListener('bridge-authenticated', () => window.prompt('codexbridge-session:" + clipboardToken + "', ''));document.addEventListener('bridge-logged-out', () => window.prompt('codexbridge-logout:" + clipboardToken + "', ''));document.addEventListener('bridge-auth-lost', () => window.prompt('codexbridge-auth-lost:" + clipboardToken + "', ''));"
         configuration.userContentController.addUserScript(WKUserScript(source: appearanceScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
-        let clipboardScript = scripts.clipboard.replacingOccurrences(of: "__BRIDGE_CLIPBOARD_TOKEN__", with: clipboardToken)
+        #if compiler(>=6.1)
+        if #available(iOS 18.4, *) {
+            let uploadScript = "window.BridgeUploadSource = (source, accept) => navigator.userActivation?.isActive && window.prompt('codexbridge-upload-source:" + clipboardToken + "', source + (source !== 'files' && accept && !accept.includes('video') ? '-images' : '')) === 'selected';"
+            configuration.userContentController.addUserScript(WKUserScript(source: uploadScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        }
+        #endif
+        let clipboardScript = scripts.clipboard.replacingOccurrences(of: "__BRIDGE_CLIPBOARD_TOKEN__", with: clipboardToken).replacingOccurrences(of: "'__BRIDGE_NATIVE_LANGUAGE__'", with: "\"" + nativeLanguage + "\"")
         configuration.userContentController.addUserScript(WKUserScript(source: clipboardScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         let systemBarsScript = scripts.systemBars.replacingOccurrences(of: "__BRIDGE_CLIPBOARD_TOKEN__", with: clipboardToken)
         configuration.userContentController.addUserScript(WKUserScript(source: systemBarsScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         let web = WKWebView(frame: .zero, configuration: configuration); self.web = web; web.scrollView.contentInsetAdjustmentBehavior = .never; web.navigationDelegate = self; web.uiDelegate = self; web.allowsBackForwardNavigationGestures = true; web.customUserAgent = nil; page.addArrangedSubview(web); gatewayMenuTop = gatewayMenu.topAnchor.constraint(equalTo: web.topAnchor, constant: 4); gatewayMenuTop?.isActive = true; loadWithRecovery(web, url: url, address: address, ticket: generation)
+        let ticket = generation
+        let deadline = DispatchWorkItem { [weak self, weak web] in
+            guard let self, let web, ticket == self.generation, self.web === web, self.connectionError == nil else { return }
+            self.connectionDeadline = nil; web.stopLoading(); self.showConnectionError(status: nil); self.recoverConnection()
+        }
+        connectionDeadline = deadline; DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: deadline)
         web.scrollView.pinchGestureRecognizer?.isEnabled = false
     }
-    @objc private func refresh() { routeAttempted = false; web?.reload() }
+    @objc private func refresh() { routeAttempted = false; if documentAddress != origin,let uri=web?.url,GatewayURL.same(uri,documentAddress),let next=URL(string:origin+uri.absoluteString.dropFirst(documentAddress.count)){connect(next,address:origin);return};if let web { nativeMainNavigation = web.url.map { (web, generation, $0.absoluteString) }; web.reload() } }
     func webView(_ webView: WKWebView, decidePolicyFor response: WKNavigationResponse, decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
-        let recover = webView === web && response.isForMainFrame && response.response.url.map { GatewayURL.same($0, origin) } == true && ConnectionDiscovery.retryableStatus((response.response as? HTTPURLResponse)?.statusCode ?? 0)
-        decisionHandler(.allow)
-        if recover { recoverConnection() }
+        let status = (response.response as? HTTPURLResponse)?.statusCode ?? 0
+        if let peer=peerViews[webView] {decisionHandler((response.response.url?.absoluteString.components(separatedBy:"#").first==peer.next+"/mobile-channel" && status==200) ? .allow:.cancel);return}
+        let recover = webView === web && response.isForMainFrame && response.response.url.map { GatewayURL.same($0, documentAddress) } == true && ConnectionDiscovery.retryableStatus(status)
+        // Tunnel and proxy error pages (e.g. Cloudflare 1033/530) carry no gateway navigation; keep the way back native.
+        decisionHandler(recover ? .cancel : .allow)
+        if recover { showConnectionError(status: status); recoverConnection() }
     }
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         guard let url = action.request.url else { decisionHandler(.cancel); return }
-        if url.absoluteString == "codexbridge://home", action.sourceFrame.isMainFrame, action.navigationType == .linkActivated, let source = webView.url, GatewayURL.same(source, origin) { decisionHandler(.cancel); home(); return }
+        if let peer=peerViews[webView]{decisionHandler(action.request.url?.absoluteString==peer.document ? .allow:.cancel);return}
+        if webView===web,action.sourceFrame.isMainFrame,action.targetFrame==nil,let peer=pendingPeer,url.absoluteString==peer.document{decisionHandler(.allow);return}
+        if action.targetFrame?.isMainFrame == false {
+            decisionHandler(isIsolatedShell(url) ? .allow : .cancel); return
+        }
+        if action.targetFrame?.isMainFrame == true, nativeMainNavigation?.web === webView {
+            let expected = nativeMainNavigation
+            nativeMainNavigation = nil
+            if !action.sourceFrame.isMainFrame {
+                guard action.navigationType == .other, expected?.generation == generation,
+                      expected?.url == url.absoluteString, GatewayURL.same(url, documentAddress) else { decisionHandler(.cancel); return }
+            }
+        } else if !action.sourceFrame.isMainFrame { decisionHandler(.cancel); return }
+        if isIsolatedShell(url) { decisionHandler(.cancel); return }
+        if url.absoluteString == "codexbridge://home", action.sourceFrame.isMainFrame, action.navigationType == .linkActivated, let source = webView.url, GatewayURL.same(source, documentAddress) { decisionHandler(.cancel); home(); return }
         if action.navigationType == .linkActivated, action.sourceFrame.isMainFrame,
-           let source = webView.url, GatewayURL.same(source, origin), isArtifact(url) {
+           let source = webView.url, GatewayURL.same(source, documentAddress), isArtifact(url) {
             decisionHandler(.cancel); downloadArtifact(action.request); return
         }
-        if GatewayURL.same(url, origin) {
-            if action.targetFrame == nil { decisionHandler(.cancel); webView.load(action.request) }
+        if GatewayURL.same(url, documentAddress) {
+            if action.targetFrame == nil { decisionHandler(.cancel); loadNative(webView, action.request) }
             else { decisionHandler(.allow) }
             return
         }
@@ -610,60 +1233,149 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
             let a = UIAlertController(title: MobileStrings.text("在浏览器打开外部链接？"), message: url.host, preferredStyle: .alert); a.addAction(UIAlertAction(title: MobileStrings.text("取消"), style: .cancel)); a.addAction(UIAlertAction(title: MobileStrings.text("打开"), style: .default) { _ in UIApplication.shared.open(url) }); present(a, animated: true)
         }
     }
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { guard webView === web, let url = webView.url, GatewayURL.same(url, origin) else { return }; subtitle.isHidden = true; registerNativePush(); rememberConnection()
-        if let snapshot = pendingStorage { pendingStorage = nil; webView.evaluateJavaScript("(()=>{const data=" + snapshot + ";for(const [k,v] of Object.entries(data))if(typeof v==='string')localStorage.setItem(k,v);location.reload();})()", completionHandler: nil) }
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        guard webView === web, connectionError == nil, let url = webView.url, GatewayURL.same(url, documentAddress) else { return }
+        channelTicket+=1;rollbackPeer()
+        connectionDeadline?.cancel(); connectionDeadline = nil; hideEntryProgress();subtitle.isHidden = true
+        syncWebTheme()
     }
-    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { guard webView === web else { return }; subtitle.isHidden = false; subtitle.text = MobileStrings.text("连接失败，请检查电脑和地址后刷新"); recoverConnection() }
-    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { guard webView === web else { return }; recoverConnection() }
-    func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) { let a = UIAlertController(title: nil, message: message, preferredStyle: .alert); a.addAction(UIAlertAction(title: MobileStrings.text("好"), style: .default) { _ in completionHandler() }); present(a, animated: true) }
-    func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) { let a = UIAlertController(title: nil, message: message, preferredStyle: .alert); a.addAction(UIAlertAction(title: MobileStrings.text("取消"), style: .cancel) { _ in completionHandler(false) }); a.addAction(UIAlertAction(title: MobileStrings.text("确认"), style: .default) { _ in completionHandler(true) }); present(a, animated: true) }
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        if let peer=peerViews[webView]{
+            if pendingPeer===peer,webView.url?.absoluteString==peer.document{
+                webView.evaluateJavaScript(routeScript+";window.BridgeChannelLink.worker("+peer.arguments([documentAddress,peer.nonce,peer.device])+")",completionHandler:nil)
+            }
+            return
+        }
+        if nativeMainNavigation?.web === webView { nativeMainNavigation = nil }; guard webView === web, connectionError == nil, let url = webView.url, GatewayURL.same(url, documentAddress) else { return }; hideEntryProgress();pageReady=true;subtitle.isHidden = true; registerNativePush(); rememberConnection()
+        syncWebTheme()
+        if let snapshot = pendingStorage, let encoded = try? JSONEncoder().encode(snapshot) { pendingStorage = nil; webView.evaluateJavaScript("(()=>{const data=JSON.parse(" + String(decoding:encoded,as:UTF8.self) + ");if(data.version===2){window.BridgeMobileHandoff?.restore(data);return;}for(const [k,v] of Object.entries(data))if(typeof v==='string')localStorage.setItem(k,v);location.reload();})()", completionHandler: nil) }
+    }
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { if nativeMainNavigation?.web === webView { nativeMainNavigation = nil }; guard webView === web, connectionError == nil else { return }
+        let failure = error as NSError
+        guard failure.domain != NSURLErrorDomain || failure.code != NSURLErrorCancelled else { return }
+        subtitle.isHidden = false; subtitle.text = MobileStrings.text("连接失败，请检查电脑和地址后刷新")
+        showConnectionError(status: nil)
+        recoverConnection()
+    }
+    private func showConnectionError(status: Int?) {
+        guard connectionError == nil, let route = requestedRoute else { return }
+        pendingEntry=nil;connectionDeadline?.cancel(); connectionDeadline = nil
+        hideEntryProgress();let address = origin, ticket = generation
+        updateSystemBars(reset: true); web?.isHidden = true; subtitle.isHidden = true; gatewayMenu.isHidden = true
+        let container = UIView(); page.addArrangedSubview(container); connectionError = container; let content = scrollContent(in: container)
+        let visual = UIImageView(image: UIImage(systemName: "wifi.exclamationmark")); visual.tintColor = .secondaryLabel; visual.contentMode = .scaleAspectFit; visual.heightAnchor.constraint(equalToConstant: 48).isActive = true
+        let heading = label(MobileStrings.text("暂时无法连接电脑"), size: 22, weight: .semibold); heading.textAlignment = .center
+        let hint = label(MobileStrings.text("网关暂时无法访问。请检查电脑和网络后重试，或返回电脑列表。"), secondary: true); hint.textAlignment = .center
+        let detail = label(computerName(address) + (status.map { " · HTTP \($0)" } ?? ""), size: 13, secondary: true); detail.textAlignment = .center
+        let hero = column(spacing: 12); [visual, heading, hint, detail].forEach(hero.addArrangedSubview); hero.setCustomSpacing(20, after: visual)
+        content.addArrangedSubview(hero)
+        content.addArrangedSubview(card([button(MobileStrings.text("重试"), symbol: "arrow.clockwise", primary: true) { [weak self] in
+            guard let self, ticket == self.generation, self.saved.contains(address) else { return }; self.openComputer(address,route)
+        }, button(MobileStrings.text("管理这台电脑"),symbol:"slider.horizontal.3"){[weak self] in self?.manageComputer(address)
+        }, button(MobileStrings.text("返回电脑列表"), symbol: "desktopcomputer") { [weak self] in self?.home() }]))
+    }
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { if nativeMainNavigation?.web === webView { nativeMainNavigation = nil }; guard webView === web else { return }; recoverConnection() }
+    func webView(_ webView: WKWebView, runJavaScriptAlertPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping () -> Void) { guard frame.isMainFrame else { completionHandler(); return }; let a = UIAlertController(title: nil, message: message, preferredStyle: .alert); a.addAction(UIAlertAction(title: MobileStrings.text("好"), style: .default) { _ in completionHandler() }); present(a, animated: true) }
+    func webView(_ webView: WKWebView, runJavaScriptConfirmPanelWithMessage message: String, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (Bool) -> Void) { guard frame.isMainFrame else { completionHandler(false); return }; let a = UIAlertController(title: nil, message: message, preferredStyle: .alert); a.addAction(UIAlertAction(title: MobileStrings.text("取消"), style: .cancel) { _ in completionHandler(false) }); a.addAction(UIAlertAction(title: MobileStrings.text("确认"), style: .default) { _ in completionHandler(true) }); present(a, animated: true) }
     func webView(_ webView: WKWebView, runJavaScriptTextInputPanelWithPrompt prompt: String, defaultText: String?, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping (String?) -> Void) {
+        guard webView===web else{completionHandler(nil);return}
+        if prompt == "codexbridge-upload-source:" + clipboardToken {
+            guard webView === web, connectionError == nil, UIApplication.shared.applicationState == .active,
+                  frame.isMainFrame, let source = frame.request.url, GatewayURL.same(source, documentAddress),
+                  let current = webView.url, GatewayURL.same(current, documentAddress), presentedViewController == nil,
+                  let value = defaultText, ["photos", "files", "photos-images"].contains(value) else { completionHandler(nil); return }
+            uploadSource = (value, Date()); completionHandler("selected"); return
+        }
+        if prompt == "codexbridge-uu:" + clipboardToken {
+            if connectionError == nil, UIApplication.shared.applicationState == .active, frame.isMainFrame,
+               let source = frame.request.url, GatewayURL.same(source, documentAddress),
+               let current = webView.url, GatewayURL.same(current, documentAddress),
+               let command = defaultText, ["read","retry"].contains(command) {
+                if command == "retry", saved.contains(origin) { uuAvailability = "checking"; rememberConnection() }
+                completionHandler(uuContext() ? uu.settings("read") : "{\"supported\":false,\"availability\":\"" + uuAvailability + "\"}")
+                return
+            }
+            guard uuContext(), UIApplication.shared.applicationState == .active, frame.isMainFrame,
+                  let source = frame.request.url, GatewayURL.same(source, documentAddress),
+                  let command = defaultText, ["enable","disable","forget"].contains(command) else { completionHandler(nil); return }
+            completionHandler(uu.settings(command)); return
+        }
+        if prompt == "codexbridge-theme:" + clipboardToken {
+            guard webView === web, connectionError == nil, UIApplication.shared.applicationState == .active,
+                  frame.isMainFrame, let source = frame.request.url, GatewayURL.same(source, documentAddress),
+                  let current = webView.url, GatewayURL.same(current, documentAddress),
+                  let value = defaultText, ["system", "light", "dark"].contains(value) else { completionHandler(nil); return }
+            defaults.set(value, forKey: "settingsTheme"); completionHandler("saved"); applyTheme(); return
+        }
         if prompt == "codexbridge-system-bars:" + clipboardToken {
             guard webView === web, UIApplication.shared.applicationState == .active, frame.isMainFrame,
-                  let source = frame.request.url, GatewayURL.same(source, origin),
-                  let current = webView.url, GatewayURL.same(current, origin),
+                  let source = frame.request.url, GatewayURL.same(source, documentAddress),
+                  let current = webView.url, GatewayURL.same(current, documentAddress),
                   let text = defaultText, text.utf16.count < 100, let data = text.data(using: .utf8),
                   let colors = try? JSONSerialization.jsonObject(with: data) as? [String: String],
                   let top = Self.barColor(colors["top"]), let bottom = Self.barColor(colors["bottom"]) else { completionHandler(nil); return }
             updateSystemBars(top: top, bottom: bottom); completionHandler("saved"); return
         }
-        if prompt == "codexbridge-computer:" + clipboardToken {
-            guard webView === web, frame.isMainFrame, let source = frame.request.url, GatewayURL.same(source, origin),
-                  let current = webView.url, GatewayURL.same(current, origin) else { completionHandler(nil); return }
-            completionHandler(computerName(origin)); return
+        if prompt == "codexbridge-modal:" + clipboardToken {
+            guard webView === web, connectionError == nil, UIApplication.shared.applicationState == .active,
+                  frame.isMainFrame, let source = frame.request.url, GatewayURL.same(source, documentAddress),
+                  let current = webView.url, GatewayURL.same(current, documentAddress),
+                  let state = defaultText, ["open", "closed"].contains(state) else { completionHandler(nil); return }
+            gatewayMenu.isHidden = state == "open"; gatewayMenu.isEnabled = state == "closed"
+            completionHandler("saved"); return
+        }
+        if prompt == "codexbridge-channels:" + clipboardToken {
+            guard web === webView,frame.isMainFrame,UIApplication.shared.applicationState == .active,
+                  let src=frame.request.url,GatewayURL.same(src, documentAddress),let page=webView.url,GatewayURL.same(page, documentAddress) else{completionHandler(nil);return}
+            if let peer=pendingPeer,defaultText=="ready:"+peer.nonce {
+                let token=clipboardToken,screen=generation,address=documentAddress
+                commitPeer(peer,eligible:{self.web===webView && self.generation==screen && self.clipboardToken==token &&
+                    self.documentAddress==address && UIApplication.shared.applicationState == .active &&
+                    webView.url==page && !webView.isLoading && webView.url.map{GatewayURL.same($0,address)}==true},reply:completionHandler)
+                return
+            }
+            if let cmd=defaultText,let answer=channelCommand(cmd){completionHandler(answer);return}
+            if defaultText=="settled"{let retry=deferredRoute;deferredRoute=nil;retry?()}
+            else if defaultText=="probe"{checkChannels(failure:false,inspect:true)}
+            else if let choice=defaultText,choice.hasPrefix("pick:"){checkChannels(failure:false,forced:String(choice.dropFirst(5)))}
+            completionHandler(channelMenu());return
+        }
+        if prompt == "codexbridge-channel-failure:" + clipboardToken {
+            if webView === web, frame.isMainFrame, let source = frame.request.url, GatewayURL.same(source, documentAddress) { checkChannels(failure:true) }
+            completionHandler(""); return
         }
         if prompt == "codexbridge-logout:" + clipboardToken {
             guard webView === web, UIApplication.shared.applicationState == .active, frame.isMainFrame,
-                  let source = frame.request.url, GatewayURL.same(source, origin),
-                  let current = webView.url, GatewayURL.same(current, origin) else { completionHandler(nil); return }
+                  let source = frame.request.url, GatewayURL.same(source, documentAddress),
+                  let current = webView.url, GatewayURL.same(current, documentAddress) else { completionHandler(nil); return }
             bindingRevision += 1
-            DeviceBinding.clear(origin)
+            clearChannels(origin);DeviceBinding.clear(origin)
             binding(origin) { cookie in if let cookie { WKWebsiteDataStore.default().httpCookieStore.delete(cookie) } }
             completionHandler("cleared"); return
         }
         if prompt == "codexbridge-auth-lost:" + clipboardToken {
             guard webView === web, UIApplication.shared.applicationState == .active, frame.isMainFrame,
-                  let source = frame.request.url, GatewayURL.same(source, origin),
-                  let current = webView.url, GatewayURL.same(current, origin), !authLossAttempted,
+                  let source = frame.request.url, GatewayURL.same(source, documentAddress),
+                  let current = webView.url, GatewayURL.same(current, documentAddress), !authLossAttempted,
                   let target = URL(string: origin + "/") else { completionHandler(nil); return }
             authLossAttempted = true; loadWithRecovery(webView, url: target, address: origin, ticket: generation)
             completionHandler("recovering"); return
         }
         if prompt == "codexbridge-session:" + clipboardToken {
             guard webView === web, UIApplication.shared.applicationState == .active, frame.isMainFrame,
-                  let source = frame.request.url, GatewayURL.same(source, origin),
-                  let current = webView.url, GatewayURL.same(current, origin) else { completionHandler(nil); return }
+                  let source = frame.request.url, GatewayURL.same(source, documentAddress),
+                  let current = webView.url, GatewayURL.same(current, documentAddress) else { completionHandler(nil); return }
             authLossAttempted = false; rememberConnection(); completionHandler("saved"); return
         }
         if prompt == "codexbridge-language:" + clipboardToken {
-            guard webView === web, frame.isMainFrame, let source = frame.request.url, GatewayURL.same(source, origin),
-                  let current = webView.url, GatewayURL.same(current, origin), let language = defaultText, ["zh", "en"].contains(language) else { completionHandler(nil); return }
+            guard webView === web, frame.isMainFrame, let source = frame.request.url, GatewayURL.same(source, documentAddress),
+                  let current = webView.url, GatewayURL.same(current, documentAddress), let language = defaultText, ["zh", "en"].contains(language) else { completionHandler(nil); return }
             defaults.set(language, forKey: "bridge-language");updateGatewayMenu();completionHandler("saved");return
         }
         guard prompt == "codexbridge-copy:" + clipboardToken, webView === web,
               UIApplication.shared.applicationState == .active, frame.isMainFrame,
-              let source = frame.request.url, GatewayURL.same(source, origin),
-              let current = webView.url, GatewayURL.same(current, origin),
+              let source = frame.request.url, GatewayURL.same(source, documentAddress),
+              let current = webView.url, GatewayURL.same(current, documentAddress),
               let text = defaultText, text.utf16.count <= 262144 else { completionHandler(nil); return }
         UIPasteboard.general.string = text
         completionHandler("copied")
@@ -685,12 +1397,15 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
         setNeedsStatusBarAppearanceUpdate(); navigationController?.setNeedsStatusBarAppearanceUpdate()
     }
     private func isArtifact(_ url: URL) -> Bool {
-        DownloadManager.allows(url, origin: origin)
+        DownloadManager.allows(url, origin: documentAddress)
+    }
+    private func isIsolatedShell(_ url: URL) -> Bool {
+        url.absoluteString == documentAddress + "/html-preview-shell" || url.absoluteString == documentAddress + "/mermaid-render-shell" || url.absoluteString == documentAddress + "/visualize-shell"
     }
     private func downloadArtifact(_ request: URLRequest) {
         guard !downloadState.busy else { downloadPanel.expand(); info(MobileStrings.text("已有下载进行中，请稍候")); return }
         guard let url = request.url, isArtifact(url) else { return }
-        downloadPanel.expand(); downloads.start(url, origin: origin)
+        guard let physical=URL(string:origin+url.absoluteString.dropFirst(documentAddress.count)) else{return};downloadPanel.expand(); downloads.start(physical, origin: origin)
     }
     private func openDownload() {
         guard downloadState.phase == .complete, let file = downloadState.file, presentedViewController == nil else { return }
@@ -715,23 +1430,69 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
     #if compiler(>=6.1)
     @available(iOS 18.4, *)
     func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping @MainActor @Sendable ([URL]?) -> Void) {
-        guard webView === web, frame.isMainFrame, let source = frame.request.url, GatewayURL.same(source, origin),
-              let current = webView.url, GatewayURL.same(current, origin), presentedViewController == nil else { completionHandler(nil); return }
+        guard webView === web, frame.isMainFrame, let source = frame.request.url, GatewayURL.same(source, documentAddress),
+              let current = webView.url, GatewayURL.same(current, documentAddress), presentedViewController == nil else { completionHandler(nil); return }
+        let uploadKind = uploadSource.flatMap { Date().timeIntervalSince($0.at) < 2 ? $0.name : nil }
         finishUpload(nil)
+        uploadCompletion = completionHandler; uploadGeneration = generation
+        if uploadKind == "photos" || uploadKind == "photos-images" {
+            var config = PHPickerConfiguration(); config.preferredAssetRepresentationMode = .compatible; if uploadKind == "photos-images" { config.filter = .images }; config.selectionLimit = parameters.allowsMultipleSelection ? 10 : 1
+            let picker = PHPickerViewController(configuration: config); picker.delegate = self
+            mediaPicker = picker; present(picker, animated: true); picker.presentationController?.delegate = self; return
+        }
         let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.item], asCopy: true)
         picker.allowsMultipleSelection = parameters.allowsMultipleSelection; picker.delegate = self
         uploadPicker = picker; uploadCompletion = completionHandler; uploadGeneration = generation
-        present(picker, animated: true)
+        present(picker, animated: true); picker.presentationController?.delegate = self
     }
     #endif
     private func finishUpload(_ urls: [URL]?) {
-        let completion = uploadCompletion; uploadCompletion = nil; uploadPicker = nil
+        let completion = uploadCompletion; uploadCompletion = nil; uploadPicker = nil; mediaPicker = nil; uploadSource = nil; uploadTicket = UUID()
         completion?(urls)
+    }
+    func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+        let picker = presentationController.presentedViewController
+        if picker === uploadPicker || picker === mediaPicker { finishUpload(nil) }
+    }
+    private func mediaUploadFolder() throws -> URL {
+        if let folder = mediaUploadDirectory { return folder }
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("BridgeUpload-" + UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        mediaUploadDirectory = folder; return folder
+    }
+    func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+        guard picker === mediaPicker else { picker.dismiss(animated: true); return }
+        let ticket = uploadTicket
+        guard !results.isEmpty, let folder = try? mediaUploadFolder() else {
+            picker.dismiss(animated: true) { if ticket == self.uploadTicket { self.finishUpload(nil) } }; return
+        }
+        picker.dismiss(animated: true)
+        Task { @MainActor in
+            var urls = [URL]()
+            for result in results {
+                let provider = result.itemProvider
+                guard let type = provider.registeredTypeIdentifiers.first(where: { UTType($0)?.conforms(to: .image) == true || UTType($0)?.conforms(to: .movie) == true }) else { continue }
+                let saved: URL? = await withCheckedContinuation { continuation in
+                    provider.loadFileRepresentation(forTypeIdentifier: type) { url, _ in
+                        guard let url else { continuation.resume(returning: nil); return }
+                        let destination = folder.appendingPathComponent(UUID().uuidString).appendingPathExtension(url.pathExtension)
+                        do { try FileManager.default.copyItem(at: url, to: destination); continuation.resume(returning: destination) }
+                        catch { continuation.resume(returning: nil) }
+                    }
+                }
+                if let saved { urls.append(saved) }
+            }
+            guard ticket == uploadTicket, uploadGeneration == generation, let current = web?.url, GatewayURL.same(current, documentAddress) else {
+                for url in urls { try? FileManager.default.removeItem(at: url) }; return
+            }
+            if urls.count == results.count { finishUpload(urls) }
+            else { for url in urls { try? FileManager.default.removeItem(at: url) }; finishUpload(nil); info(MobileStrings.text("无法读取所选文件，请从系统文件选择器重新选择。")) }
+        }
     }
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
         if controller === exportPicker { exportPicker = nil; if !urls.isEmpty { downloads.markSaved() }; return }
         guard controller === uploadPicker else { return }
-        guard uploadGeneration == generation, let current = web?.url, GatewayURL.same(current, origin) else { finishUpload(nil); return }
+        guard uploadGeneration == generation, let current = web?.url, GatewayURL.same(current, documentAddress) else { finishUpload(nil); return }
         guard !urls.isEmpty, urls.allSatisfy({ $0.isFileURL && FileManager.default.isReadableFile(atPath: $0.path) }) else {
             finishUpload(nil)
             controller.dismiss(animated: true) { self.info(MobileStrings.text("无法读取所选文件，请从系统文件选择器重新选择。")) }
@@ -744,9 +1505,11 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
         if controller === exportPicker { exportPicker = nil }
     }
     func openLink(_ url: URL) {
+        if let result = uu.callback(url) { if !result.isEmpty { routeNotice(MobileStrings.text(result)) }; return }
         guard let c = URLComponents(url: url, resolvingAgainstBaseURL: false), c.scheme == "codexbridge", c.host == "open" else { return }
         let q = c.queryItems ?? []; func get(_ key: String) -> String? { q.first(where: { $0.name == key })?.value }
-        guard let address = get("origin"), saved.contains(address), let thread = get("thread"), let target = try? GatewayURL.chat(address, thread: thread, host: get("host") ?? "local") else { info(MobileStrings.text("请先扫码保存通知对应的电脑，再打开聊天。")); return }
+        guard let original = get("origin"), let thread = get("thread"), saved.contains(activeChannel(original)), let target = try? GatewayURL.chat(activeChannel(original), thread: thread, host: get("host") ?? "local") else { info(MobileStrings.text("请先扫码保存通知对应的电脑，再打开聊天。")); return }
+        let address = activeChannel(original)
         connect(target, address: address)
     }
     private func fetch(address requestedAddress: String? = nil, after: Int? = nil, poll: Int? = nil, route: String = "/api/mobile/events", body: [String: Any]? = nil, csrf: String? = nil, _ done: @escaping (Result<[String: Any], Error>) -> Void) {
@@ -774,7 +1537,7 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
                        name.range(of: #"^codex_mobile_session_[a-f0-9]{24}$"#, options: .regularExpression) != nil {
                         self.defaults.set(name, forKey: "cookieName:" + address)
                     }
-                    if poll != nil { self.pollTask = nil }
+                    if poll != nil { self.pollTasks.removeValue(forKey: address) }
                     let response = response as? HTTPURLResponse
                     let headers = response?.allHeaderFields as? [String: String] ?? [:]
                     let renewed = code == 200 && response?.url.map({ GatewayURL.same($0, address) }) == true ? HTTPCookie.cookies(withResponseHeaderFields: headers, for: target).first(where: { cookie in
@@ -804,7 +1567,7 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
                     }
                 }
             }
-            if poll != nil { self.pollTask = task }
+            if poll != nil { self.pollTasks[address] = task }
             task.resume()
         }
     }
@@ -871,35 +1634,33 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
             }
         }
     } }
-    @objc private func active() { computerNotifications.values.forEach { $0.alpha = 0.5 }; cancelSync(); checkComputers(); foregroundBaselines.removeAll();sync(); activityTimer?.invalidate(); activityTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.syncLiveActivity() }; syncLiveActivity(); timer?.invalidate(); timer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in self?.sync() } }
-    @objc private func inactive() { routeDiscovery?.cancel(); routeDiscovery = nil; routeAttempted = false; computerNotifications.values.forEach { $0.alpha = 0.5 }; cancelSync(); downloads.pause(); stopComputerChecks(); timer?.invalidate(); timer = nil; activityTimer?.invalidate(); activityTimer = nil; if #available(iOS 16.2, *) { Task { await LiveActivityController.shared.pause() } } }
+    @objc private func active() { if let entry=pendingEntry,entry.interrupted,web==nil,UIApplication.shared.applicationState == .active {openComputer(entry.address,entry.url)};watchChannels(); computerNotifications.values.forEach { $0.alpha = 0.5 }; cancelSync(); checkComputers(); foregroundBaselines.removeAll();sync(); activityTimer?.invalidate(); activityTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.syncLiveActivity() }; syncLiveActivity(); timer?.invalidate(); timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.sync() } }
+    @objc private func inactive() { pendingEntry?.interrupted=true;rollbackPeer();cancelChannelJobs();lastChannelProbe=nil;channelSignature="";channelTicket += 1; channelMonitor?.cancel(); channelMonitor = nil;channelCatalogTimer?.invalidate();channelCatalogTimer=nil; routeDiscovery?.cancel(); routeDiscovery = nil; routeAttempted = false; computerNotifications.values.forEach { $0.alpha = 0.5 }; cancelSync(); downloads.pause(); stopComputerChecks(); timer?.invalidate(); timer = nil; activityTimer?.invalidate(); activityTimer = nil; if #available(iOS 16.2, *) { Task { await LiveActivityController.shared.pause() } } }
     private func cancelSync() {
-        pollGeneration += 1; pollTask?.cancel(); pollTask = nil; loading = false
+        pollGeneration += 1; pollTasks.values.forEach { $0.cancel() }; pollTasks.removeAll(); polling.removeAll()
     }
     private func pollCurrent(_ ticket: Int) -> Bool {
         ticket == pollGeneration && UIApplication.shared.applicationState == .active
     }
     private func sync() {
-        guard UIApplication.shared.applicationState == .active, !loading else { return }
+        guard UIApplication.shared.applicationState == .active else { return }
         registerNativePush()
-        loading = true; pollGeneration += 1
         let ticket = pollGeneration
-        let addresses = saved
-        func next(_ index: Int) {
-            guard self.pollCurrent(ticket) else { return }
-            guard index < addresses.count else { self.loading = false; return }
-            let address = addresses[index]
-            guard self.saved.contains(address) else { next(index + 1); return }
+        // Each saved computer has one request in flight. A slow/offline gateway
+        // must not delay notifications from another computer.
+        for address in saved where channelEnabled(address) && !polling.contains(address) {
+            polling.insert(address)
             let after = self.defaults.integer(forKey: "cursor:" + address)
             self.fetch(address: address, after: after, poll: ticket) { result in
                 guard self.pollCurrent(ticket) else { return }
+                self.polling.remove(address)
                 if case .success(let data) = result, self.saved.contains(address) { self.updateComputerNotifications(data, address: address) }
                 else { if case .failure(let error) = result, [401, 403].contains((error as NSError).code) { self.computerSnapshots.removeValue(forKey: address); self.computerNotifications[address]?.arrangedSubviews.forEach { $0.removeFromSuperview() } }; self.updateComputerNotifications(nil, address: address) }
                 if self.saved.contains(address), case .success(let data) = result, data["enabled"] as? Bool == true, let stream = data["streamId"] as? String {
                     let key = "cursor:" + address, previous = self.defaults.integer(forKey: key)
                     let ready = self.foregroundBaselines.contains(address) && self.defaults.string(forKey: "stream:" + address) == stream
                     let cleared = self.defaults.integer(forKey: "cleared:" + address + ":" + stream)
-                    if ready, self.defaults.bool(forKey: "foregroundAlerts"), UIApplication.shared.applicationState == .active {
+                    if ready, self.defaults.bool(forKey: "foregroundAlerts"), self.notificationSourceEnabled(address), UIApplication.shared.applicationState == .active {
                         for event in data["events"] as? [[String: Any]] ?? [] where event["unread"] as? Bool != false && (event["sequence"] as? Int ?? 0) > max(previous, cleared) {
                             let content = UNMutableNotificationContent()
                             content.title = event["title"] as? String ?? MobileStrings.text("任务提醒")
@@ -907,7 +1668,7 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
                             content.sound = .default
                             NotificationSource.apply(content, provider: event["provider"] as? String, host: event["host"] as? String)
                             content.userInfo = ["origin": address, "thread": event["threadId"] as? String ?? "", "host": event["host"] as? String ?? "local", "sequence": event["sequence"] as? Int ?? 0]
-                            let identifier = address + ":" + stream + ":" + (event["id"] as? String ?? String(event["sequence"] as? Int ?? 0))
+                            let identifier = (self.channelRecord(address)?["deviceId"] as? String ?? address) + ":" + stream + ":" + (event["id"] as? String ?? String(event["sequence"] as? Int ?? 0))
                             UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: identifier, content: content, trigger: nil))
                         }
                     }
@@ -915,10 +1676,37 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
                     self.defaults.set(stream, forKey: "stream:" + address)
                     self.foregroundBaselines.insert(address)
                 }
-                next(index + 1)
             }
         }
-        next(0)
+    }
+    func notificationSourceEnabled(_ address: String) -> Bool {
+        !defaults.bool(forKey: "notificationsMuted:" + address)
+    }
+    private func setNotificationSource(_ address: String, enabled: Bool) {
+        guard saved.contains(address), notificationSourceEnabled(address) != enabled else { return }
+        defaults.set(!enabled, forKey: "notificationsMuted:" + address)
+        // Retire pending polls before baselining this source; other inbox cursors stay intact.
+        cancelSync(); foregroundBaselines.remove(address); sync()
+    }
+    private func sourceSwitch(_ text:UIView,name:String,on:Bool,changed:@escaping (Bool)->Void)->UIView {
+        let toggle=UISwitch();toggle.isOn=on;toggle.accessibilityLabel=name
+        toggle.addAction(UIAction { [weak toggle] _ in if let toggle {changed(toggle.isOn)} },for:.valueChanged)
+        toggle.setContentCompressionResistancePriority(.required,for:.horizontal)
+        let row=UIStackView(arrangedSubviews:[text,toggle]);row.axis = .horizontal;row.spacing=12;row.alignment = .center
+        return card([row])
+    }
+    private func notificationSources() {
+        let (_, content) = sheet(MobileStrings.text("通知来源"))
+        content.addArrangedSubview(label(MobileStrings.text("仅控制这台手机的任务提醒，不影响聊天和通知收件箱。"), secondary: true))
+        if saved.isEmpty { content.addArrangedSubview(label(MobileStrings.text("尚未保存电脑连接"), secondary: true)) }
+        for address in saved {
+            let text = column(spacing: 4)
+            text.addArrangedSubview(label(computerName(address), size: 17, weight: .semibold))
+            text.addArrangedSubview(label(address, size: 13, secondary: true))
+            content.addArrangedSubview(sourceSwitch(text,name:computerName(address)+", "+address,on:notificationSourceEnabled(address)){[weak self] on in
+                self?.setNotificationSource(address,enabled:on)
+            })
+        }
     }
     private func requestStartupNotifications() {
         // Preserve explicit choices and avoid prompting again after refusal.
@@ -936,7 +1724,7 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
         requestForegroundAlerts(showDeniedMessage: true)
     }
     private func currentTask(_ completion: @escaping ([String: String]?) -> Void) {
-        guard let web, let url = web.url, GatewayURL.same(url, origin) else { completion(nil); return }
+        guard let web, let url = web.url, GatewayURL.same(url, documentAddress) else { completion(nil); return }
         let ticket = generation
         web.evaluateJavaScript("""
         (() => {
@@ -970,11 +1758,22 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
     }
     @objc private func settings() {
         let (sheet, content) = sheet(MobileStrings.text("设置"))
+        content.addArrangedSubview(label(MobileStrings.text("外观与显示"), size: 19, weight: .semibold))
+        let themes = ["system", "light", "dark"]
+        let choice = UISegmentedControl(items: ["跟随系统", "浅色", "深色"].map(MobileStrings.text))
+        choice.accessibilityLabel = MobileStrings.text("主题")
+        choice.selectedSegmentIndex = themes.firstIndex(of: theme) ?? 0
+        choice.addAction(UIAction { [weak self, weak choice] _ in
+            guard let self, let index = choice?.selectedSegmentIndex, themes.indices.contains(index) else { return }
+            self.defaults.set(themes[index], forKey: "settingsTheme"); self.applyTheme()
+        }, for: .valueChanged)
+        content.addArrangedSubview(card([label(MobileStrings.text("主题"), size: 17, weight: .semibold), choice]))
         content.addArrangedSubview(label(MobileStrings.text("通知"), size: 19, weight: .semibold))
         content.addArrangedSubview(card([
             label(MobileStrings.text("前台任务提醒"), size: 17, weight: .semibold),
             button(defaults.bool(forKey: "foregroundAlerts") ? MobileStrings.text("关闭任务通知") : MobileStrings.text("开启任务通知"), symbol: "bell") { [weak self, weak sheet] in sheet?.dismiss(animated: true) { self?.toggleForegroundAlerts() } },
             label(MobileStrings.text("App 打开时提醒已连接电脑的新任务消息。离开 App 或锁屏后不保证通知；可在电脑端配置 Bark 或 ntfy。"), secondary: true),
+            button(MobileStrings.text("通知来源"), symbol: "bell") { [weak self, weak sheet] in sheet?.dismiss(animated: true) { self?.notificationSources() } },
             button(MobileStrings.text("测试本机通知"), symbol: "bell.badge") { [weak self, weak sheet] in sheet?.dismiss(animated: true) { self?.testNotification() } },
             label(MobileStrings.text("10 秒后显示，用于检查手机的通知权限。"), size: 13, secondary: true)
         ]))
@@ -1016,7 +1815,7 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("Codex-Mobile-Bridge/" + current, forHTTPHeaderField: "User-Agent")
         let session = URLSession(configuration: .ephemeral)
-        session.dataTask(with: request) { [weak sheet, weak check, weak status] data, response, error in
+        session.dataTask(with: request) { [weak self, weak sheet, weak check, weak status] data, response, error in
             defer { session.finishTasksAndInvalidate() }
             var candidate: MobileRelease?; var failed = false
             do {
@@ -1024,13 +1823,19 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
                 candidate = try MobileRelease.select(data, current: current)
             } catch { failed = true }
             DispatchQueue.main.async {
-                guard let sheet, sheet.presentingViewController != nil, let check, let status else { return }
+                guard let self, let sheet, sheet.presentingViewController != nil, let check, let status else { return }
                 check.isEnabled = true
                 let url = candidate?.page ?? URL(string: MobileRelease.repository + "/releases")!
                 if !failed && candidate == nil { status.text = MobileStrings.text("当前已是此通道最新版本。"); return }
-                status.text = MobileStrings.text(failed ? "检查失败，请检查网络后重试。也可以打开版本页面。" : "发现新版本") + (candidate.map { " · " + $0.version } ?? "")
+                let skipKey = "skip-mobile-update:" + MobileRelease.channel(current)
+                let skipped = candidate?.version == self.defaults.string(forKey: skipKey)
+                status.text = MobileStrings.text(failed ? "检查失败，请检查网络后重试。也可以打开版本页面。" : skipped ? "已跳过此版本，仍可手动更新" : "发现新版本") + (candidate.map { " · " + $0.version } ?? "")
                 let alert = UIAlertController(title: status.text, message: candidate.map { MobileStrings.text("iOS App 需要使用自己的 Apple 账号重新签名安装，暂不支持 App 内直接覆盖更新。") + "\n\n" + $0.notes }, preferredStyle: .alert)
                 alert.addAction(UIAlertAction(title: MobileStrings.text("稍后"), style: .cancel))
+                if let candidate { alert.addAction(UIAlertAction(title: MobileStrings.text("跳过此版本"), style: .default) { _ in
+                    self.defaults.set(candidate.version, forKey: skipKey)
+                    status.text = MobileStrings.text("已跳过此版本，仍可手动更新") + " · " + candidate.version
+                }) }
                 alert.addAction(UIAlertAction(title: MobileStrings.text(failed ? "版本页面" : "查看新版与安装指引"), style: .default) { _ in UIApplication.shared.open(url) })
                 sheet.present(alert, animated: true)
             }
@@ -1056,7 +1861,7 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
         }
     }
     private func sendPushRegistration(_ body: [String: String], address: String) {
-        guard let web, address == origin, let url = web.url, GatewayURL.same(url, origin) else { return }
+        guard let web, address == origin, let url = web.url, GatewayURL.same(url, documentAddress) else { return }
         let device = defaults.string(forKey: "pushDeviceID") ?? UUID().uuidString; defaults.set(device, forKey: "pushDeviceID")
         var value = body; value["deviceId"] = device
         web.callAsyncJavaScript("const a = await (await fetch('/api/auth')).json(); if (!a.authenticated) return false; const r = await fetch('/api/mobile/push', {method:'POST', headers:{'Content-Type':'application/json', 'X-CSRF-Token':a.csrf}, body:JSON.stringify(body)}); return r.ok;", arguments: ["body": value], in: nil, in: .page) { _ in }
@@ -1075,7 +1880,7 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
         }
     }
     private func revokeConnection(_ address: String, _ done: @escaping () -> Void) {
-        guard address == origin, let web, let url = web.url, GatewayURL.same(url, address) else { done(); return }
+        guard address == origin, let web, let url = web.url, GatewayURL.same(url, documentAddress) else { done(); return }
         web.callAsyncJavaScript("const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 5000); try { const a = await (await fetch('/api/auth', {signal:controller.signal})).json(); if (a.authenticated) await fetch('/api/logout', {method:'POST', signal:controller.signal, headers:{'Content-Type':'application/json', 'X-CSRF-Token':a.csrf}, body:'{}'}); } finally { clearTimeout(timer); }", arguments: [:], in: nil, in: .page) { _ in done() }
     }
     private func confirmRemove(_ address: String? = nil) {
@@ -1086,11 +1891,11 @@ final class BridgeController: UIViewController, WKNavigationDelegate, WKUIDelega
             let revision = self.generation
             self.downloads.cancel(origin: target)
             self.revokeConnection(target) {
-                DeviceBinding.clear(target)
+                self.clearChannels(target);DeviceBinding.clear(target)
                 if target == self.origin, #available(iOS 16.2, *) { Task { await LiveActivityController.shared.stop() } }
                 self.defaults.set(self.saved.filter { $0 != target }, forKey: "origins"); self.computerSnapshots.removeValue(forKey: target)
                 if self.defaults.string(forKey: "active") == target { self.defaults.removeObject(forKey: "active") }
-                self.defaults.removeObject(forKey: "connection:" + target); self.defaults.removeObject(forKey: "cursor:" + target); self.defaults.removeObject(forKey: "stream:" + target); self.defaults.removeObject(forKey: "name:" + target); self.defaults.removeObject(forKey: "last-opened:" + target)
+                self.defaults.removeObject(forKey: "notificationsMuted:" + target); self.defaults.removeObject(forKey: "connection:" + target); self.defaults.removeObject(forKey: "cursor:" + target); self.defaults.removeObject(forKey: "stream:" + target); self.defaults.removeObject(forKey: "name:" + target); self.defaults.removeObject(forKey: "last-opened:" + target)
                 WKWebsiteDataStore.default().httpCookieStore.getAllCookies { cookies in
                     for cookie in cookies where self.cookieMatches(cookie, address: target) { WKWebsiteDataStore.default().httpCookieStore.delete(cookie) }
                 }
@@ -1201,12 +2006,44 @@ final class Scanner: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
 enum ComputerNotificationSummary {
     static func clients(_ data: [String: Any]) -> [[String: Any]] {
         let rows = data["clients"] as? [[String: Any]] ?? []
-        return ["codex", "claude", "deepseek"].compactMap { provider in rows.first { $0["id"] as? String == provider && $0["enabled"] as? Bool == true } }
+        return ["codex", "claude", "deepseek", "zcode", "antigravity"].compactMap { provider in rows.first { $0["id"] as? String == provider && $0["enabled"] as? Bool == true } }
     }
 }
 
 enum MobileStrings {
     static let values: [String: String] = [
+        "UU 请求正在处理中": "A UU request is already in progress",
+        "请安装或更新 UU 远程至 4.42.0 及以上版本": "Install or update UU Remote to version 4.42.0 or later",
+        "无法打开 UU 远程": "Could not open UU Remote",
+        "UU 设备已绑定，请再次选择小窗或远控": "Device linked. Select picture-in-picture or remote control again.",
+        "UU 绑定未完成，请在 UU 中确认账号和设备": "Device linking did not finish. Check your account and device in UU Remote.",
+        "UU 小窗已开启": "UU picture-in-picture is open",
+        "UU 设备已失效，请重新绑定": "The UU device is no longer available. Link it again.",
+        "UU 设备离线": "The UU device is offline",
+        "当前设备不支持 UU 小窗，请使用全屏远控": "Picture-in-picture is unavailable. Use full-screen control.",
+        "UU 小窗未能开启，请检查设备或重试": "Could not open picture-in-picture. Check the device and try again.",
+        "此设备无法使用相机": "Camera is unavailable on this device",
+        "粘贴 DSH 客户端 Mobile 功能提供的完整链接": "Paste the full link from your DSH client’s Mobile feature",
+        "连接 DSH Mobile？": "Connect to DSH Mobile?",
+        "\n请确认这是你自己的 DSH 客户端。将打开它自带的手机界面。": "\nConfirm this is your DSH client. Its own mobile interface will open.",
+        "无法保存 DSH Mobile 连接": "Could not save the DSH Mobile connection",
+        "连接凭据不可用，请移除后重新添加": "Connection credentials are unavailable. Remove and add this connection again.",
+        "连接凭据不可用": "Connection credentials unavailable",
+        "Android 8 请使用浏览器打开 DSH Mobile；App 内连接需要 Android 9 或更高版本。": "On Android 8, open DSH Mobile in your browser. In-app access requires Android 9 or later.",
+        "连接失败，请刷新重试": "Connection failed. Refresh to retry",
+        "DSH Mobile 地址无效": "Invalid DSH Mobile URL",
+        "请使用完整的 DSH Mobile HTTPS 链接，或局域网 HTTP 链接。": "Use a full DSH Mobile HTTPS link, or an HTTP link on your local network.",
+        "通知来源": "Notification sources",
+        "连接中…": "Connecting…",
+        "当前信道不可达，请手动切换连接信道": "Current channel is unreachable. Choose another channel.",
+        "移除此电脑": "Remove this computer",
+        "管理这台电脑": "Manage this computer",
+        "仅控制这台手机的任务提醒，不影响聊天和通知收件箱。": "Choose task alerts for this phone. Chats and notification inboxes remain available.",
+        "尚未保存电脑连接": "No saved computer connections",
+        "主题": "Theme",
+        "跟随系统": "System",
+        "浅色": "Light",
+        "深色": "Dark",
         "正在连接…": "Connecting…",
         "已暂停": "Paused",
         "下载未完成": "Download incomplete",
@@ -1281,6 +2118,8 @@ enum MobileStrings {
 "版本页面": "Releases",
 "当前已是此通道最新版本。": "You are up to date on this channel.",
 "发现新版本": "Update available",
+"跳过此版本": "Skip this version",
+"已跳过此版本，仍可手动更新": "This version is skipped; you can still update manually",
 "下载后按系统提示覆盖安装，不要先卸载。已保存的电脑与登录状态会保留。": "After downloading, follow the system prompts to update without uninstalling. Saved computers and sign-ins will be retained.",
 "稍后": "Later",
 "更新说明": "Release notes",
@@ -1289,6 +2128,9 @@ enum MobileStrings {
 "iOS App 需要使用自己的 Apple 账号重新签名安装，暂不支持 App 内直接覆盖更新。": "The iOS app requires signing the new build with your own Apple account. Direct in-app installation is not available yet.",
 
         "返回电脑列表": "Back to computers",
+        "暂时无法连接电脑": "Can’t reach the computer",
+        "网关暂时无法访问。请检查电脑和网络后重试，或返回电脑列表。": "The gateway is temporarily unreachable. Check your computer and network, then retry or go back to your computers.",
+        "重试": "Try again",
         "外观与显示": "Appearance",
         "隐藏底部 APP 图标": "Hide bottom app icons",
         "显示底部 APP 图标": "Show bottom app icons",

@@ -7,22 +7,31 @@ import base64
 import copy
 import functools
 import hashlib
+import inspect
 import json
 import os
 import queue
 import re
 import shutil
+import sqlite3
+import sys
 import tempfile
 import threading
 import time
 import uuid
 from pathlib import Path
+from contextlib import nullcontext
 from urllib.parse import urlsplit
 
 from bridge.features.accounts.account import AccountRPC, AccountError, Account
 from bridge.clients.desktop_app import DesktopApp
-from bridge.features.accounts.models import model_ids
+from bridge.clients.errors import TaskStateUnavailable, TaskAuditIncomplete
+from bridge.features.accounts.models import model_catalog, model_ids, valid_model_id
+from bridge.clients.codex.catalog import Catalog, ModelStore, MODEL_REFRESH_SECONDS
 from bridge.features.accounts.info import AccountInfo
+from bridge.features.accounts.operation_gate import OperationGate
+from bridge.features.accounts.reset_forecast import ResetForecast
+from bridge.clients.codex.configuration import magpie_managed
 from bridge.clients.codex.transport import connect_stream
 from bridge.features.notifications.channels import read_json
 
@@ -38,7 +47,18 @@ def private_bytes(path, content):
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(name, path)
+        deadline = time.monotonic() + 2 if os.name == 'nt' else 0
+        while True:
+            try:
+                os.replace(name, path)
+                break
+            except PermissionError as exc:
+                if os.name != 'nt' or getattr(exc, 'winerror', None) not in (5, 32, 33):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                time.sleep(min(.05, remaining))
     finally:
         Path(name).unlink(missing_ok=True)
 
@@ -58,14 +78,39 @@ def token_owner(auth):
         return None
 
 
-def operation(method):
-    """One gate for native mutations, background queue sends and activation."""
+def operation(method=None, *, host=None, project=None, entry_only=False):
+    """Host operations are independent; account and lifecycle changes stay exclusive."""
+    if method is None:
+        return functools.partial(operation, host=host, project=project, entry_only=entry_only)
+    signature = inspect.signature(method) if host or project else None
     @functools.wraps(method)
     def call(self, *args, **kwargs):
-        manager = getattr(self, 'accounts', None)
+        entry_gate = getattr(self, 'entry_gate', None)
+        if entry_gate is not None:
+            with entry_gate.host(self.host):
+                if self.closed.is_set():
+                    raise ValueError('Codex 入口已关闭，请重新打开接入')
+                manager = None if entry_only else getattr(self, 'accounts', None)
+                if manager is None:
+                    return method(self, *args, **kwargs)
+                with manager.gate.host(self.host):
+                    manager.check_ready()
+                    return method(self, *args, **kwargs)
+        manager = None if entry_only else getattr(self, 'accounts', None)
         if manager is None:
             return method(self, *args, **kwargs)
-        with manager.gate:
+        host_id = getattr(self, 'host', 'local')
+        if signature:
+            values = signature.bind(self, *args, **kwargs)
+            values.apply_defaults()
+            if host:
+                host_id = values.arguments[host]
+            else:
+                host_id = self.project_host(values.arguments[project])
+        if not isinstance(host_id, str):
+            raise ValueError('运行主机无效')
+        gate = manager.gate
+        with gate.host(host_id) if isinstance(gate, OperationGate) else gate:
             guard = getattr(manager, 'require_client_enabled', None)
             if guard is not None:
                 guard()
@@ -127,21 +172,36 @@ class Accounts:
         if self.root.is_symlink():
             raise ValueError('账号目录不能是符号链接')
         self.lock = threading.RLock()
-        self.gate = threading.RLock()
+        self.gate = OperationGate()
+        self.api_models_locks = {}
+        self.api_model_store = ModelStore(bridge.data_dir)
+        self.saved_model_catalogs = {}
+        self.api_model_refreshing = set()
+        self.api_model_timers = {}
+        self.api_model_retry_at = {}
         self.index = read_json(self.root/'index.json', {'accounts': [], 'activeId': None, 'desktopExecutable': ''})
         self.state = read_json(self.root/'switch.json', {'phase': 'idle'})
         if self.state.get('phase') in ('preparing', 'stopping', 'applying', 'migrating', 'starting', 'verifying', 'restoring'):
             self.state.update(phase='interrupted', error='上次切换中断，请在桌面端恢复原接入')
+            if self.state.get('operation') == 'desktopRuntime':
+                self.state.update(phase='failed', error='上次连接初始化中断，请重新初始化连接')
         self.enrollment = None
         self.discovery = None
         self.candidates = {}
         self.info = AccountInfo(self)
+        self.reset_forecast = ResetForecast()
+        self.reset_dynamic_enabled = read_json(self.root/'reset-dynamic.json', {}).get('enabled') is True
         from bridge.features.updates.codex import DesktopUpdates
         from bridge.features.accounts.monitor import AccountMonitor
         self.updates = DesktopUpdates(self)
         self.monitor = AccountMonitor(self)
         self.login_cancel = threading.Event()
         self.thread = None
+        self.desktop_preparation = {'state': 'idle'}
+
+    @property
+    def independent(self):
+        return getattr(self.bridge, 'host', 'local').startswith('codex:')
 
     @property
     def runtime(self):
@@ -153,6 +213,16 @@ class Accounts:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.root.chmod(0o700)
         return self.root/identifier
+
+    def saved_model_catalog(self, identifier):
+        with self.lock:
+            home = self.directory(identifier)
+            catalog = self.saved_model_catalogs.get(identifier)
+            if catalog is None:
+                catalog = Catalog(home, self.runtime,
+                    observation_enabled=lambda: getattr(self.bridge, 'observation_enabled', lambda: True)())
+                self.saved_model_catalogs[identifier] = catalog
+            return catalog
 
     def row(self, identifier):
         self.directory(identifier)
@@ -206,21 +276,74 @@ class Accounts:
 
     def public(self):
         with self.lock:
-            current = self.info.current()
+            management = self.management()
+            if management['external']:
+                current = {'status': 'ready', 'kind': 'external', 'id': None, 'name': 'Magpie / 外部管理'}
+            else:
+                current = self.info.current()
+            if self.state.get('operation') == 'cliAuth' and self.state.get('phase') == 'authUnknown':
+                current = {'status': 'error', 'kind': 'api', 'id': None,
+                           'name': '原生账号同步结果待核验'}
             verified = bool(current.get('id'))
             return {'accounts': [{**{k: row[k] for k in ('id', 'name', 'kind', 'email', 'planType', 'baseUrl', 'model') if k in row},
-                                  'details': copy.deepcopy(self.info.entries.get(row['id'], {}))}
+                                  'details': copy.deepcopy(self.info.public_details(row['id']))}
                                  for row in self.index['accounts']],
                     'activeId': current.get('id'), 'activeVerified': verified, 'current': current, 'blockers': self.blockers(),
-                    'externalChange': bool(self.index.get('activeId')) and not verified, 'switch': dict(self.state),
+                    'externalChange': bool(self.index.get('activeId')) and not verified,
+                    'sharedWithLocalCli': True, 'scope': 'profile' if self.independent else 'desktop',
+                    'scopeLabel': getattr(self.bridge, 'host_label', '此电脑'), 'codexHome': str(self.home),
+                    'canManageDesktop': not self.independent, 'switch': dict(self.state),
+                    'desktopRuntime': self.desktop_runtime_status(),
+                    'loginAccount': copy.deepcopy(self.info.current_login()),
+                    'resetDynamicEnabled':self.reset_dynamic_enabled,
+                    'globalReset':self.reset_forecast.status() if self.reset_dynamic_enabled else None,
                     'reminders':dict(self.monitor.preferences), 'reminderError':self.monitor.last_error,
-                    'desktopUpdate':self.updates.status()}
+                    'desktopUpdate':self.updates.status(), 'management': management,
+                    'sshHosts': self.bridge.ssh_status() if not self.independent and hasattr(self.bridge, 'ssh_status') else [],
+                    'canSwitch': not management['external']}
+
+    def set_reset_dynamic(self, enabled):
+        if type(enabled) is not bool:
+            raise ValueError('重置动态设置无效')
+        with self.lock:
+            if enabled and not self.reset_dynamic_enabled:
+                self.monitor.reset_global_watch()
+            private_json(self.root/'reset-dynamic.json', {'enabled': enabled})
+            self.reset_dynamic_enabled = enabled
+
+    def management(self):
+        try:
+            text = (self.home/'config.toml').read_text(encoding='utf-8')
+        except FileNotFoundError:
+            text = ''
+        except (OSError, UnicodeError):
+            return {'mode': 'external', 'external': True, 'reason': '无法确认接入配置，已暂停覆盖配置'}
+        configured = self.index.get('accessManagement', 'auto')
+        detected = magpie_managed(text=text)
+        return {'mode': configured, 'external': configured == 'external' or detected,
+                'detected': 'magpie' if detected else None,
+                'reason': '此入口由 Magpie 或外部工具管理；请在原工具中切换接入' if configured == 'external' or detected else None}
+
+    def require_managed_writes(self):
+        if self.management()['external']:
+            raise ValueError('此入口由 Magpie 或外部工具管理，Bridge 不会覆盖其认证、提供商和模型目录')
 
     def desktop_status(self):
         result = self.public()
         with self.lock:
-            result.update(desktopExecutable=self.index.get('desktopExecutable') or DesktopApp.discover(self.runtime),
+            result.update(desktopExecutable=None if self.independent else self.index.get('desktopExecutable') or DesktopApp.discover(self.runtime),
                           enrollment=self.enrollment, discovery=self.discovery, codexHome=str(self.home))
+        return result
+
+    def desktop_runtime_status(self):
+        supported = sys.platform in ('darwin', 'win32') and getattr(self.bridge, 'host', 'local') == 'local'
+        result = {'supported': supported, 'configured': False, 'preparation': dict(self.desktop_preparation)}
+        if supported:
+            from bridge.clients.codex.desktop_runtime import settings
+            try:
+                result['configured'] = settings(self.home) is not None
+            except (OSError, ValueError, TypeError, KeyError):
+                result['error'] = '共享接入配置无法读取，请重新初始化连接'
         return result
 
     @staticmethod
@@ -375,29 +498,144 @@ class Accounts:
             self.update_discovery()
             return self.desktop_status()
 
-    def api_models(self, row, refresh=False):
-        cached = self.info.entries.get(row['id'], {}).get('models') or {}
-        if not refresh and cached.get('status') == 'ready' and time.time()-cached.get('checkedAt', 0) < 300:
-            return copy.deepcopy(cached['models'])
-        key = read_json(self.directory(row['id'])/'api.json', {})['key']
-        models = [{'id': identifier, 'name': identifier, 'efforts': []} for identifier in model_ids(row['baseUrl'], key)]
-        self.info.entries.setdefault(row['id'], {})['models'] = {'models':copy.deepcopy(models), 'status':'ready', 'checkedAt':time.time()}
-        return models
+    def api_model_identity(self, row):
+        with self.lock:
+            if self.row(row['id']).get('baseUrl') != row['baseUrl']:
+                raise ValueError('当前接入已变化，请重新读取模型列表')
+            key = read_json(self.directory(row['id'])/'api.json', {})['key']
+            return ModelStore.key('saved-api', str(self.home), row['id'], row['baseUrl'], key)
+
+    def api_models(self, row, refresh=False, with_timestamp=False):
+        with self.lock:
+            self.check_ready()
+            self.row(row['id'])
+            model_lock = self.api_models_locks.setdefault(row['id'], threading.Lock())
+        with model_lock:
+            with self.lock:
+                self.check_ready()
+                stored = dict(self.row(row['id']))
+                if any(stored.get(key) != row.get(key) for key in ('kind', 'baseUrl', 'model')):
+                    raise ValueError('当前接入已变化，请重新读取模型列表')
+                key = read_json(self.directory(row['id'])/'api.json', {})['key']
+                identity = ModelStore.key('saved-api', str(self.home), row['id'], row['baseUrl'], key)
+                def result(models, updated_at, error=None):
+                    with self.lock:
+                        self.check_ready()
+                        if (self.row(row['id']) != stored or
+                                read_json(self.directory(row['id'])/'api.json', {}).get('key') != key):
+                            raise ValueError('当前接入已变化，请重新读取模型列表')
+                    copied = copy.deepcopy(models)
+                    return (copied, updated_at, error) if with_timestamp else copied
+                try:
+                    persisted = self.api_model_store.read(identity)
+                except (OSError, sqlite3.DatabaseError, ValueError):
+                    persisted = None
+                if persisted and not refresh:
+                    if (time.time()-persisted[0] >= MODEL_REFRESH_SECONDS and identity not in self.api_model_refreshing
+                            and time.time() >= self.api_model_retry_at.get(identity, 0)):
+                        self.api_model_refreshing.add(identity)
+                        def update():
+                            try:
+                                self.api_models(row, refresh=True)
+                            except ValueError:
+                                pass
+                            finally:
+                                with self.lock:
+                                    self.api_model_retry_at[identity] = time.time() + 60
+                                    self.api_model_refreshing.discard(identity)
+                        threading.Thread(target=update, daemon=True, name='saved-api-model-refresh').start()
+                    elif time.time()-persisted[0] < MODEL_REFRESH_SECONDS:
+                        self._schedule_api_model_refresh(row, identity, persisted[0])
+                    return result(persisted[1], persisted[0])
+            try:
+                models = model_catalog(row['baseUrl'], key)
+            except ValueError:
+                if persisted:
+                    return result(persisted[1], persisted[0], '模型目录刷新失败，已保留上次结果')
+                raise
+            with self.lock:
+                self.check_ready()
+                if (self.row(row['id']) != stored or
+                        read_json(self.directory(row['id'])/'api.json', {}).get('key') != key):
+                    raise ValueError('当前接入已变化，请重新读取模型列表')
+            try:
+                updated_at = self.api_model_store.write(identity, models)
+                self._schedule_api_model_refresh(row, identity, updated_at, replace=True)
+            except (OSError, sqlite3.DatabaseError):
+                updated_at = time.time()
+            return result(models, updated_at)
+
+    def _schedule_api_model_refresh(self, row, identity, updated_at, replace=False):
+        if not getattr(self.bridge, 'observation_enabled', lambda: True)():
+            return
+        with self.lock:
+            if getattr(self.bridge, 'closed', None) is not None and self.bridge.closed.is_set():
+                return
+            if replace and identity in self.api_model_timers:
+                self.api_model_timers.pop(identity).cancel()
+            if identity in self.api_model_timers:
+                return
+            delay = max(1, updated_at + MODEL_REFRESH_SECONDS - time.time())
+            def due():
+                with self.lock:
+                    self.api_model_timers.pop(identity, None)
+                    if not getattr(self.bridge, 'observation_enabled', lambda: True)():
+                        return
+                    if getattr(self.bridge, 'closed', None) is not None and self.bridge.closed.is_set():
+                        return
+                try:
+                    self.api_models(row, refresh=True)
+                except ValueError:
+                    pass
+                finally:
+                    with self.lock:
+                        try:
+                            record = self.api_model_store.read(identity)
+                        except (OSError, sqlite3.DatabaseError, ValueError):
+                            record = None
+                        if record and any(saved['id'] == row['id'] for saved in self.index['accounts']):
+                            self._schedule_api_model_refresh(row, identity, max(record[0], time.time() - MODEL_REFRESH_SECONDS + 300))
+            timer = threading.Timer(delay, due)
+            timer.daemon = True
+            self.api_model_timers[identity] = timer
+            timer.start()
+
+    def current_model_identity(self):
+        with self.lock:
+            if not self.active_matches():
+                return None
+            row = dict(self.row(self.index['activeId']))
+            if row['kind'] == 'api':
+                return self.api_model_identity(row)
+        return self.bridge.catalog_reader.model_identity(str(self.home), 'openai')
 
     def current_models(self, refresh=False):
         with self.lock:
             self.check_ready()
+            if self.management()['external']:
+                return None
             if not self.active_matches():
                 return None
             row = dict(self.row(self.index['activeId']))
-            if row['kind'] != 'api':
-                result = self.bridge.catalog_reader.get_kind('models', str(self.home), refresh=refresh, provider='openai')
-            else:
-                result = {'models':[], 'modelSource':'api', 'fastMode':{'allowed':False}}
-                try:
-                    result['models'] = self.api_models(row, refresh)
-                except ValueError as error:
-                    result['modelError'] = str(error)
+            stamp = copy.deepcopy(self.index.get('activeStamp'))
+        if row['kind'] != 'api':
+            result = self.bridge.catalog_reader.get_kind('models', str(self.home), refresh=refresh, provider='openai')
+        else:
+            result = {'models':[], 'modelSource':'api', 'fastMode':{'allowed':False}}
+            try:
+                result['models'], updated_at, error = self.api_models(row, refresh, with_timestamp=True)
+                identity = self.api_model_identity(row)
+                result['cache'] = {'state': 'stale' if error else 'fresh', 'updatedAt': updated_at,
+                                   'identity': identity}
+                if error:
+                    result['modelError'] = error
+            except ValueError as error:
+                result['modelError'] = str(error)
+        with self.lock:
+            self.check_ready()
+            if (self.index.get('activeId') != row['id'] or self.index.get('activeStamp') != stamp or
+                    not self.active_matches() or self.row(row['id']) != row):
+                raise ValueError('当前接入已变化，请重新读取模型列表')
             return {**result, 'modelAccessName':row['name'], 'modelAccountId':row['id']}
 
     def models(self, value):
@@ -420,7 +658,7 @@ class Accounts:
             name = self.name(value)
             url, key, model = value.get('baseUrl', ''), value.get('apiKey', ''), value.get('model', '')
             url, key = self.api_credentials(value)
-            if not isinstance(model, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_./:@+-]{0,199}', model):
+            if not valid_model_id(model):
                 raise ValueError('请填写有效模型 ID')
             existing = self.row(value['id']) if value.get('id') else None
             if existing and (existing['kind'] != 'api' or existing['id'] == self.info.current().get('id')):
@@ -484,6 +722,9 @@ class Accounts:
                                 self.index['accounts'].remove(replacing)
                             self.save()
                             if replacing:
+                                catalog = self.saved_model_catalogs.pop(replacing['id'], None)
+                                if catalog:
+                                    catalog.stop_model_refresh()
                                 shutil.rmtree(self.directory(replacing['id']), ignore_errors=True)
                             accepted = True
                             self.enrollment = {'phase': 'complete', 'name': name}
@@ -496,41 +737,108 @@ class Accounts:
             threading.Thread(target=run, daemon=True).start()
             return self.desktop_status()
 
+    def current_login_account(self):
+        row = self.info.current_login()
+        if not row or not row.get('transient'):
+            raise ValueError('账号身份已变化，请刷新列表')
+        target = Account(self.home, self.bridge.data_dir, executable=self.runtime)
+        target.usage_cache = self.bridge.account.usage_cache
+        target.subscription_cache = self.bridge.account.subscription_cache
+        expected_owner = self.info.identity['login']['owner']
+        expected_route = self.info.identity['login']['context'].get('_routeCacheKey')
+        def checked_login(rpc):
+            context = Account.login_context(rpc)
+            if (not context or context['accountKey'] != row['accountKey'] or
+                    context.get('_routeCacheKey') != expected_route or
+                    token_owner(read_json(self.home/'auth.json', {})) != expected_owner):
+                raise ValueError('账号身份已变化，请刷新列表')
+            return context
+        target.context = checked_login
+        return target, expected_owner
+
+    def saved_account(self, row):
+        if row['kind'] != 'chatgpt':
+            raise ValueError('仅官方 ChatGPT 账号可使用重置卡')
+        identity = self.info.read_identity()
+        with self.lock:
+            active = self.info.match(identity)
+        login = identity.get('login')
+        native_login = bool(login and login.get('owner') and login['owner'] == row.get('tokenOwner'))
+        home = self.home if native_login or active and active['id'] == row['id'] else self.directory(row['id'])
+        if token_owner(read_json(home/'auth.json', {})) != row.get('tokenOwner'):
+            raise ValueError('账号身份不匹配')
+        if home != self.home:
+            private_bytes(home/'config.toml', b'cli_auth_credentials_store = "file"\nmodel_provider = "openai"\n')
+        target = Account(home, self.bridge.data_dir, executable=self.runtime)
+        target.usage_cache = self.bridge.account.usage_cache
+        target.subscription_cache = self.bridge.account.subscription_cache
+        def checked_context(rpc):
+            context = Account.login_context(rpc) if native_login else Account.context(rpc)
+            if (not context or context.get('loginType') != 'chatgpt' or context.get('email') != row.get('email') or
+                    native_login and (context['accountKey'] != login['context']['accountKey'] or
+                                      context.get('_routeCacheKey') != login['context'].get('_routeCacheKey')) or
+                    token_owner(read_json(home/'auth.json', {})) != row.get('tokenOwner')):
+                raise ValueError('账号身份已变化')
+            return context
+        target.context = checked_context
+        return target
+
+    def read_account(self, value):
+        from bridge.features.accounts.info import CURRENT_LOGIN_ID
+        # Account switching shares this credential lock; chat operations keep their own gate.
+        with self.bridge.account.lock:
+            with self.lock:
+                self.check_ready()
+                row = None if value.get('id') == CURRENT_LOGIN_ID else dict(self.row(value.get('id')))
+                if row is None:
+                    target, owner = self.current_login_account()
+            if row is not None:
+                target, owner = self.saved_account(row), row.get('tokenOwner')
+            result = target.read(refresh=value.get('refresh', True) is not False)
+            with self.lock:
+                self.check_ready()
+                if ((row is not None and self.row(row['id']).get('tokenOwner') != owner) or
+                        token_owner(read_json(target.home/'auth.json', {})) != owner):
+                    raise ValueError('账号身份已变化，请刷新列表')
+            return result
+
     def account(self, value):
-        """Operate one saved login without changing the desktop's active connection."""
-        from bridge.features.accounts.account import Account
+        """Operate one login without changing the desktop's active connection."""
         action = value.get('operation', 'read')
         if action not in ('read', 'consume') or set(value) - {'action', 'id', 'operation', 'refresh', 'confirmed', 'requestId', 'accountKey', 'creditId'}:
             raise ValueError('账号重置请求包含不支持的字段')
+        if action == 'read':
+            return self.read_account(value)
+        from bridge.features.accounts.info import CURRENT_LOGIN_ID
         with self.gate, self.bridge.account.lock, self.lock:
             self.check_ready()
-            row = dict(self.row(value.get('id')))
-            if row['kind'] != 'chatgpt':
-                raise ValueError('仅官方 ChatGPT 账号可使用重置卡')
-            identity = self.info.read_identity()
-            active = self.info.match(identity)
-            home = self.home if active and active['id'] == row['id'] else self.directory(row['id'])
-            if token_owner(read_json(home/'auth.json', {})) != row.get('tokenOwner'):
-                raise ValueError('账号身份不匹配')
-            if home != self.home:
-                private_bytes(home/'config.toml', b'cli_auth_credentials_store = "file"\nmodel_provider = "openai"\n')
-            target = Account(home, self.bridge.data_dir, executable=self.runtime)
-            target.usage_cache = self.bridge.account.usage_cache
-            target.subscription_cache = self.bridge.account.subscription_cache
-            def checked_context(rpc):
-                context = Account.context(rpc)
-                if (context.get('loginType') != 'chatgpt' or context.get('email') != row.get('email') or
-                        token_owner(read_json(home/'auth.json', {})) != row.get('tokenOwner')):
-                    raise ValueError('账号身份已变化')
-                return context
-            target.context = checked_context
+            if value.get('id') == CURRENT_LOGIN_ID:
+                target, _ = self.current_login_account()
+            else:
+                target = self.saved_account(dict(self.row(value.get('id'))))
             result = target.control({**{k:v for k,v in value.items() if k not in ('action','id','operation')}, 'action':action})
-            if action == 'consume':
-                self.info.entries.get(row['id'], {}).pop('usage', None)
+            self.info.entries.get(value['id'], {}).pop('usage', None)
             return result
 
     def control(self, value):
         action = value.get('action', 'list')
+        if self.independent and action in ('retrySsh', 'checkDesktopUpdate', 'requestDesktopUpdate', 'scanDesktop', 'configure', 'recover', 'initializeDesktopRuntime'):
+            raise ValueError('独立配置不管理默认 Codex Desktop')
+        if action == 'initializeDesktopRuntime':
+            return self.initialize_desktop_runtime(value)
+        if action == 'retrySsh':
+            if set(value) != {'action', 'host'}:
+                raise ValueError('SSH 重试请求包含不支持的字段')
+            self.bridge.retry_ssh(value['host'])
+            return self.desktop_status()
+        if action == 'management':
+            if set(value) != {'action', 'mode'} or value['mode'] not in ('auto', 'external'):
+                raise ValueError('接入管理模式无效')
+            with self.gate, self.lock:
+                self.assert_editable()
+                self.index['accessManagement'] = value['mode']
+                self.save()
+            return self.desktop_status()
         if action == 'account':
             return self.account(value)
         if action == 'reminders':
@@ -548,6 +856,8 @@ class Accounts:
             self.info.request(value)
             return self.desktop_status()
         if action == 'list':
+            if self.reset_dynamic_enabled and value.get('resetForecast') in (True, 'refresh'):
+                self.reset_forecast.request(refresh=value.get('resetForecast') == 'refresh')
             return self.desktop_status()
         if action in ('scan', 'import', 'models'):
             return {'scan': self.scan, 'import': self.import_account, 'models': self.models}[action](value)
@@ -581,12 +891,37 @@ class Accounts:
                     if row['id'] == self.info.current().get('id'):
                         raise ValueError('请先切换到其他接入，再删除此账号')
                     self.index['accounts'].remove(row)
+                    self.api_models_locks.pop(row['id'], None)
+                    catalog = self.saved_model_catalogs.pop(row['id'], None)
+                    if catalog:
+                        catalog.stop_model_refresh()
                     self.save()
                     shutil.rmtree(self.directory(row['id']), ignore_errors=True)
             else:
                 raise ValueError('不支持的账号管理操作')
             self.save()
             return self.desktop_status()
+
+    @staticmethod
+    def _native_cli_connection(bridge, identifier, session):
+        """Identify a native route for this audit; this is not Desktop absence."""
+        if (getattr(session, 'runtime', None) != 'cli' or
+                getattr(session, 'owner', None) != 'cli:' + identifier):
+            return None
+        cli = getattr(bridge, 'cli_sessions', None)
+        if cli is None:
+            return None
+        with cli.lock:
+            process = getattr(cli.client, 'process', None)
+            info = getattr(cli.client, 'server_info', None)
+            expected = cli.remote_home if cli.alias else cli.home
+            token = cli.metadata.get(identifier, {}).get('connectionToken')
+            if (process is None or cli.joined.get(identifier) is not process or not info or
+                    not token or not expected or Path(info.get('codexHome', '')) != Path(expected)):
+                return None
+            if not cli.alias and Path(expected).resolve() != Path(bridge.codex_home).resolve():
+                return None
+            return (process, token, str(expected)) if process.poll() is None else None
 
     def blockers(self):
         result = []
@@ -615,29 +950,72 @@ class Accounts:
             bridge.ignore_submission(value.get('threadId', ''), value.get('submissionId', ''))
             return self.public()
 
-    def idle(self):
+    def idle(self, *, pending_only=False):
         blocked = self.blockers()
+        if pending_only:
+            blocked = [row for row in blocked if row['reason'] in ('queued', 'unknown')]
         if blocked:
             names = '、'.join(row['title'] for row in blocked[:3])
             raise ValueError('请先结束任务或处理待发送消息：'+names)
 
+    def desktop_runtime_lifecycle(self):
+        # Lock even before initialization has saved settings: another gateway
+        # may be between its idle audit and the first shared configuration write.
+        if sys.platform in ('darwin', 'win32') and getattr(self.bridge, 'host', 'local') == 'local':
+            from bridge.clients.codex.desktop_runtime import initialization_lock
+            return initialization_lock(self.home)
+        return nullcontext()
+
     def switch(self, value):
+        self.require_managed_writes()
         if value.get('confirmed') is not True or value.get('tasksConfirmed') is not True:
             raise ValueError('请确认所有桌面任务已结束，并同意重启 Codex 桌面应用')
         request_id = value.get('requestId')
         if not isinstance(request_id, str) or str(uuid.UUID(request_id)) != request_id:
             raise ValueError('切换请求标识无效')
-        with self.gate, self.lock:
+        with getattr(self.bridge, 'entry_gate', None) or nullcontext(), self.gate, self.bridge.account.lock, self.desktop_runtime_lifecycle(), self.lock:
+            if self.independent and self.bridge.closed.is_set():
+                raise ValueError('Codex 入口已关闭，请重新打开管理页面')
             row = dict(self.row(value.get('id')))
+            sync_cli = True
             ledger = read_json(self.root/'requests.json', {})
+            from bridge.features.accounts.cli_sync import LocalCliSync
+            sync = LocalCliSync(self.bridge)
+            if self.state.get('operation') == 'cliAuth' and self.state.get('phase') == 'authUnknown':
+                if self.state.get('requestId') != request_id or self.state.get('targetId') != row['id']:
+                    raise ValueError('上次账号同步结果待核验，请检查同一次切换，勿重复提交')
+                sync.switch_live_api(row, request_id, reconcile=True)
+                return self.public()
             if request_id in ledger:
                 if ledger[request_id] != row['id']:
                     raise ValueError('同一请求不能切换到不同账号')
                 return self.public()
+            # One local account home always verifies CLI effectiveness.
+            self.assert_editable()
+            if sync.switch_live_api(row, request_id):
+                return self.public()
+            if self.info.current().get('id') != row['id']:
+                sync.prepare_profile_switch()
+            preflight = sync.preflight('codex')
             self.assert_editable()
             if self.info.current().get('id') == row['id']:
                 return self.public()
             self.idle()
+            if not preflight['desktopRunning']:
+                before = sync.snapshot('codex')
+                applied = None
+                try:
+                    applied = sync.apply('codex', row)
+                    sync.verify('codex', row)
+                except Exception:
+                    if applied and applied.get('mutated') is True:
+                        sync.restore('codex', before)
+                    raise
+                ledger[request_id] = row['id']
+                private_json(self.root/'requests.json', ledger)
+                self.state = {'phase': 'complete', 'requestId': request_id, 'targetId': row['id'],
+                              'error': None, 'cliSync': {'status': 'verified'}}
+                return self.public()
             executable = self.index.get('desktopExecutable') or DesktopApp.discover(self.runtime)
             if not executable:
                 raise ValueError('请先在桌面端指定 Codex 桌面程序路径')
@@ -645,11 +1023,219 @@ class Accounts:
             app.validate(self.runtime)
             ledger[request_id] = row['id']
             private_json(self.root/'requests.json', ledger)
-            self.state = {'phase': 'preparing', 'requestId': request_id, 'targetId': row['id'], 'error': None}
+            self.state = {'phase': 'preparing', 'requestId': request_id, 'targetId': row['id'], 'error': None,
+                          'cliSync': {'status': 'pending' if sync_cli else 'shared-config-unverified'}}
             self.phase('preparing')
             self.thread = threading.Thread(target=self._switch, args=(row, app), daemon=True)
             self.thread.start()
             return self.public()
+
+    def initialize_desktop_runtime(self, value):
+        if sys.platform not in ('darwin', 'win32') or getattr(self.bridge, 'host', 'local') != 'local':
+            raise ValueError('此入口不支持 Codex 原生连接初始化')
+        required = {'action', 'confirmed', 'tasksConfirmed', 'requestId'}
+        if (set(value) - {'acknowledgeUnavailable'} != required or value.get('confirmed') is not True
+                or value.get('tasksConfirmed') is not True
+                or 'acknowledgeUnavailable' in value and value['acknowledgeUnavailable'] is not True):
+            raise ValueError('请确认所有桌面任务已结束，并同意重启 Codex 桌面应用')
+        request_id = value.get('requestId')
+        try:
+            valid_id = isinstance(request_id, str) and str(uuid.UUID(request_id)) == request_id
+        except ValueError:
+            valid_id = False
+        if not valid_id:
+            raise ValueError('初始化请求标识无效')
+        with self.gate, self.bridge.account.lock, self.lock:
+            self.require_managed_writes()
+            if self.state.get('operation') == 'desktopRuntime' and self.state.get('requestId') == request_id:
+                return self.public()
+            self.assert_editable()
+            acknowledged = value.get('acknowledgeUnavailable') is True
+            if acknowledged and not (self.state.get('operation') == 'desktopRuntime'
+                                     and self.state.get('phase') == 'failed'
+                                     and self.state.get('taskStateUnavailable') is True
+                                     or self.desktop_preparation.get('state') == 'waiting'
+                                     and self.desktop_preparation.get('taskStateUnavailable') is True):
+                raise ValueError('请先核验原生连接初始化的任务状态，再确认是否继续')
+            self.idle(pending_only=True)
+            executable = self.index.get('desktopExecutable') or DesktopApp.discover(self.runtime)
+            if not executable:
+                executable = DesktopApp.scan(self.runtime, self.home)
+            app = DesktopApp(executable, self.home)
+            app.validate(self.runtime)
+            from bridge.clients.codex.desktop_runtime import validate_runtime, launcher_settings
+            validate_runtime(self.runtime)
+            launcher_settings(app.executable)
+            self.state = {'phase': 'preparing', 'operation': 'desktopRuntime', 'requestId': request_id, 'error': None}
+            self.phase('preparing')
+            self.thread = threading.Thread(target=self._initialize_desktop_runtime, args=(app, acknowledged), daemon=True)
+            self.thread.start()
+            return self.public()
+
+    def prepare_desktop_runtime(self, app, *, cancelled=lambda: False):
+        """Startup preparation; return True only when a passive retry is safe.
+
+        Waiting does not change account state or hold a gate between attempts.
+        Once a lifecycle write starts, a failure requires explicit recovery.
+        """
+        if sys.platform not in ('darwin', 'win32') or getattr(self.bridge, 'host', 'local') != 'local':
+            return False
+        if not self.gate.acquire(timeout=0):
+            self.desktop_preparation = {'state': 'waiting', 'reason': '等待当前操作结束后自动准备原生侧聊'}
+            return True
+        try:
+            if self.bridge.closed.is_set() or cancelled():
+                return False
+            self.assert_editable()
+            return self._initialize_desktop_runtime(app, automatic=True, cancelled=cancelled)
+        except ValueError as exc:
+            self.desktop_preparation = {'state': 'waiting', 'reason': str(exc)}
+            return True
+        finally:
+            self.gate.release()
+
+    def _initialize_desktop_runtime(self, app, acknowledged=False, *, automatic=False, cancelled=lambda: False):
+        from bridge.clients.codex.desktop_runtime import configure, connect, initialization_lock, process_identity, DesktopRuntimeBusy
+        from bridge.clients.codex.desktop_runtime import preparation, record_preparation, settings
+        from bridge.clients.codex.app_server import AppServerUnavailable
+        from bridge.clients.lifecycle import inspect_client, stop_client
+        if sys.platform == 'win32':
+            from bridge.platforms.windows.codex_daemon_env import read_process_environment
+            from bridge.platforms.windows.desktop import commands
+        else:
+            from bridge.platforms.macos.codex_daemon_env import read_process_environment
+            from bridge.platforms.macos.desktop import commands
+        descriptor = {'id': 'codex', 'installed': True, 'executable': str(app.executable), 'dataDirectory': str(self.home)}
+
+        def observed():
+            state = inspect_client(descriptor)
+            main = state.get('mainPids', [])
+            if state.get('unknown') or len(main) > 1 or state.get('running') and not main:
+                raise ValueError('无法确认唯一的 Codex 桌面进程，请在电脑端检查后重试')
+            identities = {pid: process_identity(pid) for pid in main}
+            if any(identity['image'] != os.path.normcase(str(app.executable)) for identity in identities.values()):
+                raise ValueError('Codex 桌面进程身份已变化，请重新初始化连接')
+            launch_commands = commands(main) if main else {}
+            for pid, identity in identities.items():
+                record = ({'processStartTime': str(identity['created'])} if sys.platform == 'win32' else
+                          {'processIdentity': {'uniqueId': identity['birth'][0], 'startSeconds': identity['started'][0],
+                                               'startMicroseconds': identity['started'][1]}})
+                environment, _ = read_process_environment(pid, record, app.executable,
+                    ('CODEX_HOME', 'CODEX_SQLITE_HOME', 'CODEX_ELECTRON_USER_DATA_PATH', 'HOME', 'USERPROFILE'))
+                user_home = environment.get('USERPROFILE' if sys.platform == 'win32' else 'HOME') or Path.home()
+                home = Path(environment.get('CODEX_HOME') or Path(user_home)/'.codex').resolve()
+                sqlite_home = Path(environment.get('CODEX_SQLITE_HOME') or home).resolve()
+                command = launch_commands.get(pid)
+                if (home != self.home.resolve() or sqlite_home != home or environment.get('CODEX_ELECTRON_USER_DATA_PATH')
+                        or not command or re.search(r'''(?:^|[\s"'])--user-data-dir(?:[=\s"']|$)''', command)):
+                    raise ValueError('运行中的 Codex 使用其他配置目录，不能初始化此接入')
+                if process_identity(pid) != identity:
+                    raise ValueError('Codex 桌面进程身份已变化，请重新初始化连接')
+            return state, identities
+
+        try:
+            with self.gate, self.bridge.account.lock, initialization_lock(self.home):
+                preparation_error = None
+                if automatic:
+                    self.desktop_preparation = {'state': 'checking'}
+                    # Recheck under the shared initialization lock: another
+                    # gateway may have prepared this same App in the meantime.
+                    try:
+                        client = connect(self.home, self.runtime)
+                    except (OSError, ValueError, AppServerUnavailable):
+                        client = None
+                    if client is not None:
+                        client.close()
+                        prior = preparation(self.home)
+                        if prior and prior['state'] == 'pending':
+                            record_preparation(self.home, prior['requestId'], complete=True)
+                        self.desktop_preparation = {'state': 'ready'}
+                        return False
+                    prior = preparation(self.home)
+                    if prior and prior['state'] == 'pending':
+                        self.desktop_preparation = {'state': 'failed', 'reason': '上次原生连接准备结果待核对，请在账号管理中重新准备；不会自动重复重启'}
+                        return False
+                    app.validate(self.runtime)
+                    from bridge.clients.codex.desktop_runtime import validate_runtime, launcher_settings
+                    try:
+                        self.require_managed_writes()
+                        validate_runtime(self.runtime)
+                        launcher_settings(app.executable)
+                    except ValueError as exc:
+                        # An unsupported shared transport must not prevent an
+                        # ordinary cold App launch. Existing shared settings or
+                        # an uncertain launch never use this fallback.
+                        if settings(self.home) is not None:
+                            raise
+                        preparation_error = exc
+                state, identities = observed()
+                if preparation_error and state['running']:
+                    raise preparation_error
+                try:
+                    self.bridge.assert_desktop_idle(allow_stopped_app=not state['running'], desktop_only=True,
+                        desktop_executable=app.executable,
+                        **({'timeout': 3} if automatic else {}))
+                except (TaskStateUnavailable, TaskAuditIncomplete) as exc:
+                    if automatic:
+                        self.desktop_preparation = {'state': 'waiting', 'reason': str(exc), 'taskStateUnavailable': True}
+                        return True
+                    if not acknowledged:
+                        self.phase('failed', error=str(exc), taskStateUnavailable=True)
+                        return
+                    # Consent covers unknown tasks, never a new queued/unknown
+                    # write or a known busy owner found by the fresh audit.
+                    self.idle(pending_only=True)
+                except ValueError as exc:
+                    if not automatic:
+                        raise
+                    self.desktop_preparation = {'state': 'waiting', 'reason': str(exc)}
+                    return True
+                current, current_identities = observed()
+                if identities != current_identities or set(state['pids']) != set(current['pids']):
+                    raise ValueError('Codex 桌面进程已变化，请重新初始化连接')
+                if automatic:
+                    if self.bridge.closed.is_set() or cancelled():
+                        return False
+                    self.state = {'phase': 'preparing', 'operation': 'desktopRuntime', 'automatic': True,
+                                  'requestId': str(uuid.uuid4()), 'error': None}
+                    self.phase('preparing')
+                    self.desktop_preparation = {'state': 'preparing'}
+                # This receipt must precede stop/configure/start and live beside
+                # the shared lock, not in a gateway-specific account directory.
+                record_preparation(self.home, self.state['requestId'])
+                if state['running']:
+                    self.phase('stopping')
+                    stop_client(descriptor, state=current)
+                    self.wait_stopped()
+                self.invalidate()
+                if observed()[0]['running']:
+                    raise ValueError('Codex 桌面已被重新启动，请重新初始化连接')
+                if automatic and (self.bridge.closed.is_set() or cancelled()):
+                    raise ValueError('网关已停止准备，原生连接尚未完成；请在账号管理中重新准备')
+                if not preparation_error:
+                    self.phase('applying')
+                    configure(self.home, app.executable, self.runtime)
+                if automatic and (self.bridge.closed.is_set() or cancelled()):
+                    raise ValueError('网关已停止准备，尚未启动 Codex；请在账号管理中重新准备')
+                self.phase('starting')
+                app.start()
+                self.phase('verifying')
+                self.wait_ready(app, native_runtime=not preparation_error)
+                record_preparation(self.home, self.state['requestId'], complete=True)
+                self.phase('complete', error=None)
+                self.desktop_preparation = ({'state': 'failed', 'reason': str(preparation_error)}
+                                            if preparation_error else {'state': 'ready'})
+                return False
+        except Exception as exc:
+            # Keep a successfully saved configuration available for an explicit
+            # retry. Never force-stop or automatically start the App a second time.
+            if automatic and isinstance(exc, DesktopRuntimeBusy) and self.desktop_preparation.get('state') != 'preparing':
+                self.desktop_preparation = {'state': 'waiting', 'reason': str(exc)}
+                return True
+            if not automatic or self.desktop_preparation.get('state') == 'preparing':
+                self.phase('failed', error=str(exc))
+            self.desktop_preparation = {'state': 'failed', 'reason': str(exc)}
+            return False
 
     def snapshot_files(self):
         result = {}
@@ -670,6 +1256,7 @@ class Accounts:
                 private_bytes(self.home/name, base64.b64decode(data))
 
     def prepare(self, row, before):
+        self.require_managed_writes()
         folder = self.root/'prepared'
         shutil.rmtree(folder, ignore_errors=True)
         folder.mkdir(mode=0o700)
@@ -721,12 +1308,15 @@ class Accounts:
             try:
                 stream = connect_stream(self.bridge.ipc.path, timeout=.5)
             except OSError:
+                if sys.platform == 'darwin' and getattr(self.bridge, 'host', 'local') == 'local':
+                    from bridge.clients.codex.desktop_runtime import wait_stopped
+                    wait_stopped(self.home)
                 return
             stream.close()
             time.sleep(.25)
         raise ValueError('仍有桌面实例占用连接，请在电脑端关闭后重试')
 
-    def wait_ready(self, app, row=None):
+    def wait_ready(self, app, row=None, *, native_runtime=False):
         end = time.monotonic()+35
         while time.monotonic() < end:
             try:
@@ -734,6 +1324,13 @@ class Accounts:
                     time.sleep(.5)
                     continue
                 self.bridge.ipc.connect()
+                if native_runtime:
+                    # Desktop IPC can be available before the shared handshake.
+                    from bridge.clients.codex.desktop_runtime import connect
+                    client = connect(self.home, self.runtime)
+                    if client is None:
+                        raise ValueError('未能确认 Codex 原生共享连接')
+                    client.close()
                 if row:
                     with ManagedRPC(self.home, self.runtime) as rpc:
                         config = rpc.request('config/read', {'includeLayers': False}).get('config', {})
@@ -776,8 +1373,13 @@ class Accounts:
                 private_bytes(self.directory(current_id)/'auth.json', base64.b64decode(snapshot['auth.json']))
 
     def _switch(self, row, app):
-        with self.bridge.account.lock:
-            self._apply_switch(row, app)
+        try:
+            with self.bridge.account.lock, self.desktop_runtime_lifecycle():
+                self._apply_switch(row, app)
+        except Exception as exc:
+            # A competing gateway must not turn lock contention into an App
+            # exit or account mutation. The caller can explicitly retry later.
+            self.phase('failed', error=str(exc))
 
     def _apply_switch(self, row, app):
         before = None
@@ -791,6 +1393,7 @@ class Accounts:
             self.phase('stopping')
             self.invalidate()
             app.stop(provider='codex')
+            self.wait_stopped()
             stopped = True
             # The GUI may refresh tokens or persist settings while exiting.
             after_stop = self.snapshot_files()
@@ -800,11 +1403,20 @@ class Accounts:
                 backup['files'] = before
                 private_json(self.root/'rollback.json', backup)
                 self.retain_current(before)
-            self.wait_stopped()
             if changed:
                 folder = self.prepare(row, before)
+            from bridge.features.accounts.cli_sync import LocalCliSync
+            LocalCliSync(self.bridge)._codex_idle()
             self.phase('applying')
+            self.require_managed_writes()
+            if self.snapshot_files() != before:
+                raise ValueError('接入配置被外部工具修改，已停止覆盖')
             private_bytes(self.home/'config.toml', (folder/'config.toml').read_bytes())
+            backup['writtenConfig'] = base64.b64encode((folder/'config.toml').read_bytes()).decode('ascii')
+            private_json(self.root/'rollback.json', backup)
+            self.require_managed_writes()
+            if self.snapshot_files() != {'config.toml': backup['writtenConfig'], 'auth.json': before['auth.json']}:
+                raise ValueError('接入配置或认证被其他工具修改，已停止覆盖')
             if (folder/'auth.json').is_file():
                 private_bytes(self.home/'auth.json', (folder/'auth.json').read_bytes())
             else:
@@ -815,31 +1427,56 @@ class Accounts:
             self.wait_ready(app, row)
             with self.lock:
                 self.mark_active(row['id'])
+                if self.state.get('cliSync', {}).get('status') == 'pending':
+                    try:
+                        from bridge.features.accounts.cli_sync import LocalCliSync
+                        local_cli = LocalCliSync(self.bridge)
+                        local_cli._codex_idle()
+                        local_cli.verify('codex', row)
+                        self.state['cliSync'] = {'status': 'verified'}
+                    except Exception as error:
+                        self.state['cliSync'] = {'status': 'failed', 'error': str(error),
+                                                 'sharedConfigChanged': True}
                 self.phase('complete')
             (self.root/'rollback.json').unlink(missing_ok=True)
         except Exception:
             if stopped and before is not None:
                 try:
+                    self.require_managed_writes()
+                    expected = backup.get('writtenConfig', before['config.toml'])
+                    if self.snapshot_files()['config.toml'] != expected:
+                        raise ValueError('配置已被其他工具修改，禁止覆盖恢复')
                     self.phase('restoring')
                     app.stop(provider='codex')
+                    self.wait_stopped()
+                    self.require_managed_writes()
+                    if self.snapshot_files()['config.toml'] != expected:
+                        raise ValueError('配置已被其他工具修改，禁止覆盖恢复')
                     self.restore_files(before)
                     self.invalidate()
                     app.start()
                     self.wait_ready(app)
                     with self.lock:
                         self.mark_active(backup['activeId'])
+                    if self.state.get('cliSync', {}).get('status') == 'pending':
+                        self.state['cliSync'] = {'status': 'not-applied', 'desktopStatus': 'restored'}
                     self.phase('restored', error='切换未完成，已恢复原接入；请检查桌面程序或重新登录')
                     (self.root/'rollback.json').unlink(missing_ok=True)
                 except Exception:
+                    if self.state.get('cliSync', {}).get('status') == 'pending':
+                        self.state['cliSync'] = {'status': 'unknown', 'desktopStatus': 'unknown'}
                     self.phase('interrupted', error='自动恢复未完成，请在桌面端恢复原接入')
             else:
                 message = ('桌面程序未正常退出，请检查系统权限或手动关闭后重试' if self.state.get('phase') == 'stopping'
                            else '切换未执行，请检查账号登录、配置限制和桌面程序路径')
+                if self.state.get('cliSync', {}).get('status') == 'pending':
+                    self.state['cliSync'] = {'status': 'not-applied', 'desktopStatus': 'failed'}
                 self.phase('failed', error=message)
         finally:
             shutil.rmtree(self.root/'prepared', ignore_errors=True)
 
     def recover(self, value):
+        self.require_managed_writes()
         if value.get('confirmed') is not True:
             raise ValueError('请确认恢复原接入并重启桌面应用')
         with self.gate, self.lock:
@@ -851,11 +1488,15 @@ class Accounts:
                 return self.desktop_status()
             self.phase('restoring')
             def run():
-                with self.bridge.account.lock:
-                    try:
+                try:
+                    with self.bridge.account.lock, self.desktop_runtime_lifecycle():
                         app = DesktopApp(backup['desktopExecutable'], self.home)
                         app.validate(self.runtime)
                         app.stop(provider='codex')
+                        self.wait_stopped()
+                        self.require_managed_writes()
+                        if 'writtenConfig' in backup and self.snapshot_files()['config.toml'] not in (backup['writtenConfig'], backup['files']['config.toml']):
+                            raise ValueError('配置已被其他工具修改，禁止覆盖恢复')
                         self.restore_files(backup['files'])
                         if backup.get('threadsApplying'):
                             # Only older previews wrote thread migrations to this
@@ -869,8 +1510,8 @@ class Accounts:
                             self.mark_active(backup['activeId'])
                             self.phase('restored', error=None)
                         (self.root/'rollback.json').unlink(missing_ok=True)
-                    except Exception:
-                        self.phase('interrupted', error='恢复未完成，请检查桌面程序路径和运行状态')
+                except Exception:
+                    self.phase('interrupted', error='恢复未完成，请检查桌面程序路径和运行状态')
             self.thread = threading.Thread(target=run, daemon=True)
             self.thread.start()
             return self.desktop_status()

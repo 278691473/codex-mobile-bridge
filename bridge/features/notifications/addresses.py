@@ -4,9 +4,10 @@ import json
 import ipaddress
 import threading
 import time
+import uuid
 from pathlib import Path
 
-from bridge.features.notifications.channels import channels, publish, publish_bark, publish_pushplus, read_json, settings, write_json
+from bridge.features.notifications.channels import channels, publish, publish_bark, publish_pushplus, publish_webhook, read_json, settings, write_json, webhook_channel_config
 
 
 def gateway_ready(port, instance_id):
@@ -36,21 +37,28 @@ def ready_url(tunnel, port, instance_id):
     return url
 
 
-def entry_urls(preferences, hosts, quick_url='', external_status=None):
+def entry_urls(preferences, hosts, quick_url='', external_status=None, lan_addresses=None):
     """Enabled fixed entries, live tunnels, and selected LAN listeners, in click order."""
     urls = []
     for entry in preferences.get('connections', []):
         if not entry['enabled']:
             continue
         mode = entry['accessMode']
-        if mode == 'nas' or (mode in ('server', 'cloudflare', 'tailscale') and
+        if mode in ('nas', 'external') or (mode in ('server', 'cloudflare', 'tailscale') and
                 (external_status or {}).get(entry['id'], {}).get('state') == 'connected'):
             urls.append(entry['publicUrl'].rstrip('/'))
     if quick_url:
         urls.append(quick_url.rstrip('/'))
     if preferences.get('lan'):
-        selected = preferences.get('lanAddresses')
-        for host in hosts:
+        # hosts is only a startup snapshot; a running monitor supplies the
+        # live authority after DHCP or Wi-Fi changes.
+        if lan_addresses is None:
+            selected = set(preferences.get('lanAddresses') or [])
+            live_hosts = hosts
+        else:
+            selected = None
+            live_hosts = sorted(set(lan_addresses), key=ipaddress.ip_address)
+        for host in live_hosts:
             try:
                 address = ipaddress.ip_address(host)
             except ValueError:
@@ -66,13 +74,18 @@ def address_message(config, urls, first=False, test=False):
     title = 'Codex Mobile Bridge · ' + ('入口通知测试' if test else '网关已启动' if first else '访问入口已更新')
     name = config.get('addressName') or 'Codex Mobile Bridge'
     body = name + ('已启动。' if first else '的当前访问入口如下。')
-    body += '\n访问地址：\n' + '\n'.join(urls) + '\n局域网地址需在同一网络访问；固定域名需已完成部署。\n请使用原网关登录方式访问。'
+    body += '\n访问地址：\n' + '\n'.join(urls) + '\n局域网地址需在同一网络访问；固定域名需要先完成部署。\n请使用原网关登录方式访问。'
     return title, body
 
 
-def send_address(config, channel, urls, first=False, test=False):
+def send_address(config, channel, urls, first=False, test=False, event_id=''):
     title, body = address_message(config, urls, first, test)
-    {'ntfy': publish, 'bark': publish_bark, 'pushplus': publish_pushplus}[channel](config, title, body, urls[0])
+    if channel == 'webhook' or channel.startswith('webhook:'):
+        publish_webhook(webhook_channel_config(config, channel), title, body, urls[0], event='test' if test else 'gateway.started' if first else 'gateway.address_changed',
+                        event_id=event_id or uuid.uuid4().hex,
+                        host=config.get('addressName') or 'Codex Mobile Bridge', count=len(urls))
+    else:
+        {'ntfy': publish, 'bark': publish_bark, 'pushplus': publish_pushplus}[channel](config, title, body, urls[0])
 
 
 class AddressNotifications:
@@ -96,7 +109,10 @@ class AddressNotifications:
             return
         if self.state.get('urls') != urls:
             self.state = {'instanceId': self.instance_id, 'urls': urls,
-                          'first': not bool(self.state.get('urls')), 'deliveries': {}}
+                          'first': not bool(self.state.get('urls')), 'eventId': uuid.uuid4().hex, 'deliveries': {}}
+            write_json(self.path, self.state)
+        elif not self.state.get('eventId'):
+            self.state['eventId'] = uuid.uuid4().hex
             write_json(self.path, self.state)
         targets = channels(config)
         records = self.state['deliveries']
@@ -116,7 +132,7 @@ class AddressNotifications:
             if channels(current).get(channel) != target:
                 continue
             try:
-                send_address(current, channel, urls, first=self.state['first'])
+                send_address(current, channel, urls, first=self.state['first'], event_id=self.state['eventId'])
                 records[target] = {'delivered': True, 'time': now, 'channel': channel}
             except Exception:
                 attempts = record.get('attempts', 0) + 1

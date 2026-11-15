@@ -1,4 +1,5 @@
 import tempfile
+import threading
 import unittest
 import uuid
 from pathlib import Path
@@ -13,10 +14,34 @@ from bridge.clients.claude.mailbox import FileDesktop, MAX_REQUEST
 ROOT = Path(__file__).resolve().parents[1]
 
 
+class ClaudeNativeModes(unittest.TestCase):
+    def test_modes_use_observed_native_permission_and_keep_goal_unsupported(self):
+        adapter = Claude.__new__(Claude)
+        row = {'status': 'idle', 'requests': [], 'permissionMode': 'default'}
+        def call(action, sid=None, body=None, **kwargs):
+            if action == 'detail': return {'session': dict(row), 'capabilities': {'permissions': True}}
+            row['permissionMode'] = body['mode']; return {'status': 'accepted'}
+        adapter._call = Mock(side_effect=call)
+        self.assertTrue(adapter.call('detail', 'session')['capabilities']['plan'])
+        self.assertFalse(adapter.call('detail', 'session')['capabilities']['goal'])
+        adapter.call('work-mode', 'session', {'mode': 'plan'})
+        self.assertEqual(adapter.call('detail', 'session')['session']['collaborationMode'], 'plan')
+        row['status'] = 'active'
+        with self.assertRaises(ValueError): adapter.call('work-mode', 'session', {'mode': 'default'})
+        row['status'] = 'idle'
+        adapter.call('work-mode', 'session', {'mode': 'default'})
+        self.assertEqual(row['permissionMode'], 'default')
+
+
 class ClaudeContract(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(dir=ROOT/'.tmp'); self.addCleanup(self.temp.cleanup)
         self.adapter = Claude(Path(self.temp.name)/'adapter')
+        self.adapter.cli = Mock()
+        self.adapter.cli.profile_resolver.return_value = None
+        self.adapter.cli.listing.return_value = {'connected': False, 'sessions': []}
+        self.adapter.cli.contains.return_value = False
+        self.adapter.cli.status.return_value = {'cliAvailable': False, 'cliAuthReady': False}
         self.rows = {'code': {'sessionId': 'code-native', 'cwd': '/project', 'model': 'api/code', 'effort': 'high', 'permissionMode': 'default', 'isRunning': True},
                      'cowork': {'sessionId': 'cowork-native', 'cwd': '/vm/work', 'userSelectedFolders': ['/host/project'], 'model': 'api/cowork'}}
         self.calls = []
@@ -36,6 +61,41 @@ class ClaudeContract(unittest.IsolatedAsyncioTestCase):
         if method == 'mobileAccount': return {'provider': 'claude', 'readOnly': True, 'canManage': False, 'current': {'kind': 'api', 'label': 'Fixture'}}
 
     def sid(self, kind='code'): return claude_model.gateway_id(kind, self.rows[kind]['sessionId'])
+
+    async def test_manual_model_and_effort_use_native_setters_and_readback_on_both_surfaces(self):
+        original = self.call
+        async def call(kind, method, *args, **kwargs):
+            if method == 'mobileCatalog':
+                return {'models': [], 'capabilities': {'models': False, 'effort': False}}
+            return await original(kind, method, *args, **kwargs)
+        self.adapter.desktop.call.side_effect = call
+        for kind in ('code', 'cowork'):
+            result = await self.adapter.dispatch('catalog', self.sid(kind), {'section': 'models'})
+            self.assertTrue(result['capabilities']['models'])
+            self.assertTrue(result['capabilities']['manualEffort'])
+            await self.adapter.dispatch('settings', self.sid(kind), {'model': 'new-model', 'effort': 'high', 'manualEffort': True})
+            self.assertEqual(self.rows[kind]['model'], 'new-model')
+            self.assertEqual(self.rows[kind]['effort'], 'high')
+
+    async def test_catalog_failure_preserves_explicit_cached_selection_and_readback(self):
+        original = self.call
+        async def call(kind, method, *args, **kwargs):
+            if method == 'mobileCatalog':
+                raise BridgeUnavailable('catalog temporarily unavailable')
+            return await original(kind, method, *args, **kwargs)
+        self.adapter.desktop.call.side_effect = call
+        for kind in ('code', 'cowork'):
+            await self.adapter.dispatch('settings', self.sid(kind), {'model': 'exact/custom-model', 'effort': 'high'})
+            self.assertEqual(self.rows[kind]['model'], 'exact/custom-model')
+            self.assertEqual(self.rows[kind]['effort'], 'high')
+
+    async def test_unconfirmed_manual_selection_never_claims_success(self):
+        async def call(kind, method, *args, **kwargs):
+            if method == 'setModel': return False
+            return await self.call(kind, method, *args, **kwargs)
+        self.adapter.desktop.call.side_effect = call
+        with self.assertRaisesRegex(BridgeUnavailable, '未确认模型设置'):
+            await self.adapter.dispatch('settings', self.sid(), {'model': 'unconfirmed-model'})
 
     async def test_effort_only_update_does_not_require_resubmitting_model(self):
         await self.adapter.dispatch('settings', self.sid(), {'effort': 'low'})
@@ -59,6 +119,18 @@ class ClaudeContract(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, 'Cowork'):
             await self.adapter.dispatch('send', self.sid('cowork'), {**body, 'mode': 'steer'})
         self.assertFalse(any(method == 'sendMessage' for _, method, _ in self.calls))
+
+    async def test_project_references_use_native_mentions_without_upload_bytes(self):
+        for kind in ('code', 'cowork'):
+            self.calls.clear()
+            body = {'text': '检查文件', 'id': str(uuid.uuid4()), 'resolvedReferences': [
+                {'path': '/host/project/中文 文件.md', 'name': '中文 文件.md', 'kind': 'file'}]}
+            await self.adapter.dispatch('send', self.sid(kind), body)
+            args = next(args for _, method, args in self.calls if method == 'sendMessage')
+            mention = '@"/host/project/中文 文件.md"' if kind == 'code' else '@/host/project/中文 文件.md'
+            self.assertEqual(args[1], '检查文件\n\n' + mention)
+            self.assertIsNone(args[2]); self.assertIsNone(args[4] if kind == 'code' else args[3])
+            self.assertEqual(body['text'], '检查文件')
 
     async def test_invalid_effort_cannot_partially_change_model(self):
         async def call(kind, method, *args, **kwargs):
@@ -85,6 +157,8 @@ class ClaudeContract(unittest.IsolatedAsyncioTestCase):
         await self.adapter.dispatch('create', None, {'projectKey': project['key'], 'title': 'Test', 'firstMessage': 'Hello'})
         args = next(args for kind, method, args in self.calls if method == 'start')[0]
         self.assertEqual(args['message'], 'Hello'); self.assertEqual(args['userSelectedFolders'], ['/host/project']); self.assertNotIn('cwd', args)
+        self.adapter.cli.create.assert_not_called()
+        self.adapter.cli.listing.assert_not_called()
 
     async def test_account_has_no_session_dependency(self):
         value = await self.adapter.dispatch('account', None, {})
@@ -134,14 +208,14 @@ class ClaudeContract(unittest.IsolatedAsyncioTestCase):
         detail = await self.adapter.dispatch('detail', self.sid(), {})
         self.assertEqual([method for _, method, _ in self.calls], ['mobileList', 'mobileDetail'])
         self.assertTrue(listing['complete'])
-        self.assertEqual(listing['coverage'], {'code': True, 'cowork': True})
+        self.assertEqual(listing['coverage'], {'code': True, 'cowork': True, 'cli': False})
         self.assertEqual(detail['session']['id'], self.sid())
 
     async def test_missing_surface_never_claims_complete_activity_coverage(self):
         self.adapter.desktop.capabilities['cowork'] = []
         value = await self.adapter.dispatch('list', None, {})
         self.assertFalse(value['complete'])
-        self.assertEqual(value['coverage'], {'code': True, 'cowork': False})
+        self.assertEqual(value['coverage'], {'code': True, 'cowork': False, 'cli': False})
 
 
 class DesktopActionContract(unittest.IsolatedAsyncioTestCase):
@@ -153,8 +227,18 @@ class DesktopActionContract(unittest.IsolatedAsyncioTestCase):
         self.manager.adapters['claude'] = self.adapter
 
     def test_account_and_permission_reads_do_not_claim_mutation_receipts(self):
-        self.manager.call('claude', 'account')
-        self.manager.call('claude', 'access', 'session')
+        self.adapter.desktop.connected = True
+        self.adapter.setup_cancel = threading.Event()
+        self.adapter.connection_probe_failed = False
+        store = Mock()
+        store.lock = threading.RLock()
+        store._current.return_value = ('official', 'fixture-login', None)
+        store.models.return_value = {'models': [], 'groups': []}
+        with patch.object(self.manager, '_account_model_identity', return_value='fixture-account'), \
+                patch.object(self.manager, '_account_store', return_value=store), \
+                patch.object(self.manager, '_account_model_live', return_value=True):
+            self.manager.call('claude', 'account')
+            self.manager.call('claude', 'access', 'session')
         self.assertEqual(self.manager.db.execute('SELECT COUNT(*) FROM requests').fetchone()[0], 0)
         self.assertEqual(self.adapter.call.call_count, 2)
 

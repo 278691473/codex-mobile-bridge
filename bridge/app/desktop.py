@@ -10,17 +10,20 @@ import sys
 import time
 import zipfile
 from pathlib import Path
+from urllib.parse import urlsplit, parse_qsl
 
 from bridge.resources import project_root
 
-from bridge.features.auth.auth import Auth, password_record, session_hours
+from bridge.features.auth.auth import Auth, password_record, session_hours, session_file_lock
 from bridge.app.lifecycle import read_record, request_stop, request_pairing
-from bridge.features.notifications.channels import Notifications, read_json, write_json, settings, save_settings, publish, publish_bark, publish_pushplus
+from bridge.features.notifications.channels import Notifications, read_json, write_json, settings, save_settings, save_webhook_endpoint, webhook_config, publish, publish_bark, publish_pushplus, publish_webhook, visible_webhook, WebhookDeliveryError, resolved_webhook_provider
 from bridge.features.sessions.store import SessionStore, StoreUnavailable
 from bridge.clients.codex.remote import AppHosts
 from bridge.clients.codex.catalog import Catalog
 import bridge.features.network.access as access
 import bridge.features.network.addresses as network
+import bridge.features.network.interfaces as interfaces
+from bridge.features.network.adaptation import settings as adaptation_settings, migrate_legacy_interfaces
 from bridge.api.validation import FieldError, at_field
 
 
@@ -32,6 +35,7 @@ class Desktop:
         self.local_bridge = None
         self.local_sessions = None
         self.starting_until = 0
+        self.watch_hosts = None
 
     def close_local(self, check_busy=False):
         if self.local_bridge:
@@ -53,9 +57,14 @@ class Desktop:
         if self.local_bridge is None:
             from bridge.app.service import Bridge
             from bridge.clients.manager import DesktopSessions
-            from bridge.clients.discovery import discover_clients
+            from bridge.clients.discovery import discover_clients, inventory_current
             p = self.preferences()
-            discovered = discover_clients(p)
+            saved = read_json(self.data_dir/'desktop-sessions/settings.json', {})
+            inputs = {**p, **{key: value for key, value in saved.items()
+                               if key.endswith(('Home', 'Application', 'Applications'))}}
+            if saved.get('discoveryPreferences', {}).get('desktopExecutable'):
+                inputs['desktopExecutable'] = saved['discoveryPreferences']['desktopExecutable']
+            discovered = saved['discovered'] if inventory_current(saved, inputs) else discover_clients(inputs)
             runtime = p.get('codexBin')
             # Keep ordinary Windows installations automatic across App updates.
             # Preserve discovery's fallback for nonstandard desktop bundles.
@@ -80,7 +89,9 @@ class Desktop:
         bridge, sessions = self.local_services()
         if action == 'desktop-sessions':
             return sessions.control(value)
-        return bridge.accounts.control(value) if action == 'accounts' else bridge.accounts.account(value)
+        if action == 'cli-access':
+            return bridge.cli_access_control(value)
+        return bridge.accounts_control(value) if action == 'accounts' else bridge.accounts.account(value)
 
     def config(self):
         if not self.config_path.exists():
@@ -98,13 +109,21 @@ class Desktop:
         detected = str(bundled) if bundled.is_file() else str(executable) if executable.is_file() else shutil.which(name) or ''
         if not detected and sys.platform == 'darwin':
             detected = next((value for value in ('/opt/homebrew/bin/cloudflared', '/usr/local/bin/cloudflared') if Path(value).is_file()), '')
-        defaults = {'autoStart': False, 'port': 8787, 'lan': True, 'lanAddresses': None, 'localAccess': True, 'tunnel': (self.data_dir/'外网地址.txt').exists(),
+        defaults = {'autoStart': False, 'port': 8787, 'lan': True, 'lanAddresses': None, 'lanInterfaces': None,
+                    'localAccess': True, 'tunnel': (self.data_dir/'外网地址.txt').exists(),
                     'cloudflared': detected,
                     'codexHome': os.environ.get('CODEX_HOME', str(Path.home()/'.codex')),
                     'ipcPath': '', 'codexBin': ''}
         saved = read_json(self.data_dir/'desktop.json', {})
         if not saved.get('cloudflared') or not Path(saved['cloudflared']).is_file():
             saved['cloudflared'] = defaults['cloudflared']
+        if 'lanInterfaces' not in saved:
+            if saved.get('lanAddresses') is not None:
+                rows = interfaces.enumerate_interfaces()
+                saved['lanInterfaces'] = interfaces.migrate_addresses_to_interfaces(
+                    rows, network.selected_addresses(saved.get('lanAddresses')))
+            else:
+                saved['lanInterfaces'] = None
         rows = access.connections({**defaults, **saved})
         return {**defaults, **{k: v for k, v in saved.items() if k not in access.DEFAULTS},
                 'connections': rows, 'tunnel': any(c['enabled'] and c['accessMode'] == 'quick' for c in rows)}
@@ -133,7 +152,7 @@ class Desktop:
         managed = connected and bool(record) and (not record.get('instanceId') or record['instanceId'] == instance)
         if not managed and record and record.get('instanceId'):
             # A specific loopback listener (for example an SSH forward) can
-            # shadow our wildcard listener. Verify the live owner through its
+            # shadow a LAN listener. Verify the live owner through its
             # existing authenticated local channel, never merely a saved PID.
             try:
                 reply = request_pairing(self.data_dir, {'action': 'status', 'ids': []}, timeout=1)
@@ -150,12 +169,26 @@ class Desktop:
         config = self.config()
         preferences = self.preferences()
         runtime = self.status()
-        from run import addresses
-        selected = preferences.get('lanAddresses')
-        hosts = (addresses() if selected is None else ['127.0.0.1'] + selected) if preferences['lan'] else ['127.0.0.1']
+        selected = interfaces.selected_interfaces(preferences.get('lanInterfaces'))
+        network_status = {}
+        if runtime['running']:
+            value = read_json(self.data_dir/'network-status.json', {})
+            if (value.get('pid') == runtime.get('pid') and
+                    value.get('instanceId') == runtime.get('instanceId') and
+                    value.get('mode') == ('off' if not preferences['lan'] else
+                                          'all' if selected is None else 'selected')):
+                network_status = {key: item for key, item in value.items() if key != 'updatedAt'}
+        # The owned runtime publishes successfully bound addresses. A detected
+        # address can still be settling or have failed to bind; never advertise it.
+        rows = network_status.get('interfaces') if network_status else interfaces.enumerate_interfaces()
+        if runtime['running']:
+            static_addresses = network.selected_addresses(network_status.get('addresses', [])) or []
+        else:
+            static_addresses = (interfaces.eligible_lan_addresses(rows) if selected is None else
+                                interfaces.addresses_for_interfaces(rows, selected))
+        hosts = ['127.0.0.1', 'localhost'] + static_addresses if preferences['lan'] else ['127.0.0.1', 'localhost']
         if not preferences['localAccess']:
             hosts = [host for host in hosts if host not in ('127.0.0.1', 'localhost')]
-        urls = [f'http://{host}:{preferences["port"]}/' for host in hosts if host != 'localhost']
         quick = read_json(self.data_dir/'cloudflare-status.json', {})
         if not runtime['running'] or quick.get('pid') != runtime.get('pid'):
             quick = {}
@@ -167,8 +200,7 @@ class Desktop:
             value = public.read_text(encoding='utf-8').splitlines()[0]
             if value.startswith('https://'):
                 quick_url = value
-                urls.insert(0, value)
-        urls = [url+'/' for url in access.public_urls(preferences)] + urls
+        urls = [url if url == quick_url else url+'/' for url in access.phone_urls(preferences, hosts, quick_url)]
         external = {}
         for entry in preferences['connections']:
             status = read_json(self.data_dir/('ssh-status-'+entry['id']+'.json'), {})
@@ -177,27 +209,63 @@ class Desktop:
         executable = preferences['cloudflared']
         cloudflared = {'path': executable, 'available': bool(executable and Path(executable).is_file() and os.access(executable, os.X_OK))}
         from bridge.features.notifications.addresses import entry_urls
-        notification_urls = entry_urls(preferences, hosts, quick_url, external) if runtime['running'] else []
+        notification_urls = entry_urls(preferences, hosts, quick_url, external,
+                                       lan_addresses=static_addresses) if runtime['running'] else []
         notifications = settings(self.data_dir)
         return {'preferences': preferences, 'auth': {'username': config['auth'].get('username', 'admin'), 'mode': config['auth']['mode'], 'sessionHours': config['auth'].get('sessionHours', 12)},
-                'origins': config.get('origins', []), 'notifications': {**notifications, 'token': '', 'hasToken': bool(notifications['token']), 'barkKey': '', 'hasBarkKey': bool(notifications['barkKey']), 'pushplusToken': '', 'hasPushplusToken': bool(notifications['pushplusToken'])},
-                'watches': self.notification_watches({'action': 'list'})['watches'],
+                'origins': config.get('origins', []), 'notifications': {**notifications, 'token': '', 'hasToken': bool(notifications['token']), 'barkKey': '', 'hasBarkKey': bool(notifications['barkKey']), 'pushplusToken': '', 'hasPushplusToken': bool(notifications['pushplusToken']), **visible_webhook(notifications)},
+                'watches': self.notification_watches({'action': 'list'}, preferences=preferences)['watches'],
                 'notificationUrls': notification_urls,
                 'securityNotificationStatus': read_json(self.data_dir/'security-notifications.json', {}),
                 'addressNotificationStatus': read_json(self.data_dir/'address-notifications.json', {}),
                 'notificationStatus': read_json(self.data_dir/'notification-status.json', {}),
                 'dataDir': str(self.data_dir), 'credentialsAvailable': (self.data_dir/'首次登录.txt').exists(),
+                'networkInterfaces': rows, 'networkStatus': network_status,
+                'networkAdaptation': {**adaptation_settings(self.data_dir),
+                                      'running': runtime['running']},
                 'runtime': runtime, 'urls': urls, 'externalStatus': external, 'cloudflared': cloudflared, 'quickTunnel': quick}
 
+    def network_adaptation(self, value):
+        if not isinstance(value, dict) or not (value == {'action': 'status'} or
+                (set(value) == {'action', 'enabled'} and value['action'] == 'set'
+                 and type(value['enabled']) is bool)):
+            raise ValueError('网络变化自动恢复请求无效')
+        record = read_record(self.data_dir/'gateway-control.json')
+        runtime = self.status()
+        if record:
+            if not runtime['running']:
+                raise ValueError('网关状态暂不可用，请稍后刷新')
+            if not record.get('networkAdaptationManagement'):
+                raise ValueError('请重新启动新版网关以调整网络变化自动恢复')
+            return request_pairing(self.data_dir, {'action': 'network-adaptation', 'value': value}, timeout=10)
+        if runtime['running'] or runtime.get('portOccupied') or time.monotonic() < self.starting_until:
+            raise ValueError('网关正在启动或端口被占用，请稍后刷新')
+        saved = adaptation_settings(self.data_dir,
+                                    {'enabled': value['enabled']} if value['action'] == 'set' else None)
+        return {**saved, 'running': False}
+
     def save(self, value):
+        with session_file_lock(self.config_path):
+            return self._save(value)
+
+    def _save(self, value):
         old_preferences = self.preferences()
         preferences = {**old_preferences, **{k: v for k, v in value['preferences'].items() if k in old_preferences}}
+        incoming_preferences = value.get('preferences', {})
+        incoming_interfaces = incoming_preferences.get('lanInterfaces')
+        if (incoming_interfaces is None and 'lanInterfaces' not in incoming_preferences) or \
+                (incoming_interfaces is None and incoming_preferences.get('lanAddresses') is not None):
+            preferences['lanInterfaces'] = interfaces.migrate_addresses_to_interfaces(
+                interfaces.enumerate_interfaces(), incoming_preferences.get('lanAddresses',
+                                                                          preferences.get('lanAddresses')))
         preferences['connections'] = access.validate_connections(preferences)
         preferences['tunnel'] = any(c['enabled'] and c['accessMode'] == 'quick' for c in preferences['connections'])
         port = preferences['port']
         if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
             raise FieldError('端口必须为 1–65535', 'port')
         preferences['lanAddresses'] = at_field('lan-scope', network.selected_addresses, preferences['lanAddresses'])
+        preferences['lanInterfaces'] = at_field('lan-scope', interfaces.selected_interfaces,
+                                                preferences['lanInterfaces'])
         for key in ('lan', 'tunnel', 'autoStart', 'localAccess'):
             if not isinstance(preferences[key], bool):
                 raise ValueError('网络开关格式不正确')
@@ -209,15 +277,23 @@ class Desktop:
         if self.status()['running'] and any(preferences[k] != old_preferences[k] for k in preferences if k != 'autoStart'):
             raise ValueError('请先停止网关再更改网络或运行路径，以免正在使用的地址失效')
         config = self.config()
+        old_auth = dict(config['auth'])
         auth = value['auth']
         if auth.get('mode') not in ('password', 'none') or not isinstance(auth.get('username'), str) or not auth['username'].strip() or len(auth['username']) > 200:
             raise FieldError('请填写有效的登录账号和登录方式', 'username')
         if auth['mode'] == 'none' and any(c['enabled'] and c['accessMode'] == 'tailscale' and c['tailscaleMode'] == 'funnel' for c in preferences['connections']):
             raise FieldError('Funnel 公网入口需要启用网关登录验证；手机仍可扫码配对。', 'auth-mode')
         password = auth.get('password', '')
+        revoke_bound_devices = auth.get('revokeBoundDevices', True)
+        if type(revoke_bound_devices) is not bool:
+            raise FieldError('设备撤销选项格式不正确', 'revoke-bound-devices')
         hours = at_field('session-hours', session_hours, auth.get('sessionHours', config['auth'].get('sessionHours', 12)))
         if not isinstance(password, str) or (password and not 12 <= len(password) <= 1000):
             raise FieldError('新密码至少需要 12 个字符', 'password')
+        preserve_bound_devices = (bool(password) and not revoke_bound_devices and old_auth.get('mode') == 'password'
+                                  and auth['mode'] == 'password' and old_auth.get('username') == auth['username'].strip())
+        if preserve_bound_devices and (self.status()['running'] or self.status()['portOccupied']):
+            raise ValueError('请先停止网关再更改密码并保留手机绑定')
         origins = value.get('origins', [])
         if not isinstance(origins, list):
             raise FieldError('额外 HTTPS 源格式不正确', 'origins')
@@ -242,8 +318,13 @@ class Desktop:
         config['publicUrl'] = access.public_url(preferences)
         config['connections'] = preferences['connections']
         config['lanAddresses'] = preferences['lanAddresses']
+        config['lanInterfaces'] = preferences['lanInterfaces']
         config['localAccess'] = preferences['localAccess']
-        write_json(self.config_path, config)
+        if preserve_bound_devices:
+            Auth.preserve_trusted_on_password_change(old_auth, config['auth'], self.data_dir,
+                                                     lambda: write_json(self.config_path, config))
+        else:
+            write_json(self.config_path, config)
         write_json(self.data_dir/'desktop.json', preferences)
         if password:
             (self.data_dir/'首次登录.txt').unlink(missing_ok=True)
@@ -267,6 +348,7 @@ class Desktop:
         if state['running']:
             return {'started': False, 'message': '已连接正在运行的网关'}
         self.close_local(check_busy=True)
+        migrate_legacy_interfaces(self.config_path)
         preferences = self.preferences()
         if not Path(preferences['codexHome']).expanduser().is_dir():
             raise ValueError('请先选择存在的 Codex 数据目录')
@@ -292,16 +374,18 @@ class Desktop:
                 if entry['accessMode'] == 'server' and entry.get('sshAuth') == 'password' and not secret.get('password'):
                     raise FieldError('请先填写并保存 SSH 密码。', 'password', entry['id'])
                 temporary[entry['id']] = secret
-        for address in network.bindings(preferences):
-            probe = socket.socket()
-            if os.name != "nt":
-                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                probe.bind((address, preferences['port']))
-            except OSError as exc:
-                raise ValueError('所选地址不可用或端口已被占用，请检查网卡与端口；不会自动开放其他地址') from exc
-            finally:
-                probe.close()
+        if preferences['lan']:
+            rows = interfaces.enumerate_interfaces()
+            for address in network.bindings(preferences, rows):
+                probe = socket.socket()
+                if os.name != "nt":
+                    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    probe.bind((address, preferences['port']))
+                except OSError as exc:
+                    raise ValueError('所选网卡地址不可用或端口已被占用，请检查网卡与端口；不会自动开放其他网卡') from exc
+                finally:
+                    probe.close()
         command = [sys.executable] if getattr(sys, 'frozen', False) else [sys.executable, str(project_root()/'desktop.py')]
         command += ['serve', '--data-dir', str(self.data_dir), '--connection-secrets-stdin']
         kwargs = {'creationflags': subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == 'nt' else {'start_new_session': True}
@@ -326,6 +410,9 @@ class Desktop:
 
     def accounts(self, value):
         return self.local_control('accounts', 'accountsManagement', value)
+
+    def cli_access(self, value):
+        return self.local_control('cli-access', 'cliAccessManagement', value)
 
     def desktop_sessions(self, value):
         return self.local_control('desktop-sessions', 'desktopSessionsManagement', value)
@@ -362,7 +449,7 @@ class Desktop:
             raise ValueError('网关状态暂不可用，请稍后刷新设备列表')
         return Auth(self.config()['auth'], self.data_dir).manage(value)
 
-    def notification_watches(self, value):
+    def notification_watches(self, value, *, preferences=None):
         if value.get('action') != 'list':
             record = read_record(self.data_dir/'gateway-control.json')
             if self.status()['running']:
@@ -374,8 +461,15 @@ class Desktop:
             else:
                 Notifications(None, self.data_dir).control(value)
         rows = read_json(self.data_dir/'notification-watches.json', [])
-        home = Path(self.preferences()['codexHome']).expanduser()
-        store, hosts = SessionStore(home), AppHosts(home).hosts()
+        if not rows:
+            return {'watches': rows}
+        home = Path((preferences or self.preferences())['codexHome']).expanduser()
+        store = SessionStore(home) if any(row['host'] == 'local' for row in rows) else None
+        hosts = {}
+        if any(row['host'] != 'local' for row in rows):
+            if self.watch_hosts is None or self.watch_hosts.home != home:
+                self.watch_hosts = AppHosts(home)
+            hosts = self.watch_hosts.hosts(cached=True)
         for row in rows:
             row['hostLabel'] = '此电脑' if row['host'] == 'local' else hosts.get(row['host'], {}).get('displayName') or hosts.get(row['host'], {}).get('alias') or row['host']
             if row['host'] == 'local':
@@ -409,15 +503,25 @@ class Desktop:
                 raise ValueError('部分通道发送失败：' + ', '.join(failed) + '；请在手机确认其他通道是否收到。')
             return {'message': '已向启用通道发送当前入口，请在手机确认是否收到。'}
         channel = (value or {}).get('channel', 'ntfy')
-        if channel not in ('ntfy', 'bark', 'pushplus'):
+        webhook_id = (value or {}).get('webhookId', 'legacy')
+        if channel not in ('ntfy', 'bark', 'pushplus', 'webhook'):
             raise ValueError('未知通知通道')
-        name = {'bark': 'Bark', 'ntfy': 'ntfy', 'pushplus': 'PushPlus'}[channel]
-        sender = {'bark': publish_bark, 'ntfy': publish, 'pushplus': publish_pushplus}[channel]
+        name = {'bark': 'Bark', 'ntfy': 'ntfy', 'pushplus': 'PushPlus', 'webhook': 'Webhook'}[channel]
+        sender = {'bark': publish_bark, 'ntfy': publish, 'pushplus': publish_pushplus, 'webhook': publish_webhook}[channel]
+        config = settings(self.data_dir)
+        if channel == 'webhook':
+            config = webhook_config(config, webhook_id)
+        elif 'webhookId' in (value or {}):
+            raise ValueError('Webhook 标识只适用于 Webhook 测试')
         try:
-            sender(settings(self.data_dir), 'Codex 手机通知测试', f'收到这条消息表示 {name} 通道已连通。')
+            sender(config, 'Codex 手机通知测试', f'收到这条消息表示 {name} 通道已连通。')
+        except WebhookDeliveryError as error:
+            raise ValueError(str(error)) from None
         except Exception:
             raise ValueError(f'{name} 测试失败，请检查服务地址、认证和网络') from None
-        return {'message': f'{name} 已接受测试通知，请在手机确认是否收到'}
+        provider = resolved_webhook_provider(config) if channel == 'webhook' else 'generic'
+        accepted = {'feishu': '飞书', 'dingtalk': '钉钉', 'discord': 'Discord', 'telegram': 'Telegram'}.get(provider, name) + ' 已接受测试通知'
+        return {'message': f'{accepted}，请在手机确认是否收到'}
 
     def deployment(self, value):
         entry = access.select_connection(self.preferences(), value)
@@ -435,6 +539,10 @@ class Desktop:
 
     def read_credentials(self, value):
         # Explicit private IPC only. Never include plaintext in polled snapshots.
+        if isinstance(value, dict) and value.get('channel') == 'webhook':
+            if set(value) - {'channel', 'webhookId'}:
+                raise ValueError('Webhook 地址读取请求格式不正确')
+            return {'webhookUrl': webhook_config(settings(self.data_dir), value.get('webhookId', 'legacy')).get('webhookUrl', '')}
         if value.get('id'):
             from bridge.features.accounts.secrets import read
             if not any(c['id'] == value['id'] for c in self.preferences()['connections']):
@@ -447,6 +555,10 @@ class Desktop:
         if initial.exists():
             result['password'] = next((line[3:] for line in initial.read_text(encoding='utf-8').splitlines() if line.startswith('密码：')), '')
         return result
+
+    def webhook_endpoint(self, value):
+        config, selected = save_webhook_endpoint(self.data_dir, value)
+        return {**visible_webhook(config), 'selectedWebhookId': selected}
 
     def connection_credentials(self, value):
         entry = next((c for c in self.preferences()['connections'] if c['id'] == value.get('id')), None)
@@ -529,7 +641,20 @@ class Desktop:
                     records[-1].append(line)
             sections.append({'name': label, 'text': '\n'.join('\n'.join(record) for record in reversed(records))})
         notifications = settings(self.data_dir)
-        for secret in (notifications.get('token'), notifications.get('barkKey'), notifications.get('pushplusToken')):
+        secrets = [notifications.get('token'), notifications.get('barkKey'), notifications.get('pushplusToken'),
+                   notifications.get('webhookSignSecret')]
+        for entry in [notifications, *notifications.get('webhookEndpoints', [])]:
+            webhook = entry.get('webhookUrl') or ''
+            parsed_webhook = urlsplit(webhook) if webhook else None
+            secrets.append(webhook)
+            if parsed_webhook:
+                secrets.extend((parsed_webhook.path if parsed_webhook.path not in ('', '/') else '', parsed_webhook.query))
+                secrets.extend(segment for segment in parsed_webhook.path.split('/') if len(segment) >= 8)
+                secrets.extend(value for _, value in parse_qsl(parsed_webhook.query) if value)
+            for header in (entry.get('webhookHeaders') or {}).values():
+                secrets.extend((header, header.rsplit(' ', 1)[-1]))
+            secrets.append(entry.get('webhookSignSecret'))
+        for secret in sorted({value for value in secrets if isinstance(value, str) and value}, key=len, reverse=True):
             if secret:
                 for section in sections:
                     section['text'] = section['text'].replace(secret, '[REDACTED]')

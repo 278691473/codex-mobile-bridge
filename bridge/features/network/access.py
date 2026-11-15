@@ -4,6 +4,8 @@ import ipaddress
 import json
 import re
 import shlex
+import socket
+import ssl
 from urllib.parse import urlsplit
 
 from bridge.features.auth.tls import client_context
@@ -21,8 +23,14 @@ def origin(value, scheme='https'):
         raise ValueError('地址不能包含空白字符')
     parsed = urlsplit(value)
     if (parsed.scheme != scheme or not parsed.hostname or parsed.username or parsed.password
-            or parsed.path not in ('', '/') or parsed.query or parsed.fragment):
+            or parsed.path not in ('', '/') or '?' in value or '#' in value):
         raise ValueError(f'请填写完整 {scheme.upper()} 地址，不含路径、账号或参数')
+    try:
+        port = parsed.port
+    except ValueError:
+        raise ValueError('地址端口不正确') from None
+    if parsed.netloc.endswith(':'):
+        raise ValueError('地址端口不正确')
     host = parsed.hostname
     try:
         ipaddress.ip_address(host)
@@ -31,11 +39,11 @@ def origin(value, scheme='https'):
     except ValueError:
         if not re.fullmatch(r'[a-zA-Z0-9](?:[a-zA-Z0-9.-]{0,251}[a-zA-Z0-9])?', host):
             raise ValueError('请使用域名或 IP 地址；国际化域名请填写 Punycode')
-    if parsed.port is not None and not 1 <= parsed.port <= 65535:
+    if port is not None and not 1 <= port <= 65535:
         raise ValueError('地址端口不正确')
     authority = '['+host+']' if ':' in host else host
-    if parsed.port is not None and parsed.port != (443 if scheme == 'https' else 80):
-        authority += ':'+str(parsed.port)
+    if port is not None and port != (443 if scheme == 'https' else 80):
+        authority += ':'+str(port)
     return f'{scheme}://{authority.lower()}'
 
 
@@ -55,7 +63,7 @@ def server_ip_url(preferences):
 
 def validate(preferences):
     p = {**DEFAULTS, **preferences}
-    if p['accessMode'] not in ('lan', 'quick', 'cloudflare', 'server', 'nas', 'tailscale'):
+    if p['accessMode'] not in ('lan', 'quick', 'cloudflare', 'server', 'nas', 'tailscale', 'external'):
         raise FieldError('请选择有效的外网连接方式', 'connection-kind')
     if p['publicUrl']:
         p['publicUrl'] = at_field('publicUrl', origin, p['publicUrl'])
@@ -79,13 +87,11 @@ def validate(preferences):
     port = p['sshRemotePort']
     if isinstance(port, bool) or not isinstance(port, int) or not 1024 <= port <= 65535:
         raise FieldError('服务器回环端口须为 1024–65535', 'sshRemotePort')
-    if p['accessMode'] in ('nas', 'cloudflare') and not p['publicUrl']:
+    if p['accessMode'] in ('nas', 'cloudflare', 'external') and not p['publicUrl']:
         raise FieldError('请填写手机访问的固定 HTTPS 地址', 'publicUrl')
     if p['accessMode'] == 'server':
         if p['sshAuth'] == 'config' and not p['sshTarget']:
             raise FieldError('请填写服务器的 SSH 目标', 'sshTarget')
-        if urlsplit(p['publicUrl']).port not in (None, 443):
-            raise FieldError('服务器 HTTPS 入口使用 443 端口；已有其他入口请选择 NAS / 已有反代', 'publicUrl')
     if p['accessMode'] == 'nas':
         if not p['lan'] or not p['proxyUpstream']:
             raise FieldError('NAS 方式需要开启局域网访问并填写 NAS 可达的电脑 HTTP 地址', 'proxyUpstream')
@@ -139,7 +145,7 @@ def validate_connections(preferences):
         if row['id'] in ids:
             raise ValueError('连接配置 ID 重复')
         ids.add(row['id'])
-        if not isinstance(row.get('enabled'), bool) or row.get('accessMode') not in ('quick', 'cloudflare', 'server', 'nas', 'tailscale'):
+        if not isinstance(row.get('enabled'), bool) or row.get('accessMode') not in ('quick', 'cloudflare', 'server', 'nas', 'tailscale', 'external'):
             raise ValueError('连接类型或开关格式不正确')
         if not isinstance(row.get('name', ''), str) or len(row.get('name', '')) > 100:
             raise FieldError('连接名称最多 100 个字符', 'name', row['id'])
@@ -179,7 +185,14 @@ def validate_connections(preferences):
 
 def public_urls(preferences):
     return [c['publicUrl'] for c in connections(preferences)
-            if c['enabled'] and c['accessMode'] in ('server', 'nas', 'cloudflare', 'tailscale') and c['publicUrl']]
+            if c['enabled'] and c['accessMode'] in ('server', 'nas', 'cloudflare', 'tailscale', 'external') and c['publicUrl']]
+
+
+def phone_urls(preferences, hosts, quick_url=''):
+    """Ordered entry list used by both the desktop overview and paired phones."""
+    fixed = [url.rstrip('/') for url in public_urls(preferences)]
+    local = [f'http://{host}:{preferences["port"]}' for host in hosts if host != 'localhost']
+    return list(dict.fromkeys(fixed + ([quick_url.rstrip('/')] if quick_url else []) + local))
 
 
 def public_url(preferences):
@@ -188,7 +201,7 @@ def public_url(preferences):
 
 def select_connection(preferences, value, allow_disabled=False):
     selected = next((c for c in connections(preferences) if c['id'] == value.get('id')), None)
-    if not selected or (not selected['enabled'] and not allow_disabled) or selected['accessMode'] not in ('server', 'nas', 'cloudflare', 'tailscale'):
+    if not selected or (not selected['enabled'] and not allow_disabled) or selected['accessMode'] not in ('server', 'nas', 'cloudflare', 'tailscale', 'external'):
         raise ValueError('请先保存并启用需要操作的固定连接配置')
     return validate({**selected, 'lan': preferences['lan'], 'port': preferences['port']})
 
@@ -201,6 +214,7 @@ def deployment(preferences):
         raise ValueError('请先选择并保存自有服务器或 NAS 配置')
     ssh_example = shlex.join(['ssh', p['sshTarget']] if p['sshAuth'] == 'config' else ['ssh', '-p', str(p['sshPort']), p['sshUser']+'@'+p['sshHost']])
     url = p['publicUrl']
+    https_port = urlsplit(url).port or 443
     try:
         ipaddress.ip_address(urlsplit(url).hostname)
         ip_entry = True
@@ -248,7 +262,7 @@ volumes:
 
 1. 可使用 `{ssh_example}` 检查服务器连接，也可在 App 内使用“检查 SSH 登录”。首次连接需核对主机指纹；密码、私钥或 SSH Agent 在 App 配置，凭据不包含在此部署包内。
 2. 服务器须允许远程端口转发（AllowTcpForwarding remote 或 yes），GatewayPorts 使用 no 或 clientspecified。回环端口 {p['sshRemotePort']} 须空闲。不要使用 GatewayPorts yes，以免强制向公网绑定。
-3. 将域名 DNS 的 A/AAAA 记录指向这台服务器。将本包解压到一个新目录；服务器须已安装 Docker Compose，且公网 TCP 80、443 可达并空闲。已有网站占用这两个端口时，不要停止旧网站；使用已有反代，将上游设为 {upstream} 并保留公网 Host 即可，无需启动本包的 Caddy。
+3. 将域名 DNS 的 A/AAAA 记录指向这台服务器。将本包解压到一个新目录；服务器须已安装 Docker Compose，且公网 HTTPS TCP {https_port} 可达并空闲；证书验证需要的 TCP 80、443 也须可达。已有网站占用这些端口时，使用已有反代，将上游设为 {upstream} 并保留公网 Host 即可。
 4. 在电脑 App 保存配置并启动网关。电脑主动建立 SSH 回程连接，不要求服务器能直接访问电脑的局域网 IP。
 5. 在服务器解压目录执行：
 
@@ -322,7 +336,7 @@ docker compose logs --tail=50
 
 1. Check `{ssh_example}` from your computer, or use Check SSH sign-in in the App. Verify the host fingerprint. Configure password, key or agent authentication in the App; credentials are not included in this package.
 2. The server must allow remote forwarding (`AllowTcpForwarding remote` or `yes`). Keep `GatewayPorts no` or `clientspecified`, never `yes`. Port {p['sshRemotePort']} must be free and restricted to loopback.
-3. Point the domain's A/AAAA records to this server. Have the user or administrator manually install Docker Compose if needed and ensure public TCP 80/443 are reachable and free. Extract this bundle into a new directory. The Caddy service uses host networking on Linux Docker Engine, on the same host as SSH; do not run this bundle on Mac/Windows Docker Desktop.
+3. Point the domain's A/AAAA records to this server. Have the user or administrator manually install Docker Compose if needed and ensure HTTPS TCP {https_port} is reachable and free, with TCP 80/443 available for certificate validation. Extract this bundle into a new directory. The Caddy service uses host networking on Linux Docker Engine, on the same host as SSH; do not run this bundle on Mac/Windows Docker Desktop.
 4. Start the computer gateway. It connects out to the server over SSH, including behind NAT or on a campus network.
 5. On the server run `docker compose config`, then `docker compose up -d`. Caddy obtains and renews certificates, persisted in the named Docker volumes. If an existing proxy already owns 80/443, keep it and use {upstream} as its upstream, preserving the public Host header; do not start another Caddy instance.
 '''
@@ -378,7 +392,7 @@ This is a reference for user review and manual setup, not an automatic deploymen
 
 1. 优先复用服务器现有 HTTPS 反向代理，将上述 IP 入口转发到 {upstream}，保留 Host，关闭缓存和响应缓冲。
 2. 如使用本包的可选 Caddy 示例，由管理员将证书完整链和私钥放在服务器上的 tls/fullchain.pem 与 tls/privkey.pem（不随本包提供），限制私钥权限并负责证书续期。不要将私钥传回网关或提交到代码仓库。
-3. 服务器公网 TCP 443 需可达。SSH 需允许远程转发，保持 GatewayPorts no，{p['sshRemotePort']} 仅监听 127.0.0.1，不向公网开放。Docker 示例仅适用于同一 SSH 服务器上的 Linux Docker Engine；已有服务占用端口时不要另启容器。
+3. 服务器公网 TCP {https_port} 需可达。SSH 需允许远程转发，保持 GatewayPorts no，{p['sshRemotePort']} 仅监听 127.0.0.1，不向公网开放。Docker 示例仅适用于同一 SSH 服务器上的 Linux Docker Engine；已有服务占用端口时使用现有反代。
 4. 保存电脑配置、检查 SSH 登录并核对指纹，再启动网关。若使用 Docker 示例，在服务器执行 docker compose config 验证后，再由管理员执行 docker compose up -d。
 5. 点击“检测固定入口”，再用手机蜂窝网络测试。证书错误时修正证书，502 时检查 SSH 隧道；SSH 登录成功不代表 HTTPS 入口已经可用。
 
@@ -393,7 +407,7 @@ No domain DNS record is needed. Provision a valid certificate trusted by the pho
 
 1. Prefer an existing HTTPS reverse proxy. Forward this IP entry to {upstream}, preserve Host and disable caching and response buffering.
 2. For the optional Caddy example, place the full certificate chain and private key on the server at tls/fullchain.pem and tls/privkey.pem. They are not included. Restrict key permissions and arrange renewal. Never send the private key to the gateway or commit it.
-3. Make public TCP 443 reachable. Allow SSH remote forwarding with GatewayPorts no and restrict port {p['sshRemotePort']} to 127.0.0.1. The Docker example requires Linux Docker Engine on the SSH server; do not start another proxy over existing listeners.
+3. Make public TCP {https_port} reachable. Allow SSH remote forwarding with GatewayPorts no and restrict port {p['sshRemotePort']} to 127.0.0.1. The Docker example requires Linux Docker Engine on the SSH server; do not start another proxy over existing listeners.
 4. Save the computer configuration, check SSH sign-in and the host fingerprint, then start the gateway. For the Docker example, validate with docker compose config before the administrator runs docker compose up -d.
 5. Check the fixed entry, then test on phone cellular data. Fix certificate errors at the server; for 502 check the SSH tunnel. Successful SSH authentication alone does not prove HTTPS access.
 
@@ -411,9 +425,14 @@ def read_auth(url):
     try:
         connection.request('GET', '/api/auth', headers={'Cache-Control': 'no-cache'})
         response = connection.getresponse()
+        if 300 <= response.status < 400:
+            raise ValueError(f'入口返回 HTTP {response.status} 重定向；请直接填写网关的 HTTPS 根地址')
         if response.status != 200:
             raise ValueError(f'入口返回 HTTP {response.status}；检查反代上游、Host 和 HTTPS 配置')
-        value = json.loads(response.read(65536))
+        try:
+            value = json.loads(response.read(65536))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ValueError('入口返回的不是网关响应，请检查反代目标') from None
         if not isinstance(value, dict):
             raise ValueError('入口返回的不是网关响应，请检查反代目标')
         return value
@@ -427,7 +446,12 @@ def check_entry(preferences, instance_id=None):
         raise ValueError('请先保存固定 HTTPS 入口配置')
     if instance_id is None:
         instance_id = read_auth(f'http://127.0.0.1:{preferences["port"]}').get('instanceId')
-    remote = read_auth(url)
+    try:
+        remote = read_auth(url)
+    except ssl.SSLError:
+        raise ValueError('HTTPS 证书或 TLS 握手失败；请检查域名、证书和反代配置') from None
+    except (socket.gaierror, TimeoutError, ConnectionError, OSError, http.client.HTTPException):
+        raise ValueError('无法连接固定 HTTPS 入口；请检查域名解析、网络和反代是否运行') from None
     if not instance_id or remote.get('instanceId') != instance_id:
         raise ValueError('入口没有连接到当前网关；请检查反代目标，旧版网关须先更新并重启')
     return {'message': '固定 HTTPS 入口已连到当前网关。请再用手机蜂窝网络验证登录与聊天。', 'url': url}

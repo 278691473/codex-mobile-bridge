@@ -29,6 +29,79 @@ PREVIOUS_QUIT_SOURCES = ('2a9926ace79180be27c248bc68c6c6d9367c58c318c8dd8a8402a9
 PREVIOUS_CONTEXT_SOURCES = ('c60b404ff5efcadc4329b125ff8524293bc4e4c2e29224393ea9cec5753ea2a1',
                             '4fdfe35712002fc368a2db8fd4e18ab2cc851bacb31473f583ffde817d564068')
 
+# Revision 4 before bounded native history pages, LF and Windows CRLF.
+PREVIOUS_HISTORY_SOURCES = ('7ff9ce99e26c3b1b9e54ade4db4a634976096f3a429b6f4d81e7401d3e067f8f',
+                            '2bd8e0711db16fe5c2d2a39f473f8e0f747e5f9067dae64572129c56ff0e7136')
+
+# Revision 4 before explicit new project directories, LF and Windows CRLF.
+PREVIOUS_PROJECT_SOURCES = ('2f71a8c64cdf798843386310c359e41b57c3b2b26130f448f97c6603b4fa5762',
+                            '2ad4a7923d1d124d2c2c94a9f46e15ab45ef4e2b91a937abe45e0bdf0616831a')
+
+# Revision 4 shipped with the WSL/project preview, before native workspace
+# registration and forks. Keep both source encodings during an explicit upgrade.
+PREVIOUS_WORKSPACE_SOURCES = ('b7f3c05ec967e736897f068b9da2820f7ce98a151a12051691e641540174e640',
+                              '0d673a9d13fb7f32da07f36ff34e45d1fd48de555cb20661e4ab8192b1427582')
+
+# Revision 5 before reversible native archive and guarded activity semantics.
+PREVIOUS_ARCHIVE_SOURCES = ('0b7d749e831f181c7b0ea9ad9d4bc6fd5858355c8facb52e1a5e3e6a8c0fce8d',
+                            '0f3e7b0962a8f1a9de1a9333afaa74316c83ab6cad18b820a132b8179d3e592e')
+
+
+# Revision 6 before explicitly confirmed stop-before-archive, LF and CRLF.
+PREVIOUS_DISCONNECT_SOURCES = ('b8b05cd4d93af60913b505c842dc6b74d2860199980bab079fe2b4e17e153752',
+                               '95451e5ff26ba7e0e5f139a1109ceeaaf3dba1a51b169d3e5d5207d5ef29873b')
+
+
+# Revision 7 before per-message model metadata, LF and Windows CRLF.
+PREVIOUS_MESSAGE_MODEL_SOURCES = ('74c6a26a7a8eca9a6dfe5e6256f595a174c58b3645d3bd15497c9877d1422938',
+                                  '740533827d3817803605c490bd95f3ffbff1bc841cf14f99820ebcf0db14ab4b')
+
+# Revision 8 before guarded native rename and project membership, LF and CRLF.
+PREVIOUS_SESSION_METADATA_SOURCES = ('78b87c8f6f5b4633067d4c75fd50b8f006042bc1dc0aba26130e662748006911',
+                                     '87ab2a8dedbde1661c1f325b9371711704caaa140e3e4209ae71801d1c78bf6d')
+
+# Revision 9 predecessors remain usable; history-image reads require the newer host.
+COMPATIBLE_OFFICIAL_SOURCES = ('1608bf0b7b4c1f6e2927a1103467b3c56dfaef4d80c6821309dca03fe2e2d9f5',
+                               'bb6a664b33c21d6195ec158a029fed76a121e989bc2ea46168e6e3c9130035c1',
+                               '19a45ae394f380e69c8b0a8b31e9014efb435276520f33bc871c410164942839',
+                               'eb507bba209d203b392249d022d69fe875a59514234df43552c70839ea1038ad',
+                               '31ee82718e131d43c60202261d531195af9257e9a375ce0c6b9ff4edf5de8d5a',
+                               '5479ae9f1e78bd7bf7ce61478a6427025b47964593dbc830b0845a1ef4f0da5a',
+                               '32fd056cd0840884610a223a41bb690c4f3e244c3af7bdb7fc9c65c84d19b3db',
+                               'f3ce3350a32ece209415418e798e2a5d348276081bd15c671552456c18576bb5',
+                               '14ca377eecc7b714e9c059b026181164c3cb21166d315a6d9ef9d16327bda815',
+                               '9c8da5a761588f5f91d5696e938ff2bd927412a2e56367e08aeabeabc6a42ec2',
+                               '80cc10b76e18621b90dbdd5675ce8dd3932eb381a3380f0a538a76b4bcc77ebf',
+                               '2ffbe404b5251cd5fb26da5ffa44a8f3ba4ed2c3c91f80c57ad9f299d62c0741',
+                               # Last revision 9 shipped before creation model selection (d75c61e).
+                               '7c10ac8e3b2849ef6cb72dd7db7a32ef2755572cd1978a5f7eaaa0cf05680aad',
+                               '2714358b35f126daed913e0f73bd52bf585038d831f68e1b09642050f7f923ef',
+                               # Revision 10 Test predecessor, before optional service lookup was corrected.
+                               '992442ed888adaf535b6893ec2f8672d7a281569d0e4778e511c392d93571a8f',
+                               '5bd8ece728f7cc4aeb96d775dbc6d6d79631e48d8aae4d70cfeea36906e69e2f',
+                               # Revision 11 before credential provenance (c057e6b), LF and CRLF.
+                               '9dfb9fe8eaba3f5f162b9177f6a9d551f2899f6316f9ee94bf82fbc5c59089d6',
+                               'd9b394e55b8436209ead3a953da0d374cb08f2454848718db0eb6a59e7ee9a1f',
+                               # Revision 11 before saved-record path reads (069ba77e), LF and CRLF.
+                               '0c6a9586ecb2e52c6392f576dda7c1bddb1629ceb41e757bef27c905869db228',
+                               'bdc236e7f02cc59a9a23b917683849d1a14473e8145dad14af6e7ae2934c2c71')
+
+def without_empty_array(text):
+    """Remove only an otherwise empty YAML document's array tokens.
+
+    The native initializer emits comments followed by []. Appending a block
+    sequence to that flow sequence is invalid YAML. Do not parse/evaluate user
+    expressions, and retain comments and newline placement verbatim.
+    """
+    tokens = ''.join(line.split('#', 1)[0].strip() for line in text.lstrip('\ufeff').splitlines())
+    if tokens != '[]':
+        return text
+    lines = []
+    for line in text.splitlines(keepends=True):
+        code, separator, comment = line.partition('#')
+        lines.append(code.replace('[', '').replace(']', '') + separator + comment)
+    return ''.join(lines)
+
 
 def insertion(text):
     """Read only our JSON flow insertion, including Harness's line wrapping.
@@ -54,6 +127,16 @@ def insertion(text):
             continuation = re.match(r'\\\r?\n[ \t]*', text[index:])
             if continuation:
                 index += continuation.end()
+                continue
+        if quoted and not escaped and char in '\r\n':
+            folded = re.match(r'(?:\r?\n[ \t]*)+', text[index:])
+            if folded:
+                while chars[-1] in ' \t':
+                    chars.pop()
+                # YAML folds one break to a space; empty lines retain line feeds.
+                breaks = folded[0].count('\n')
+                chars.append(' ' if breaks == 1 else '\\n'*(breaks-1))
+                index += folded.end()
                 continue
         chars.append(char)
         if quoted:
@@ -130,11 +213,18 @@ def verified_directory(entry, home):
         if not isinstance(credentials.get('token'), str) or not credentials['token'] or credentials.get('endpoint') != str(directory/'endpoint.json'):
             return None
         digest = hashlib.sha256(source.read_bytes()).hexdigest()
-        current = hashlib.sha256(Path(__file__).with_name('host.mjs').read_bytes()).hexdigest()
-        if digest not in (current, LEGACY_SOURCE, PREVIOUS_SOURCE, PREVIOUS_CLEANUP_SOURCE, PREVIOUS_CATALOG_SOURCE,
-                          *PREVIOUS_QUIT_SOURCES, *PREVIOUS_CONTEXT_SOURCES):
+        current_source = Path(__file__).with_name('host.mjs').read_bytes()
+        current_lf = current_source.replace(b'\r\n', b'\n')
+        current_sources = {hashlib.sha256(content).hexdigest() for content in
+                           (current_lf, current_lf.replace(b'\n', b'\r\n'))}
+        current_sources.update(COMPATIBLE_OFFICIAL_SOURCES)
+        if digest not in current_sources and digest not in (
+                LEGACY_SOURCE, PREVIOUS_SOURCE, PREVIOUS_CLEANUP_SOURCE, PREVIOUS_CATALOG_SOURCE,
+                *PREVIOUS_QUIT_SOURCES, *PREVIOUS_CONTEXT_SOURCES, *PREVIOUS_HISTORY_SOURCES,
+                *PREVIOUS_PROJECT_SOURCES, *PREVIOUS_WORKSPACE_SOURCES, *PREVIOUS_ARCHIVE_SOURCES,
+                *PREVIOUS_DISCONNECT_SOURCES, *PREVIOUS_MESSAGE_MODEL_SOURCES, *PREVIOUS_SESSION_METADATA_SOURCES):
             return None
-        return directory, digest != current
+        return directory, digest not in current_sources
     except (OSError, ValueError, KeyError, TypeError, IndexError):
         return None
 

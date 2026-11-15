@@ -1,6 +1,6 @@
 'use strict';
 // Release metadata is authenticated independently of macOS/Windows code signing.
-const fs=require('node:fs/promises'),path=require('node:path');
+const sync=require('node:fs'),fs=require('node:fs/promises'),path=require('node:path');
 const {createHash,verify}=require('node:crypto');
 const REPO='try2love/codex-mobile-bridge';
 const RELEASES=`https://api.github.com/repos/${REPO}/releases?per_page=100`;
@@ -9,6 +9,31 @@ const RELEASES=`https://api.github.com/repos/${REPO}/releases?per_page=100`;
 const MIRROR='https://gh-proxy.com/';
 const MIRROR_RETRIES=new Set([403,429,500,502,503,504]);
 const MAX_PACKAGE=1024*1024*1024;
+// The helper hands these values to its new GUI. Launch Services may also pass
+// the same environment to a different installation well after the swap.
+function activeUpdateHandoff(env,target,version,pid){
+  const transaction=env.CMB_UPDATE_TRANSACTION,dataDir=env.CMB_UPDATE_DATA_DIR,token=env.CMB_UPDATE_TOKEN;
+  if(!transaction||!token||!dataDir||!path.isAbsolute(transaction)||!path.isAbsolute(dataDir))return null;
+  const read=name=>JSON.parse(sync.readFileSync(path.join(transaction,name),'utf8'));
+  const same=(left,right)=>typeof left==='string'&&path.isAbsolute(left)&&path.relative(left,right)==='';
+  try{
+    if(!same(path.dirname(transaction),path.dirname(target))||!path.basename(transaction).startsWith('.cmb-update-')||
+       !sync.lstatSync(transaction).isDirectory()||sync.existsSync(path.join(transaction,'result.json')))return null;
+    const plan=read('plan.json');
+    if(!same(plan.target,target)||!same(plan.dataDir,dataDir)||plan.token!==token||plan.version!==version||
+       read('ready.json').token!==token)return null;
+    // The helper records the PID immediately after spawning this GUI. A fast
+    // child may reach startup first; recheck before writing its acknowledgement.
+    const launcher=env.CMB_UPDATE_LAUNCHER_PID;
+    if(launcher&&(!/^[1-9]\d*$/.test(launcher)||!Number.isSafeInteger(Number(launcher))||Number(launcher)===pid))return null;
+    if(sync.existsSync(path.join(transaction,'launched.json'))&&read('launched.json').pid!==(launcher?Number(launcher):pid))return null;
+    if(launcher&&sync.existsSync(path.join(transaction,'launch-services.json'))){
+      const receipt=read('launch-services.json');
+      if(receipt.pid!==pid||receipt.launcherPid!==Number(launcher)||receipt.token!==token)return null;
+    }
+    return {transaction,token,dataDir:path.resolve(dataDir)};
+  }catch{return null;}
+}
 function version(value){
   const match=/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(alpha|beta|preview|rc)\.(0|[1-9]\d*))?$/.exec(value);
   if(!match)throw Error('更新版本格式无效。');
@@ -89,14 +114,30 @@ async function transfer(fetch,url,{limit,signal,file,onProgress=()=>{}}){
   }finally{await handle?.close();await reader.cancel();}
 }
 class Updater{
-  constructor({current,platform=process.platform,arch=process.arch,key,fetch,directory,install,supported=true}){
-    Object.assign(this,{current,platform,arch,key,fetch,directory,apply:install,supported});
+  constructor({current,platform=process.platform,arch=process.arch,key,fetch,directory,install,preflight,supported=true,skipFile}){
+    Object.assign(this,{current,platform,arch,key,fetch,directory,apply:install,preflight,supported,skipFile});
+    this.skipIdentity=platform+'-'+arch+':'+(current.match(/-(alpha|beta|preview|rc)\./)?.[1]||'stable');
     this.state={state:supported?'idle':'unsupported',current};
   }
   status(){return {...this.state};}
   get busy(){return ['downloading','preparing','restarting'].includes(this.state.state);}
   set(state,extra={}){this.state={current:this.current,...extra,state};return this.status();}
-  async check(){
+  async skippedVersions(){
+    if(!this.skipFile)return this.skipped||{};
+    try{const value=JSON.parse(await fs.readFile(this.skipFile,'utf8'));return value&&typeof value==='object'&&!Array.isArray(value)?value:{};}catch{return {};}
+  }
+  async skippedVersion(){
+    const value=(await this.skippedVersions())[this.skipIdentity];return typeof value==='string'?value:'';
+  }
+  async skip(){
+    if(this.checking||this.busy||!this.candidate||this.state.state!=='available')throw Error('请先检查更新。');
+    const version=this.candidate.version;
+    const skipped={...await this.skippedVersions(),[this.skipIdentity]:version};
+    if(this.skipFile){await fs.mkdir(path.dirname(this.skipFile),{recursive:true,mode:0o700});await fs.writeFile(this.skipFile,JSON.stringify(skipped),{mode:0o600});}
+    else this.skipped=skipped;
+    return this.set('skipped',{version,notes:this.candidate.notes});
+  }
+  async check({manual=false}={}){
     if(this.busy||this.checking||!this.supported)return this.status();
     this.checking=true;this.candidate=null;this.set('checking');
     try{
@@ -112,7 +153,8 @@ class Updater{
       const expected=candidates[0].tag_name.slice(1);
       const bytes=(await transfer(this.fetch,releaseUrl(expected,'bridge-update.json'),{signal,limit:256*1024})).bytes;
       this.candidate=manifest(bytes,this.key,{current:this.current,platform:this.platform,arch:this.arch,expected});
-      return this.set('available',{version:expected,notes:this.candidate.notes});
+      const skipped=(await this.skippedVersion())===expected;
+      return this.set(skipped&&!manual?'skipped':'available',{version:expected,notes:this.candidate.notes,...(skipped&&manual?{skipped:true}:{})});
     }catch(error){return this.set('error',{message:error.message});}
     finally{this.checking=false;}
   }
@@ -120,8 +162,10 @@ class Updater{
     if(this.busy)return this.status();
     if(!this.candidate||this.checking)throw Error('请先检查更新。');
     const candidate=this.candidate;let staging;
-    this.set('downloading',{version:candidate.version,received:0,total:candidate.asset.size});
+    this.set('preparing',{version:candidate.version});
     try{
+      await this.preflight?.();
+      this.set('downloading',{version:candidate.version,received:0,total:candidate.asset.size});
       await fs.mkdir(this.directory,{recursive:true,mode:0o700});
       staging=await fs.mkdtemp(path.join(this.directory,'download-'));
       const archive=path.join(staging,'update.zip');
@@ -135,4 +179,4 @@ class Updater{
     finally{if(staging)await fs.rm(staging,{recursive:true,force:true});}
   }
 }
-module.exports={Updater,version,compare,manifest,assetName,allowedUrl,allowedMirrorUrl,mirrorUrl,releaseUrl,RELEASES,MIRROR,transfer};
+module.exports={Updater,activeUpdateHandoff,version,compare,manifest,assetName,allowedUrl,allowedMirrorUrl,mirrorUrl,releaseUrl,RELEASES,MIRROR,transfer};
