@@ -21,7 +21,7 @@ python -B -m bridge.features.network.zcode_relay --config <仓库外私有 deskt
 ## 安卓
 
 1. 使用本项目包含智谱连接模块的 APK。首页点击“智谱中继连接”，粘贴本机本轮打印的完整配对链接。
-2. 在系统浏览器登录与电脑相同的智谱账号，返回 App。App 核对账号下同一 sid/mid；JWT 通过 Android Keystore AES/GCM 加密保存。
+2. 未保存智谱登录时，先选“Z.ai（国际）”或“BigModel（国内）”，再在系统浏览器登录与电脑绑定设备时相同的账号，返回 App。两种账号均经 `zcode.z.ai` 国内中继；账号类型不决定中继区域。App 核对账号下同一 sid/mid 后才保存登录；JWT 通过 Android Keystore AES/GCM 加密保存。已有有效登录时直接复用；选错账号可用“退出智谱并移除连接”后重新扫码选择。
 3. 进入原版 Bridge 登录页，使用原网关账号密码登录。这层认证和 CSRF 均保留，智谱账号登录不替代网关登录。
 4. 在原版页面选择“按项目”、已有会话、模型及推理强度；问询和审批按原页面回应。
 

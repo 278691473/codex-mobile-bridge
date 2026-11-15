@@ -656,12 +656,22 @@ public final class MainActivity extends Activity implements SharedPreferences.On
  void chooseZCode(String value){
   try{ZCodePairing target=ZCodePairing.parse(value);new AlertDialog.Builder(this).setTitle(L("连接到这台电脑？")).setMessage(target.name+"\n"+target.mid+"\n\n"+L("请确认这是本机打印的配对链接。智谱只转发连接，聊天使用原版 Codex Bridge 页面。")).setNegativeButton(L("取消"),null).setPositiveButton(L("连接"),(d,w)->loginZCode(target)).show();}catch(Exception invalid){message(L("配对链接无效，请复制本机打印的完整智谱链接。"));}
  }
- void loginZCode(ZCodePairing target){
+ void loginZCode(ZCodePairing target){loginZCode(target,null);}
+ void loginZCode(ZCodePairing target,String provider){
   final int attempt=++relayLoginGeneration;ProgressDialog progress=new ProgressDialog(this);progress.setMessage(L("正在登录智谱…"));progress.setCancelable(true);progress.setOnCancelListener(d->relayLoginGeneration++);progress.show();
   relayWorker.execute(()->{try{
-   String jwt=ZCodeAccount.load(getApplicationContext());
+   String jwt=ZCodeAccount.load(getApplicationContext());if(attempt!=relayLoginGeneration)return;
    if(jwt==null||jwt.isEmpty()){
-    ZCodeAccount.Flow flow=ZCodeAccount.begin();if(flow==null)throw new Exception("oauth unavailable");final long deadline=Math.min(flow.expiresAt,System.currentTimeMillis()/1000+600);
+    if(provider==null){
+     runOnUiThread(()->{if(attempt!=relayLoginGeneration||isFinishing()||isDestroyed())return;progress.dismiss();
+      new AlertDialog.Builder(this).setTitle(L("选择智谱登录方式")).setMessage(L("请使用绑定这台电脑的同一账号登录，并选择对应的国际或国内平台。"))
+       .setPositiveButton("Z.ai（国际）",(d,w)->{if(attempt==relayLoginGeneration)loginZCode(target,"zai");})
+       .setNeutralButton("BigModel（国内）",(d,w)->{if(attempt==relayLoginGeneration)loginZCode(target,"bigmodel");})
+       .setNegativeButton(L("取消"),(d,w)->{if(attempt==relayLoginGeneration)relayLoginGeneration++;})
+       .setOnCancelListener(d->{if(attempt==relayLoginGeneration)relayLoginGeneration++;}).show();
+     });return;
+    }
+    ZCodeAccount.Flow flow=ZCodeAccount.begin(provider);if(flow==null)throw new Exception("oauth unavailable");final long deadline=Math.min(flow.expiresAt,System.currentTimeMillis()/1000+600);
     runOnUiThread(()->{if(attempt!=relayLoginGeneration||isFinishing()||isDestroyed())return;progress.setMessage(L("请在浏览器完成智谱登录，然后返回此 App。"));try{startActivity(new Intent(Intent.ACTION_VIEW,Uri.parse(flow.authorizeUrl)));}catch(Exception missing){relayLoginGeneration++;progress.dismiss();message(L("没有可用的浏览器"));}});
     while(attempt==relayLoginGeneration&&System.currentTimeMillis()/1000<deadline){jwt=ZCodeAccount.poll(flow);if(jwt!=null&&!jwt.isEmpty())break;Thread.sleep(Math.max(1,Math.min(60,flow.pollIntervalSeconds))*1000L);}
     if(attempt!=relayLoginGeneration)return;if(jwt==null||jwt.isEmpty())throw new Exception("expired");

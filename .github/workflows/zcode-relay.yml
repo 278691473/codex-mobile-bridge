@@ -50,3 +50,4 @@ jobs:
           curl --fail --location "$base.sha1" -o .tmp/mobile-tools/android-json-0.0.20131108.vaadin1.jar.sha1
           python -B scripts/test-zcode-release-channel.py
           python -B scripts/test-zcode-capability-headers.py
+          python -B scripts/test-zcode-account.py

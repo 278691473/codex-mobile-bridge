@@ -23,13 +23,11 @@ import javax.crypto.spec.GCMParameterSpec;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
-/** Encrypted ZCode account plus the official BigModel CLI OAuth flow. */
+/** Encrypted ZCode account plus the official BigModel/Z.ai CLI OAuth flow. */
 final class ZCodeAccount {
  private static final String PREFS="bridge-zcode-account",ITEM="jwt",ALIAS="codex-bridge-zcode-account-v1";
  private static final String API_ROOT="https://zcode.z.ai/api/v1";
  private static final String INIT_URL=API_ROOT+"/oauth/cli/init",DEVICE_URL=API_ROOT+"/remote/device";
- private static final String OAUTH_HOST="bigmodel.cn",OAUTH_PATH="/login";
- private static final String INIT_BODY="{\"provider\":\"bigmodel\"}";
  private static final int MAX_BODY=1024*1024,CONNECT_TIMEOUT=10000,READ_TIMEOUT=15000;
  private static final long TOTAL_TIMEOUT=TimeUnit.SECONDS.toNanos(30);
  private static final SecureRandom RANDOM=new SecureRandom();
@@ -85,14 +83,15 @@ final class ZCodeAccount {
   if(!prefs(context).edit().remove(ITEM).commit())throw new IllegalStateException("无法清除智谱登录");
  }
 
- static Flow begin(){
+ static Flow begin(String provider){
+  if(!"bigmodel".equals(provider)&&!"zai".equals(provider))throw new IllegalArgumentException("不支持的智谱账号类型");
   String pollToken=randomHex(32);
-  JSONObject envelope=request("POST",INIT_URL,pollToken,INIT_BODY);
+  JSONObject envelope=request("POST",INIT_URL,pollToken,"{\"provider\":\""+provider+"\"}");
   if(envelope==null)return null;
   JSONObject data=envelope.optJSONObject("data");if(data==null)return null;
   String authorizeUrl=text(data,"authorize_url",8192),flowId=text(data,"flow_id",256);
   Number expiresValue=number(data,"expires_at"),intervalValue=number(data,"poll_interval_sec");
-  if(!officialAuthorizeUrl(authorizeUrl)||!validFlowId(flowId)||expiresValue==null||intervalValue==null)return null;
+  if(!officialAuthorizeUrl(provider,authorizeUrl)||!validFlowId(flowId)||expiresValue==null||intervalValue==null)return null;
   double expires=expiresValue.doubleValue(),interval=intervalValue.doubleValue();
   if(expires<1||expires>253402300799d||expires!=Math.rint(expires)
    ||interval<1||interval>3600||interval!=Math.rint(interval))return null;
@@ -176,12 +175,16 @@ final class ZCodeAccount {
  }
  private static boolean validDeviceId(String value){return value!=null&&value.matches("[A-Za-z0-9_-]{1,160}");}
  private static boolean validFlowId(String value){return value!=null&&value.matches("[A-Za-z0-9._~-]{1,256}");}
- private static boolean officialAuthorizeUrl(String value){
+ private static boolean officialAuthorizeUrl(String provider,String value){
+  String host,path;
+  if("bigmodel".equals(provider)){host="bigmodel.cn";path="/login";}
+  else if("zai".equals(provider)){host="chat.z.ai";path="/api/oauth/authorize";}
+  else return false;
   try{
    URI url=new URI(value);
-   return "https".equalsIgnoreCase(url.getScheme())&&OAUTH_HOST.equalsIgnoreCase(url.getHost())
+   return "https".equalsIgnoreCase(url.getScheme())&&host.equalsIgnoreCase(url.getHost())
     &&url.getRawUserInfo()==null&&(url.getPort()==-1||url.getPort()==443)
-    &&OAUTH_PATH.equals(url.getRawPath())&&url.getRawFragment()==null
+    &&path.equals(url.getRawPath())&&url.getRawFragment()==null
     &&url.getRawQuery()!=null&&!url.getRawQuery().isEmpty();
   }catch(Exception invalid){return false;}
  }
